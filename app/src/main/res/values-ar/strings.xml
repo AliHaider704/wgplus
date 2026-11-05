@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">نفق وايرجارد بلس</string>
+    <string name="xposed_desc">نفق اتصال ومكالمات وايرجارد مدمج لتطبيق تليجرام بلس ومتوافق مع الإضافات الأخرى</string>
+</resources>

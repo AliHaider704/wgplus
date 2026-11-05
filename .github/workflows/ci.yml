@@ -1,0 +1,22 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  go-tests:
+    name: Go engine tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: wgbridge-go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: wgbridge-go/go.mod
+      - run: go vet ./...
+      # The DoH test also queries Cloudflare live, so it needs outbound HTTPS.
+      - run: go test -v ./...

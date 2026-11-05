@@ -1,0 +1,30 @@
+﻿# Signing secrets
+keystore.properties
+*.p12
+*.jks
+*.keystore
+
+# Build output
+/build/
+/app/build/
+/.gradle/
+/dist/
+*.apk
+*.aab
+local.properties
+
+# Prebuilt native bridge (rebuild with scripts/build-wgbridge.ps1)
+/app/libs/*.aar
+/app/libs/*.jar
+
+# Go
+/wgbridge-go/*.test
+/wgbridge-go/*.out
+
+# IDE and OS
+.idea/
+*.iml
+.vscode/
+.DS_Store
+Thumbs.db
+*.log

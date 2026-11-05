@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">WireGuard Plus</string>
+    <string name="xposed_desc">Embedded WireGuard tunnel and VoIP call proxy for Telegram Plus (TeleVip compatible)</string>
+</resources>
