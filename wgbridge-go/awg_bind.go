@@ -9,6 +9,7 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/crypto/blake2s"
 	"golang.org/x/crypto/curve25519"
@@ -356,7 +357,8 @@ func (b *awgBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		}
 		msgType := binary.LittleEndian.Uint32(pkt[0:4])
 
-		// Inject decoy junk burst immediately before Handshake Initiation
+		// Inject paced decoy junk burst before Handshake Initiation so cellular RRC radio wakes up
+		// and CGNAT state tables open without tail-dropping the trailing Initiation datagram.
 		if msgType == wgMsgInitiationType && len(pkt) == wgMsgInitiationSize && b.cfg.Jc > 0 {
 			for j := 0; j < b.cfg.Jc; j++ {
 				jLen := b.cfg.Jmin
@@ -371,8 +373,12 @@ func (b *awgBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 				}
 				junk := make([]byte, jLen)
 				_, _ = rand.Read(junk)
-				out = append(out, junk)
+				_ = b.inner.Send([][]byte{junk}, ep)
+				if j+1 < b.cfg.Jc {
+					time.Sleep(2 * time.Millisecond)
+				}
 			}
+			time.Sleep(2 * time.Millisecond)
 		}
 
 		obf := b.obfuscateOutbound(pkt)

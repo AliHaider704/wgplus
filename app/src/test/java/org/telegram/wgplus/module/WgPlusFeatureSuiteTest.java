@@ -1,4 +1,4 @@
-﻿package org.telegram.wgplus.module;
+package org.telegram.wgplus.module;
 
 import org.junit.Test;
 
@@ -94,6 +94,12 @@ public class WgPlusFeatureSuiteTest {
         assertEquals(parsed.keepAlive, reparsed.keepAlive);
         assertEquals(parsed.endpoint, reparsed.endpoint);
         assertEquals(parsed.toAwgParamsString(), reparsed.toAwgParamsString());
+        assertEquals(parsed.toAwgParamsString(), parsed.toEffectiveAwgParamsString());
+
+        WireGuardManager.TunnelConfig vanilla = new WireGuardManager.TunnelConfig();
+        assertFalse(vanilla.hasAwgConfigured());
+        assertEquals("", vanilla.toAwgParamsString());
+        assertEquals("Jc=3\nJmin=48\nJmax=108\n", vanilla.toEffectiveAwgParamsString());
     }
 
     @Test

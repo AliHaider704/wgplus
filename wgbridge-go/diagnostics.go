@@ -16,7 +16,6 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
 var (
@@ -148,7 +147,7 @@ func ProbeEndpointHandshakeMs(
 		timeoutMs = 15000
 	}
 
-	tunDev, probeTnet, err := netstack.CreateNetTUN(
+	tunDev, probeTnet, err := createFastNetTUN(
 		[]netip.Addr{netip.MustParseAddr("10.254.254.2")},
 		[]netip.Addr{netip.MustParseAddr("1.1.1.1")},
 		defaultMTU,
@@ -159,9 +158,11 @@ func ProbeEndpointHandshakeMs(
 
 	bindImpl, err := newAwgBind(conn.NewDefaultBind(), awgCfg, privHex, pubHex)
 	if err != nil {
+		_ = tunDev.Close()
 		return 0, err
 	}
 	probeDev := device.NewDevice(tunDev, bindImpl, device.NewLogger(device.LogLevelSilent, ""))
+	probeDev.DisableSomeRoamingForBrokenMobileSemantics()
 	defer probeDev.Close()
 
 	var uapi strings.Builder
@@ -184,10 +185,12 @@ func ProbeEndpointHandshakeMs(
 	start := time.Now()
 	deadline := start.Add(time.Duration(timeoutMs) * time.Millisecond)
 
-	// Trigger immediate Noise_IKpsk2 Handshake Initiation
+	// Trigger immediate Noise_IKpsk2 Handshake Initiation directly on the peer
+	triggerPeerHandshakeDirect(probeDev, pubHex, false)
 	triggerHandshakePacket(probeTnet)
 
-	nextRetrigger := start.Add(1100 * time.Millisecond)
+	retryStep := 0
+	nextRetrigger := start.Add(650 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		if hasCompletedHandshake(probeDev) {
 			ms := int(time.Since(start).Milliseconds())
@@ -197,15 +200,19 @@ func ProbeEndpointHandshakeMs(
 			return ms, nil
 		}
 		if time.Now().After(nextRetrigger) {
-			triggerHandshakePacket(probeTnet)
-			nextRetrigger = time.Now().Add(1100 * time.Millisecond)
+			retryStep++
+			if retryStep%2 == 1 {
+				_ = probeDev.BindUpdate()
+			}
+			triggerPeerHandshakeDirect(probeDev, pubHex, true)
+			nextRetrigger = time.Now().Add(750 * time.Millisecond)
 		}
-		time.Sleep(12 * time.Millisecond)
+		time.Sleep(10 * time.Millisecond)
 	}
 	return 0, errors.New("handshake timed out")
 }
 
-func triggerHandshakePacket(tnet *netstack.Net) {
+func triggerHandshakePacket(tnet *fastNet) {
 	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
 	defer cancel()
 	uConn, err := tnet.DialContext(ctx, "udp", "10.254.254.1:53")
@@ -335,15 +342,17 @@ func testSingleCandidateMTU(
 	probeTarget string,
 	timeout time.Duration,
 ) error {
-	tunDev, probeTnet, err := netstack.CreateNetTUN(clientAddrs, dnsAddrs, candMtu)
+	tunDev, probeTnet, err := createFastNetTUN(clientAddrs, dnsAddrs, candMtu)
 	if err != nil {
 		return err
 	}
 	bindImpl, err := newAwgBind(conn.NewDefaultBind(), awgCfg, privHex, pubHex)
 	if err != nil {
+		_ = tunDev.Close()
 		return err
 	}
 	dev := device.NewDevice(tunDev, bindImpl, device.NewLogger(device.LogLevelSilent, ""))
+	dev.DisableSomeRoamingForBrokenMobileSemantics()
 	defer dev.Close()
 
 	var uapi strings.Builder
@@ -362,6 +371,9 @@ func testSingleCandidateMTU(
 	if err := dev.Up(); err != nil {
 		return err
 	}
+
+	triggerPeerHandshakeDirect(dev, pubHex, false)
+	waitForHandshakeQuick(dev, 250*time.Millisecond)
 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()

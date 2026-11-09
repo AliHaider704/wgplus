@@ -973,3 +973,67 @@ func TestSmartKeepaliveDynamicAdjustment(t *testing.T) {
 		t.Fatalf("unexpected tunnel response %q", string(resp))
 	}
 }
+
+func TestForceRebindAndHandshakeAndEnsureTunnelAliveAndIpHint(t *testing.T) {
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	srv := startLocalWgServer(t, "10.96.0.1", 1280, clientPub, "", "")
+	defer srv.closeAll()
+
+	tcpLn, err := srv.tnet.ListenTCP(&net.TCPAddr{IP: net.IPv4(10, 96, 0, 1), Port: 8086})
+	if err != nil {
+		t.Fatalf("ListenTCP failed: %v", err)
+	}
+	defer tcpLn.Close()
+	go func() {
+		for {
+			c, aErr := tcpLn.Accept()
+			if aErr != nil {
+				return
+			}
+			_, _ = c.Write([]byte("REBIND_RECOVERY_OK"))
+			_ = c.Close()
+		}
+	}()
+
+	// Register a stale IP hint and verify resolution fallback works
+	RegisterEndpointIpHint("offline-cellular-test.invalid", "198.51.100.88")
+	resolvedHint, err := ResolveEndpointDoH("offline-cellular-test.invalid:51820", false)
+	if err != nil || resolvedHint != "198.51.100.88:51820" {
+		t.Fatalf("expected stale IP hint fallback 198.51.100.88:51820, got %q err=%v", resolvedHint, err)
+	}
+
+	socksPort, err := StartTunnelAdvanced(
+		clientPriv,
+		"",
+		"10.96.0.2/32",
+		"1.1.1.1",
+		srv.pubHex,
+		fmt.Sprintf("127.0.0.1:%d", srv.udpPort),
+		20,
+		1280,
+		"Jc=3\nJmin=48\nJmax=108",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced failed: %v", err)
+	}
+	defer StopTunnel()
+
+	if !ForceRebindAndHandshake() {
+		t.Fatalf("expected ForceRebindAndHandshake() to succeed against live local server")
+	}
+	if !EnsureTunnelAlive(1000) {
+		t.Fatalf("expected EnsureTunnelAlive(1000) to succeed")
+	}
+
+	c, err := dialSocks5TcpIPv4(socksPort, [4]byte{10, 96, 0, 1}, 8086)
+	if err != nil {
+		t.Fatalf("SOCKS5 dial after ForceRebindAndHandshake failed: %v", err)
+	}
+	resp, _ := io.ReadAll(c)
+	_ = c.Close()
+	if string(resp) != "REBIND_RECOVERY_OK" {
+		t.Fatalf("expected REBIND_RECOVERY_OK, got %q", string(resp))
+	}
+}
+

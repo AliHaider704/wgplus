@@ -59,6 +59,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
         hookApplicationLoader(lpparam);
         hookProxyListActivity(lpparam);
         hookVoipCalls(lpparam);
+        hookConnectionsManagerKeepAlive(lpparam);
         hookActivityFilePickerResult(lpparam);
     }
 
@@ -92,8 +93,8 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                     }
                                 }
 
-                                // 2. Register ActivityLifecycleCallbacks for Smart Idle Battery Saver
-                                registerSmartKeepaliveLifecycle(hostAppCtx);
+                                // 2. Register ActivityLifecycleCallbacks for 24/7 Continuity & Foreground Fast-Resume
+                                registerSmartKeepaliveLifecycle(hostAppCtx, lpparam.classLoader);
 
                                 // 3. Auto-start configured WireGuard / AmneziaWG tunnel if enabled
                                 if (WireGuardManager.isAutoConnectEnabled(hostAppCtx)) {
@@ -121,7 +122,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
         }
     }
 
-    private static void registerSmartKeepaliveLifecycle(final Context hostAppCtx) {
+    private static void registerSmartKeepaliveLifecycle(final Context hostAppCtx, final ClassLoader telegramClassLoader) {
         if (sLifecycleRegistered || hostAppCtx == null) {
             return;
         }
@@ -142,7 +143,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
             @Override
             public void onActivityStarted(Activity activity) {
                 if (startedCount.incrementAndGet() == 1) {
-                    WireGuardManager.onAppForegroundStateChanged(hostAppCtx, MODULE_PATH, true);
+                    WireGuardManager.onAppForegroundStateChanged(hostAppCtx, MODULE_PATH, telegramClassLoader, true);
                 }
             }
 
@@ -159,7 +160,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                 int remaining = startedCount.decrementAndGet();
                 if (remaining <= 0) {
                     startedCount.set(0);
-                    WireGuardManager.onAppForegroundStateChanged(hostAppCtx, MODULE_PATH, false);
+                    WireGuardManager.onAppForegroundStateChanged(hostAppCtx, MODULE_PATH, telegramClassLoader, false);
                 }
             }
 
@@ -171,6 +172,67 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
             public void onActivityDestroyed(Activity activity) {
             }
         });
+    }
+
+    /**
+     * Prevents Telegram's native MTProto engine (ConnectionsManager) from pausing or tearing down
+     * background sockets when the screen turns off or the app goes to the background while the tunnel is active.
+     */
+    private void hookConnectionsManagerKeepAlive(final XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            final Class<?> cmClass = XposedHelpers.findClassIfExists(
+                    "org.telegram.tgnet.ConnectionsManager",
+                    lpparam.classLoader
+            );
+            if (cmClass == null) {
+                return;
+            }
+            XposedHelpers.findAndHookMethod(
+                    cmClass,
+                    "setAppPaused",
+                    boolean.class,
+                    boolean.class,
+                    new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (param.args == null || param.args.length < 2) {
+                                    return;
+                                }
+                                boolean pausing = Boolean.TRUE.equals(param.args[0]);
+                                if (!pausing) {
+                                    return;
+                                }
+                                Context ctx = getOrResolveAppContext(lpparam.classLoader);
+                                if (WireGuardManager.shouldForceTelegramAlwaysAwake(ctx, MODULE_PATH)) {
+                                    param.args[0] = false;
+                                    param.args[1] = false;
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+            );
+            XposedHelpers.findAndHookMethod(
+                    cmClass,
+                    "native_pauseNetwork",
+                    int.class,
+                    new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                Context ctx = getOrResolveAppContext(lpparam.classLoader);
+                                if (WireGuardManager.shouldForceTelegramAlwaysAwake(ctx, MODULE_PATH)) {
+                                    param.setResult(null);
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+            );
+        } catch (Throwable t) {
+            XposedBridge.log("WGPlus: ConnectionsManager keepalive hook warning: " + t.getMessage());
+        }
     }
 
     /**

@@ -18,7 +18,6 @@ import (
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
-	"golang.zx2c4.com/wireguard/tun/netstack"
 )
 
 const (
@@ -26,6 +25,8 @@ const (
 	minMTU            = 1280
 	maxMTU            = 1420
 	maxUdpSessionsCap = 64
+	tcpCopyBufSize    = 64 * 1024
+	udpSocketBufSize  = 1024 * 1024
 )
 
 var (
@@ -35,8 +36,25 @@ var (
 	activeCancel     context.CancelFunc
 	activePort       int
 	activePeerPubHex string
+	activeRawEp      string
 	activeUseDoH     bool
+	activeKeepAlive  int
+	activeStartTime  time.Time
 	running          bool
+
+	tcpCopyBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, tcpCopyBufSize)
+			return &b
+		},
+	}
+
+	udpFrameBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, 65535)
+			return &b
+		},
+	}
 )
 
 func normalizeHexKey(raw string) (string, error) {
@@ -125,6 +143,40 @@ func normalizeMTU(mtu int) int {
 	return mtu
 }
 
+func lookupPeerByHex(dev *device.Device, pubHex string) *device.Peer {
+	if dev == nil || len(pubHex) != 64 {
+		return nil
+	}
+	raw, err := hex.DecodeString(pubHex)
+	if err != nil || len(raw) != 32 {
+		return nil
+	}
+	var pk device.NoisePublicKey
+	copy(pk[:], raw)
+	return dev.LookupPeer(pk)
+}
+
+func triggerPeerHandshakeDirect(dev *device.Device, pubHex string, isRetry bool) {
+	peer := lookupPeerByHex(dev, pubHex)
+	if peer != nil {
+		_ = peer.SendHandshakeInitiation(isRetry)
+	}
+}
+
+func waitForHandshakeQuick(dev *device.Device, maxWait time.Duration) bool {
+	if dev == nil {
+		return false
+	}
+	deadline := time.Now().Add(maxWait)
+	for time.Now().Before(deadline) {
+		if hasCompletedHandshake(dev) {
+			return true
+		}
+		time.Sleep(12 * time.Millisecond)
+	}
+	return hasCompletedHandshake(dev)
+}
+
 // StartTunnel starts the userspace WireGuard tunnel with default MTU (1280) and no PresharedKey.
 func StartTunnel(privateKeyHex string, clientIP string, dnsServer string, peerPublicKeyHex string, endpoint string, keepAlive int) (int, error) {
 	return StartTunnelWithOptions(privateKeyHex, "", clientIP, dnsServer, peerPublicKeyHex, endpoint, keepAlive, defaultMTU)
@@ -190,23 +242,30 @@ func StartTunnelAdvanced(
 		return 0, err
 	}
 	effectiveMTU := normalizeMTU(mtu)
+	// Ensure S4 transport padding never pushes outer UDP frames past typical cellular 1452-byte ceiling
+	if awgCfg.S4 > 0 && effectiveMTU+awgCfg.S4 > maxMTU {
+		effectiveMTU = normalizeMTU(maxMTU - awgCfg.S4)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
 
 	stopLocked()
 
-	tunDev, tnet, err := netstack.CreateNetTUN(clientAddrs, dnsAddrs, effectiveMTU)
+	tunDev, tnet, err := createFastNetTUN(clientAddrs, dnsAddrs, effectiveMTU)
 	if err != nil {
-		return 0, fmt.Errorf("failed to create netstack TUN: %w", err)
+		return 0, fmt.Errorf("failed to create fast netstack TUN: %w", err)
 	}
 
 	bindImpl, err := newAwgBind(conn.NewDefaultBind(), awgCfg, privHex, pubHex)
 	if err != nil {
+		_ = tunDev.Close()
 		return 0, fmt.Errorf("failed to initialize tunnel bind: %w", err)
 	}
 
 	dev := device.NewDevice(tunDev, bindImpl, device.NewLogger(device.LogLevelSilent, ""))
+	// Essential for 4G/5G CGNAT stability: prevent stray NAT packets from corrupting peer endpoint state
+	dev.DisableSomeRoamingForBrokenMobileSemantics()
 
 	var uapi strings.Builder
 	fmt.Fprintf(&uapi, "private_key=%s\n", privHex)
@@ -244,15 +303,120 @@ func StartTunnelAdvanced(
 	activeCancel = cancel
 	activePort = port
 	activePeerPubHex = pubHex
+	activeRawEp = endpoint
 	activeUseDoH = useDoH
+	activeKeepAlive = keepAlive
+	activeStartTime = time.Now()
 	running = true
 
+	// Kick off immediate Noise_IKpsk2 Handshake Initiation at t=0ms
+	triggerPeerHandshakeDirect(dev, pubHex, false)
+	// Give fast peers up to 160ms to complete handshake before returning port to Telegram
+	waitForHandshakeQuick(dev, 160*time.Millisecond)
+
 	go acceptLoop(ctx, ln, tnet)
+	go tunnelWatchdogLoop(ctx, dev, pubHex)
 
 	return port, nil
 }
 
-// UpdatePeerEndpoint updates the WireGuard peer endpoint dynamically on network handoff without restarting the local SOCKS5 listener.
+// tunnelWatchdogLoop runs 24/7 inside the Go runtime to guarantee cellular CGNAT continuity:
+// 1. During initial startup, performs fast retry + UDP source-port hopping (BindUpdate) every 550ms
+//    instead of waiting for WireGuard's default 5000ms RekeyTimeout.
+// 2. Continuously monitors RX/TX progress and handshake freshness, automatically rebinding the local
+//    UDP socket and re-initiating handshake whenever a mobile CGNAT pinhole dies or stalls.
+func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) {
+	// Phase 1: Aggressive initial handshake warmup with source-port hopping
+	for attempt := 1; attempt <= 5; attempt++ {
+		if hasCompletedHandshake(dev) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(520 * time.Millisecond):
+		}
+		if hasCompletedHandshake(dev) {
+			break
+		}
+		// Hop local ephemeral UDP port on retry #2 and #4 to bypass CGNAT/DPI port blackholes
+		if attempt%2 == 0 {
+			_ = dev.BindUpdate()
+		}
+		triggerPeerHandshakeDirect(dev, pubHex, true)
+	}
+
+	// Phase 2: 24/7 continuous health & CGNAT pinhole guardian
+	ticker := time.NewTicker(6 * time.Second)
+	defer ticker.Stop()
+
+	var lastRx uint64
+	var lastTx uint64
+	var stalledTicks int
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		rx, tx, hsSec := readDeviceCounters(dev)
+		nowSec := time.Now().Unix()
+
+		// Case A: Handshake never completed or expired (> 135s old)
+		if hsSec <= 0 || (nowSec-hsSec) > 135 {
+			_ = dev.BindUpdate()
+			triggerPeerHandshakeDirect(dev, pubHex, true)
+			stalledTicks = 0
+			lastRx = rx
+			lastTx = tx
+			continue
+		}
+
+		// Case B: Outbound traffic is flowing (tx increasing) but zero inbound packets (rx frozen)
+		// for 2 consecutive 6s intervals -> CGNAT pinhole collapsed or cellular IP roamed silently!
+		if tx > lastTx && rx == lastRx {
+			stalledTicks++
+			if stalledTicks >= 2 {
+				_ = dev.BindUpdate()
+				triggerPeerHandshakeDirect(dev, pubHex, true)
+				stalledTicks = 0
+			} else if p := lookupPeerByHex(dev, pubHex); p != nil {
+				p.SendKeepalive()
+			}
+		} else {
+			stalledTicks = 0
+		}
+
+		lastRx = rx
+		lastTx = tx
+	}
+}
+
+func readDeviceCounters(dev *device.Device) (rx uint64, tx uint64, hsSec int64) {
+	if dev == nil {
+		return 0, 0, 0
+	}
+	ipcOut, err := dev.IpcGet()
+	if err != nil || ipcOut == "" {
+		return 0, 0, 0
+	}
+	for _, line := range strings.Split(ipcOut, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "rx_bytes=") {
+			rx, _ = strconv.ParseUint(strings.TrimPrefix(line, "rx_bytes="), 10, 64)
+		} else if strings.HasPrefix(line, "tx_bytes=") {
+			tx, _ = strconv.ParseUint(strings.TrimPrefix(line, "tx_bytes="), 10, 64)
+		} else if strings.HasPrefix(line, "last_handshake_time_sec=") {
+			hsSec, _ = strconv.ParseInt(strings.TrimPrefix(line, "last_handshake_time_sec="), 10, 64)
+		}
+	}
+	return rx, tx, hsSec
+}
+
+// UpdatePeerEndpoint updates the WireGuard peer endpoint dynamically on network handoff,
+// rebinds the local UDP socket to the active network interface, and initiates an immediate handshake.
 func UpdatePeerEndpoint(endpoint string) error {
 	mu.Lock()
 	useDoH := activeUseDoH
@@ -264,17 +428,108 @@ func UpdatePeerEndpoint(endpoint string) error {
 		return err
 	}
 	mu.Lock()
-	defer mu.Unlock()
 	if !running || activeDev == nil || activePeerPubHex == "" {
+		mu.Unlock()
 		return errors.New("tunnel is not running")
 	}
+	dev := activeDev
+	pubHex := activePeerPubHex
+	activeRawEp = endpoint
 	var uapi strings.Builder
-	fmt.Fprintf(&uapi, "public_key=%s\n", activePeerPubHex)
+	fmt.Fprintf(&uapi, "public_key=%s\n", pubHex)
 	fmt.Fprintf(&uapi, "endpoint=%s\n", resolved)
-	return activeDev.IpcSet(uapi.String())
+	err = dev.IpcSet(uapi.String())
+	mu.Unlock()
+
+	if err != nil {
+		return err
+	}
+	// Rebind local UDP socket to pick up the new Wi-Fi / 4G / 5G interface and trigger immediate handshake
+	_ = dev.BindUpdate()
+	triggerPeerHandshakeDirect(dev, pubHex, true)
+	return nil
 }
 
-// SetPeerKeepalive dynamically adjusts persistent_keepalive_interval on the active peer (0 pauses background keepalives for battery saving).
+// ForceRebindAndHandshake hops to a fresh local UDP source port on the active network interface,
+// forces an immediate cryptographic re-handshake, and waits up to 1.2s to verify completion.
+func ForceRebindAndHandshake() bool {
+	mu.Lock()
+	dev := activeDev
+	pubHex := activePeerPubHex
+	rawEp := activeRawEp
+	useDoH := activeUseDoH
+	isUp := running
+	mu.Unlock()
+
+	if !isUp || dev == nil || pubHex == "" {
+		return false
+	}
+
+	if strings.TrimSpace(rawEp) != "" {
+		ClearDnsCache()
+		if resolved, err := ResolveEndpointDoH(rawEp, useDoH); err == nil && resolved != "" {
+			var uapi strings.Builder
+			fmt.Fprintf(&uapi, "public_key=%s\n", pubHex)
+			fmt.Fprintf(&uapi, "endpoint=%s\n", resolved)
+			_ = dev.IpcSet(uapi.String())
+		}
+	}
+
+	_ = dev.BindUpdate()
+	if peer := lookupPeerByHex(dev, pubHex); peer != nil {
+		_ = peer.SendHandshakeInitiation(true)
+	}
+
+	if waitForHandshakeQuick(dev, 550*time.Millisecond) {
+		return true
+	}
+	// Second port hop if first packet was dropped during cellular radio state transition
+	_ = dev.BindUpdate()
+	triggerPeerHandshakeDirect(dev, pubHex, true)
+	return waitForHandshakeQuick(dev, 650*time.Millisecond)
+}
+
+// EnsureTunnelAlive checks if the active tunnel has a fresh verified handshake and responsive UDP path;
+// if stale, it performs an immediate socket rebind + handshake within timeoutMs.
+func EnsureTunnelAlive(timeoutMs int) bool {
+	mu.Lock()
+	dev := activeDev
+	pubHex := activePeerPubHex
+	isUp := running
+	mu.Unlock()
+
+	if !isUp || dev == nil || pubHex == "" {
+		return false
+	}
+
+	_, _, hsSec := readDeviceCounters(dev)
+	nowSec := time.Now().Unix()
+	if hsSec > 0 && (nowSec-hsSec) < 75 {
+		if peer := lookupPeerByHex(dev, pubHex); peer != nil {
+			peer.SendKeepalive()
+		}
+		return true
+	}
+
+	if timeoutMs <= 0 {
+		timeoutMs = 1200
+	}
+	if timeoutMs > 5000 {
+		timeoutMs = 5000
+	}
+
+	_ = dev.BindUpdate()
+	triggerPeerHandshakeDirect(dev, pubHex, true)
+	half := time.Duration(timeoutMs/2) * time.Millisecond
+	if waitForHandshakeQuick(dev, half) {
+		return true
+	}
+	_ = dev.BindUpdate()
+	triggerPeerHandshakeDirect(dev, pubHex, true)
+	return waitForHandshakeQuick(dev, half)
+}
+
+// SetPeerKeepalive dynamically adjusts persistent_keepalive_interval on the active peer.
 func SetPeerKeepalive(keepAlive int) error {
 	if keepAlive < 0 {
 		keepAlive = 0
@@ -287,6 +542,7 @@ func SetPeerKeepalive(keepAlive int) error {
 	if !running || activeDev == nil || activePeerPubHex == "" {
 		return errors.New("tunnel is not running")
 	}
+	activeKeepAlive = keepAlive
 	var uapi strings.Builder
 	fmt.Fprintf(&uapi, "public_key=%s\n", activePeerPubHex)
 	fmt.Fprintf(&uapi, "persistent_keepalive_interval=%d\n", keepAlive)
@@ -353,7 +609,9 @@ func stopLocked() {
 	}
 	activePort = 0
 	activePeerPubHex = ""
+	activeRawEp = ""
 	activeUseDoH = false
+	activeKeepAlive = 0
 	running = false
 }
 
@@ -374,7 +632,15 @@ func GetActivePort() int {
 	return activePort
 }
 
-func acceptLoop(ctx context.Context, ln net.Listener, tnet *netstack.Net) {
+func tuneLocalTcpSocket(c net.Conn) {
+	if tcpConn, ok := c.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+		_ = tcpConn.SetKeepAlive(true)
+		_ = tcpConn.SetKeepAlivePeriod(20 * time.Second)
+	}
+}
+
+func acceptLoop(ctx context.Context, ln net.Listener, tnet *fastNet) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -382,11 +648,12 @@ func acceptLoop(ctx context.Context, ln net.Listener, tnet *netstack.Net) {
 				return
 			}
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
-				time.Sleep(50 * time.Millisecond)
+				time.Sleep(25 * time.Millisecond)
 				continue
 			}
 			return
 		}
+		tuneLocalTcpSocket(c)
 		go handleSocks5Client(ctx, c, tnet)
 	}
 }
@@ -429,6 +696,29 @@ func readSocks5Target(r io.Reader, atyp byte) (host string, port uint16, err err
 	}
 	port = binary.BigEndian.Uint16(portBuf)
 	return host, port, nil
+}
+
+func awaitInitialHandshakeBeforeDial(ctx context.Context) {
+	mu.Lock()
+	dev := activeDev
+	pubHex := activePeerPubHex
+	started := activeStartTime
+	mu.Unlock()
+
+	if dev == nil || pubHex == "" || hasCompletedHandshake(dev) {
+		return
+	}
+	// If tunnel was started recently (< 4s ago), wait up to 750ms for handshake before firing TCP SYN into netstack
+	if time.Since(started) < 4*time.Second {
+		triggerPeerHandshakeDirect(dev, pubHex, false)
+		deadline := time.Now().Add(750 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			if ctx.Err() != nil || hasCompletedHandshake(dev) {
+				return
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
+	}
 }
 
 func handleSocks5Client(ctx context.Context, client net.Conn, dialer udpDialer) {
@@ -482,10 +772,30 @@ func handleSocks5Client(ctx context.Context, client net.Conn, dialer udpDialer) 
 	}
 }
 
+type writeCloserConn interface {
+	CloseWrite() error
+}
+
+func closeWriteOrConn(c net.Conn) {
+	if wc, ok := c.(writeCloserConn); ok {
+		_ = wc.CloseWrite()
+	} else {
+		_ = c.Close()
+	}
+}
+
+func copyWithPooledBuf(dst io.Writer, src io.Reader) {
+	bufPtr := tcpCopyBufPool.Get().(*[]byte)
+	defer tcpCopyBufPool.Put(bufPtr)
+	_, _ = io.CopyBuffer(dst, src, *bufPtr)
+}
+
 func handleTcpConnect(ctx context.Context, client net.Conn, dialer udpDialer, host string, dstPort uint16) {
+	awaitInitialHandshakeBeforeDial(ctx)
+
 	targetAddr := net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
 
-	dialCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	dialCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
 	remote, err := dialer.DialContext(dialCtx, "tcp", targetAddr)
 	cancel()
 	if err != nil {
@@ -514,13 +824,13 @@ func handleTcpConnect(ctx context.Context, client net.Conn, dialer udpDialer, ho
 
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(remote, client)
-		_ = remote.Close()
+		copyWithPooledBuf(remote, client)
+		closeWriteOrConn(remote)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(client, remote)
-		_ = client.Close()
+		copyWithPooledBuf(client, remote)
+		closeWriteOrConn(client)
 		done <- struct{}{}
 	}()
 	<-done
@@ -582,11 +892,15 @@ func parseSocks5UdpDatagram(pkt []byte) (targetAddr string, replyHdr []byte, pay
 }
 
 func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDialer) {
+	awaitInitialHandshakeBeforeDial(ctx)
+
 	udpLn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
 		_, _ = tcpControl.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
+	_ = udpLn.SetReadBuffer(udpSocketBufSize)
+	_ = udpLn.SetWriteBuffer(udpSocketBufSize)
 
 	relayPort := udpLn.LocalAddr().(*net.UDPAddr).Port
 
@@ -604,7 +918,7 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 	}
 
 	assocCtx, assocCancel := context.WithCancel(ctx)
-	var sessMu sync.Mutex
+	var sessMu sync.RWMutex
 	sessions := make(map[string]*udpRemoteSession)
 
 	cleanupAll := func() {
@@ -629,7 +943,10 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 
 	// Pump local UDP frames from tgcalls into WireGuard netstack UDP sockets
 	go func() {
-		buf := make([]byte, 65535)
+		bufPtr := udpFrameBufPool.Get().(*[]byte)
+		defer udpFrameBufPool.Put(bufPtr)
+		buf := *bufPtr
+
 		for {
 			n, srcAddr, rErr := udpLn.ReadFromUDP(buf)
 			if rErr != nil {
@@ -644,14 +961,26 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 				continue
 			}
 
-			sessMu.Lock()
+			// Fast read-lock lookup for existing RTP media stream
+			sessMu.RLock()
 			sess, exists := sessions[targetAddr]
+			sessMu.RUnlock()
+
+			if exists {
+				sess.clientAddr.Store(srcAddr)
+				_, _ = sess.remoteConn.Write(payload)
+				continue
+			}
+
+			// Slow path: new UDP target session
+			sessMu.Lock()
+			sess, exists = sessions[targetAddr]
 			if !exists {
 				if len(sessions) >= maxUdpSessionsCap {
 					sessMu.Unlock()
 					continue
 				}
-				dialCtx, cancel := context.WithTimeout(assocCtx, 8*time.Second)
+				dialCtx, cancel := context.WithTimeout(assocCtx, 5*time.Second)
 				rConn, dErr := dialer.DialContext(dialCtx, "udp", targetAddr)
 				cancel()
 				if dErr != nil {
@@ -668,7 +997,17 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 
 				// Pump return UDP packets from WireGuard netstack back to local client with RFC 1928 UDP header
 				go func(key string, s *udpRemoteSession) {
-					respBuf := make([]byte, 65535)
+					rBufPtr := udpFrameBufPool.Get().(*[]byte)
+					defer udpFrameBufPool.Put(rBufPtr)
+					respBuf := *rBufPtr
+
+					outBufPtr := udpFrameBufPool.Get().(*[]byte)
+					defer udpFrameBufPool.Put(outBufPtr)
+					outPkt := *outBufPtr
+
+					hdrLen := len(s.replyHdr)
+					copy(outPkt[:hdrLen], s.replyHdr)
+
 					for {
 						rn, readErr := s.remoteConn.Read(respBuf)
 						if readErr != nil {
@@ -679,11 +1018,9 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 							return
 						}
 						cAddrAny := s.clientAddr.Load()
-						if cAddr, ok := cAddrAny.(*net.UDPAddr); ok && cAddr != nil {
-							outPkt := make([]byte, len(s.replyHdr)+rn)
-							copy(outPkt, s.replyHdr)
-							copy(outPkt[len(s.replyHdr):], respBuf[:rn])
-							_, _ = udpLn.WriteToUDP(outPkt, cAddr)
+						if cAddr, ok := cAddrAny.(*net.UDPAddr); ok && cAddr != nil && hdrLen+rn <= len(outPkt) {
+							copy(outPkt[hdrLen:hdrLen+rn], respBuf[:rn])
+							_, _ = udpLn.WriteToUDP(outPkt[:hdrLen+rn], cAddr)
 						}
 					}
 				}(targetAddr, sess)

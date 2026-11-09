@@ -4,12 +4,15 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.net.ConnectivityManager;
+import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.wifi.WifiManager;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.util.Log;
 import android.widget.Toast;
 
@@ -30,6 +33,7 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -38,6 +42,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
 import javax.net.ssl.HttpsURLConnection;
@@ -63,6 +69,7 @@ public final class WireGuardManager {
     public static final String KEY_PROFILES_JSON = "wg_profiles_v2_json";
     public static final String KEY_ACTIVE_PROFILE_ID = "wg_active_profile_id";
     public static final String KEY_CONNECTED_PROFILE_ID = "wg_connected_profile_id";
+    private static final String KEY_DNS_LKG_CACHE_JSON = "wg_dns_lkg_cache_json";
 
     // Legacy v1.1.0 single-profile keys (transparently migrated once)
     public static final String KEY_PRIVATE_KEY = "wg_private_key";
@@ -90,18 +97,36 @@ public final class WireGuardManager {
     private static volatile String sWatchdogRawEndpoint = "";
     private static volatile String sConnectedProfileId = "";
     private static volatile long sLastRoamingUpdateMs = 0L;
+    private static volatile boolean sUserManuallyStopped = false;
 
     // Live Ping RTT cache (profileId -> ms, or -1 on timeout)
     private static final Map<String, Integer> sPingCacheMs = new ConcurrentHashMap<>();
 
-    // Auto-Failover & Smart Keepalive background state
+    // 24/7 Forced Continuity Locks, Guardian Executor & Smart Keepalive background state
+    private static final Object LOCK_SYNC = new Object();
+    private static PowerManager.WakeLock sForcedWakeLock = null;
+    private static WifiManager.WifiLock sForcedWifiLock = null;
+    private static ScheduledExecutorService sGuardianExecutor = null;
+    private static ScheduledFuture<?> sGuardianFuture = null;
+    private static ScheduledFuture<?> sRoamingDebounceFuture = null;
     private static Handler sMainHandler = null;
     private static volatile boolean sAppInForeground = true;
     private static volatile boolean sKeepalivePausedForIdle = false;
     private static Runnable sPendingIdleSaverTask = null;
-    private static Runnable sFailoverTickerTask = null;
     private static volatile int sConsecutiveHealthFailures = 0;
     private static volatile boolean sFailoverCheckRunning = false;
+
+    private static synchronized ScheduledExecutorService getGuardianExecutor() {
+        if (sGuardianExecutor == null || sGuardianExecutor.isShutdown()) {
+            sGuardianExecutor = Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "wg-plus-24x7-guardian");
+                t.setDaemon(true);
+                t.setPriority(Thread.NORM_PRIORITY + 1);
+                return t;
+            });
+        }
+        return sGuardianExecutor;
+    }
 
     private static synchronized Handler getMainHandler() {
         if (sMainHandler == null) {
@@ -209,6 +234,23 @@ public final class WireGuardManager {
             if (!safeTrim(h3).isEmpty()) sb.append("H3=").append(safeTrim(h3)).append('\n');
             if (!safeTrim(h4).isEmpty()) sb.append("H4=").append(safeTrim(h4)).append('\n');
             return sb.toString();
+        }
+
+        /**
+         * Returns the runtime AmneziaWG parameters passed to the native bridge.
+         * For standard (vanilla) WireGuard configs where no AWG parameters are set,
+         * injects a lightweight 3-packet micro-paced UDP wakeup burst (Jc=3, Jmin=48, Jmax=108)
+         * before every Handshake Initiation. Standard WireGuard servers silently discard
+         * unrecognized UDP packets, while mobile carriers' 4G/5G RRC state machines, CGNAT
+         * tables, and first-packet DPI filters wake up cleanly without dropping the real
+         * 148-byte WireGuard Handshake Initiation packet.
+         */
+        public String toEffectiveAwgParamsString() {
+            String explicit = toAwgParamsString();
+            if (!explicit.isEmpty()) {
+                return explicit;
+            }
+            return "Jc=3\nJmin=48\nJmax=108\n";
         }
 
         public String summaryLabel() {
@@ -345,10 +387,8 @@ public final class WireGuardManager {
             return;
         }
         getPrefs(context).edit().putBoolean(KEY_AUTO_FAILOVER, enabled).commit();
-        if (enabled && isTunnelRunning(context, moduleApkPath)) {
+        if (isTunnelRunning(context, moduleApkPath)) {
             startFailoverMonitor(context, moduleApkPath, telegramClassLoader);
-        } else if (!enabled) {
-            stopFailoverMonitor();
         }
     }
 
@@ -363,7 +403,7 @@ public final class WireGuardManager {
     }
 
     public static boolean isSmartKeepaliveEnabled(Context context) {
-        return context == null || getPrefs(context).getBoolean(KEY_SMART_KEEPALIVE, true);
+        return context != null && getPrefs(context).getBoolean(KEY_SMART_KEEPALIVE, false);
     }
 
     public static void setSmartKeepaliveEnabled(Context context, String moduleApkPath, boolean enabled) {
@@ -374,6 +414,180 @@ public final class WireGuardManager {
         if (!enabled && sKeepalivePausedForIdle) {
             restoreActiveKeepaliveNow(context, moduleApkPath);
         }
+    }
+
+    /**
+     * Returns true when Telegram's native tgnet sockets should be forced awake 24/7
+     * (blocking setAppPaused(true) and native_pauseNetwork) so background delivery,
+     * messages, and incoming calls stay live across cellular and Wi-Fi.
+     */
+    public static boolean shouldForceTelegramAlwaysAwake(Context context, String moduleApkPath) {
+        if (context == null) {
+            return false;
+        }
+        if (!sConnectedProfileId.isEmpty()) {
+            return true;
+        }
+        try {
+            if (isAutoConnectEnabled(context) || isKillSwitchEnabled(context)) {
+                return true;
+            }
+            String savedConn = getPrefs(context).getString(KEY_CONNECTED_PROFILE_ID, "");
+            if (savedConn != null && !savedConn.isEmpty()) {
+                return true;
+            }
+        } catch (Throwable ignored) {
+        }
+        return isTunnelRunning(context, moduleApkPath);
+    }
+
+    private static void acquireForcedContinuityLocks(Context context) {
+        if (context == null) {
+            return;
+        }
+        synchronized (LOCK_SYNC) {
+            Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+            try {
+                if (sForcedWakeLock == null) {
+                    PowerManager pm = (PowerManager) appCtx.getSystemService(Context.POWER_SERVICE);
+                    if (pm != null) {
+                        sForcedWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "WireGuardPlus::ForcedContinuityWakeLock");
+                        sForcedWakeLock.setReferenceCounted(false);
+                    }
+                }
+                if (sForcedWakeLock != null && !sForcedWakeLock.isHeld()) {
+                    sForcedWakeLock.acquire();
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                if (sForcedWifiLock == null) {
+                    WifiManager wm = (WifiManager) appCtx.getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+                    if (wm != null) {
+                        int lockMode = Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q
+                                ? WifiManager.WIFI_MODE_FULL_LOW_LATENCY
+                                : WifiManager.WIFI_MODE_FULL_HIGH_PERF;
+                        sForcedWifiLock = wm.createWifiLock(lockMode, "WireGuardPlus::ForcedContinuityWifiLock");
+                        sForcedWifiLock.setReferenceCounted(false);
+                    }
+                }
+                if (sForcedWifiLock != null && !sForcedWifiLock.isHeld()) {
+                    sForcedWifiLock.acquire();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static void releaseForcedContinuityLocks() {
+        synchronized (LOCK_SYNC) {
+            try {
+                if (sForcedWakeLock != null && sForcedWakeLock.isHeld()) {
+                    sForcedWakeLock.release();
+                }
+            } catch (Throwable ignored) {
+            }
+            try {
+                if (sForcedWifiLock != null && sForcedWifiLock.isHeld()) {
+                    sForcedWifiLock.release();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private static boolean isCellularNetworkActive(Context context) {
+        if (context == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return false;
+        }
+        try {
+            ConnectivityManager cm = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                return false;
+            }
+            Network active = cm.getActiveNetwork();
+            if (active == null) {
+                return false;
+            }
+            NetworkCapabilities caps = cm.getNetworkCapabilities(active);
+            return caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR);
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void syncEndpointDnsHintsToNative(Context context, String rawEndpoint) {
+        if (context == null) {
+            return;
+        }
+        try {
+            SharedPreferences prefs = getPrefs(context);
+            String rawCache = prefs.getString(KEY_DNS_LKG_CACHE_JSON, "");
+            if (rawCache != null && !rawCache.isEmpty()) {
+                JSONObject obj = new JSONObject(rawCache);
+                Iterator<String> keys = obj.keys();
+                while (keys.hasNext()) {
+                    String host = keys.next();
+                    String ip = obj.optString(host, "");
+                    if (!host.isEmpty() && !ip.isEmpty()) {
+                        Wgbridge.registerEndpointIpHint(host, ip);
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        String host = extractEndpointHost(rawEndpoint);
+        if (host.isEmpty()) {
+            return;
+        }
+        try {
+            InetAddress[] addrs = InetAddress.getAllByName(host);
+            if (addrs != null && addrs.length > 0) {
+                InetAddress chosen = addrs[0];
+                for (InetAddress cand : addrs) {
+                    if (cand instanceof Inet4Address) {
+                        chosen = cand;
+                        break;
+                    }
+                }
+                String ip = chosen.getHostAddress();
+                if (ip != null && !ip.isEmpty()) {
+                    Wgbridge.registerEndpointIpHint(host, ip);
+                    persistEndpointDnsHint(context, host, ip);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void persistEndpointDnsHint(Context context, String host, String ip) {
+        if (context == null || host == null || host.isEmpty() || ip == null || ip.isEmpty()) {
+            return;
+        }
+        try {
+            SharedPreferences prefs = getPrefs(context);
+            String rawCache = prefs.getString(KEY_DNS_LKG_CACHE_JSON, "");
+            JSONObject obj = (rawCache != null && !rawCache.isEmpty()) ? new JSONObject(rawCache) : new JSONObject();
+            obj.put(host.toLowerCase(Locale.ROOT), ip);
+            prefs.edit().putString(KEY_DNS_LKG_CACHE_JSON, obj.toString()).apply();
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static String extractEndpointHost(String rawEndpoint) {
+        String ep = safeTrim(rawEndpoint);
+        if (ep.isEmpty() || ep.startsWith("[")) {
+            return "";
+        }
+        int lastColon = ep.lastIndexOf(':');
+        if (lastColon <= 0 || lastColon == ep.length() - 1) {
+            return "";
+        }
+        String host = ep.substring(0, lastColon).trim();
+        if (host.indexOf(':') >= 0) {
+            return "";
+        }
+        return host;
     }
 
     public static synchronized List<TunnelConfig> loadProfiles(Context context) {
@@ -1113,16 +1327,21 @@ public final class WireGuardManager {
             throw new WgStrings.WgException(WgStrings.ErrorCode.MISSING_ADDRESS);
         }
 
+        sUserManuallyStopped = false;
+        acquireForcedContinuityLocks(context);
+        syncEndpointDnsHintsToNative(context, cfg.endpoint);
+
         String privHex = normalizeKeyToHex(cfg.privateKey);
         String pubHex = normalizeKeyToHex(cfg.publicKey);
         String pskHex = safeTrim(cfg.presharedKey).isEmpty() ? "" : normalizeKeyToHex(cfg.presharedKey);
         String dns = safeTrim(cfg.dns).isEmpty() ? "1.1.1.1" : safeTrim(cfg.dns);
-        int keepAlive = clampKeepAlive(cfg.keepAlive);
-        int mtu = clampMtu(cfg.mtu);
+        boolean onCellular = isCellularNetworkActive(context);
+        int keepAlive = onCellular ? Math.min(20, clampKeepAlive(cfg.keepAlive)) : clampKeepAlive(cfg.keepAlive);
+        int mtu = onCellular ? 1280 : clampMtu(cfg.mtu);
         boolean useDoH = isDohEnabled(context);
         // When DoH is enabled, pass raw hostname straight to Go so zero plaintext port-53 DNS leaks occur!
         String endpointForGo = useDoH ? safeTrim(cfg.endpoint) : preResolveEndpoint(cfg.endpoint);
-        String awgParams = cfg.toAwgParamsString();
+        String awgParams = cfg.toEffectiveAwgParamsString();
 
         long portLong;
         try {
@@ -1181,15 +1400,16 @@ public final class WireGuardManager {
             Wgbridge.stopKillSwitchGuard();
         } catch (Throwable ignored) {
         }
-        if (isAutoFailoverEnabled(context)) {
-            startFailoverMonitor(context, moduleApkPath, telegramClassLoader);
-        }
+        // Always start the 24/7 Forced Continuity & Auto-Failover Guardian while connected
+        startFailoverMonitor(context, moduleApkPath, telegramClassLoader);
         return localPort;
     }
 
     public static void stopAndUnbind(Context context, String moduleApkPath, ClassLoader telegramClassLoader) {
+        sUserManuallyStopped = true;
         stopFailoverMonitor();
         unregisterNetworkWatchdog(context);
+        releaseForcedContinuityLocks();
         sConnectedProfileId = "";
         sKeepalivePausedForIdle = false;
         if (context != null) {
@@ -1326,12 +1546,13 @@ public final class WireGuardManager {
                     String pubHex = normalizeKeyToHex(item.publicKey);
                     String pskHex = safeTrim(item.presharedKey).isEmpty() ? "" : normalizeKeyToHex(item.presharedKey);
                     String ep = useDoH ? safeTrim(item.endpoint) : preResolveEndpoint(item.endpoint);
+                    syncEndpointDnsHintsToNative(context, item.endpoint);
                     long rtt = Wgbridge.probeEndpointHandshakeMs(
                             privHex,
                             pskHex,
                             pubHex,
                             ep,
-                            item.toAwgParamsString(),
+                            item.toEffectiveAwgParamsString(),
                             useDoH,
                             3800L
                     );
@@ -1421,6 +1642,7 @@ public final class WireGuardManager {
         }
 
         try {
+            syncEndpointDnsHintsToNative(context, draft.endpoint);
             long optimal = Wgbridge.discoverOptimalMTU(
                     privHex,
                     pskHex,
@@ -1428,7 +1650,7 @@ public final class WireGuardManager {
                     dns,
                     pubHex,
                     ep,
-                    draft.toAwgParamsString(),
+                    draft.toEffectiveAwgParamsString(),
                     useDoH,
                     "",
                     2800L
@@ -1452,12 +1674,22 @@ public final class WireGuardManager {
     }
 
     /**
-     * Driven by Application.ActivityLifecycleCallbacks to relax persistent keepalives after 90s of background idle
-     * (stopping overnight 4G/5G radio wakeups) and immediately restore keepalive on foreground resume.
+     * Driven by Application.ActivityLifecycleCallbacks to ensure immediate zero-delay tunnel
+     * verification and Telegram tgnet socket wake-up on foreground resume, while maintaining
+     * 24/7 CGNAT NAT persistence in the background.
      */
     public static void onAppForegroundStateChanged(
             final Context context,
             final String moduleApkPath,
+            final boolean inForeground
+    ) {
+        onAppForegroundStateChanged(context, moduleApkPath, null, inForeground);
+    }
+
+    public static void onAppForegroundStateChanged(
+            final Context context,
+            final String moduleApkPath,
+            final ClassLoader telegramClassLoader,
             final boolean inForeground
     ) {
         sAppInForeground = inForeground;
@@ -1470,39 +1702,81 @@ public final class WireGuardManager {
         }
 
         if (inForeground) {
-            if (sKeepalivePausedForIdle) {
-                restoreActiveKeepaliveNow(context, moduleApkPath);
-            }
-        } else if (isSmartKeepaliveEnabled(context) && h != null) {
-            sPendingIdleSaverTask = () -> {
-                if (!sAppInForeground && isSmartKeepaliveEnabled(context) && isTunnelRunning(context, moduleApkPath)) {
-                    new Thread(() -> {
-                        try {
-                            Wgbridge.setPeerKeepalive(0L);
-                            sKeepalivePausedForIdle = true;
-                        } catch (Throwable ignored) {
+            getGuardianExecutor().execute(() -> {
+                try {
+                    if (sKeepalivePausedForIdle) {
+                        restoreActiveKeepaliveNow(context, moduleApkPath);
+                    }
+                    if (!sUserManuallyStopped && !isTunnelRunning(context, moduleApkPath)) {
+                        if (isAutoConnectEnabled(context) || !sConnectedProfileId.isEmpty()) {
+                            TunnelConfig cfg = loadConfig(context);
+                            if (cfg.hasPeerConfigured()) {
+                                startAndBindProfile(context, cfg, moduleApkPath, telegramClassLoader);
+                                return;
+                            }
                         }
-                    }, "wg-plus-idle-saver").start();
+                    }
+                    if (isTunnelRunning(context, moduleApkPath)) {
+                        acquireForcedContinuityLocks(context);
+                        Wgbridge.ensureTunnelAlive(1400L);
+                        int activePort = getActivePort(context, moduleApkPath);
+                        if (activePort > 0 && telegramClassLoader != null) {
+                            postBindTelegramProxy(
+                                    context,
+                                    telegramClassLoader,
+                                    true,
+                                    activePort,
+                                    isRouteCallsEnabled(context)
+                            );
+                        }
+                    }
+                } catch (Throwable ignored) {
                 }
-            };
-            h.postDelayed(sPendingIdleSaverTask, 90_000L);
+            });
+        } else {
+            // In background: keep WakeLock/WifiLock held and keep CGNAT pinhole alive (25s max interval, never 0)
+            getGuardianExecutor().execute(() -> {
+                try {
+                    if (isTunnelRunning(context, moduleApkPath)) {
+                        acquireForcedContinuityLocks(context);
+                        if (isSmartKeepaliveEnabled(context)) {
+                            Wgbridge.setPeerKeepalive(25L);
+                            sKeepalivePausedForIdle = true;
+                        } else {
+                            TunnelConfig activeCfg = getConnectedProfile(context, moduleApkPath);
+                            int ka = activeCfg != null ? clampKeepAlive(activeCfg.keepAlive) : 20;
+                            if (isCellularNetworkActive(context)) {
+                                ka = Math.min(20, ka);
+                            }
+                            Wgbridge.setPeerKeepalive(ka);
+                        }
+                        if (telegramClassLoader != null) {
+                            XposedProxyReflector.nudgeTelegramConnections(telegramClassLoader);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+            });
         }
     }
 
     private static void restoreActiveKeepaliveNow(final Context context, final String moduleApkPath) {
-        new Thread(() -> {
+        getGuardianExecutor().execute(() -> {
             try {
                 if (!isTunnelRunning(context, moduleApkPath)) {
                     sKeepalivePausedForIdle = false;
                     return;
                 }
                 TunnelConfig activeCfg = getConnectedProfile(context, moduleApkPath);
-                int ka = activeCfg != null ? clampKeepAlive(activeCfg.keepAlive) : 25;
+                int ka = activeCfg != null ? clampKeepAlive(activeCfg.keepAlive) : 20;
+                if (isCellularNetworkActive(context)) {
+                    ka = Math.min(20, ka);
+                }
                 Wgbridge.setPeerKeepalive(ka);
                 sKeepalivePausedForIdle = false;
             } catch (Throwable ignored) {
             }
-        }, "wg-plus-keepalive-restore").start();
+        });
     }
 
     private static void startFailoverMonitor(
@@ -1511,42 +1785,32 @@ public final class WireGuardManager {
             final ClassLoader telegramClassLoader
     ) {
         stopFailoverMonitor();
-        final Handler h = getMainHandler();
-        if (context == null || !isAutoFailoverEnabled(context) || h == null) {
+        if (context == null) {
             return;
         }
         final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
-        sFailoverTickerTask = new Runnable() {
-            @Override
-            public void run() {
-                if (!isAutoFailoverEnabled(appCtx) || !isTunnelRunning(appCtx, moduleApkPath)) {
-                    return;
-                }
-                if (sAppInForeground && !sFailoverCheckRunning) {
-                    sFailoverCheckRunning = true;
-                    new Thread(() -> {
-                        try {
-                            evaluateTunnelHealthAndFailover(appCtx, moduleApkPath, telegramClassLoader);
-                        } finally {
-                            sFailoverCheckRunning = false;
-                        }
-                    }, "wg-plus-failover").start();
-                }
-                if (sFailoverTickerTask == this) {
-                    h.postDelayed(this, 25_000L);
-                }
+        ScheduledExecutorService exec = getGuardianExecutor();
+        sGuardianFuture = exec.scheduleWithFixedDelay(() -> {
+            if (sUserManuallyStopped || sFailoverCheckRunning) {
+                return;
             }
-        };
-        h.postDelayed(sFailoverTickerTask, 25_000L);
+            sFailoverCheckRunning = true;
+            try {
+                evaluateTunnelHealthAndFailover(appCtx, moduleApkPath, telegramClassLoader);
+            } catch (Throwable ignored) {
+            } finally {
+                sFailoverCheckRunning = false;
+            }
+        }, 10L, 10L, TimeUnit.SECONDS);
     }
 
     private static void stopFailoverMonitor() {
-        Handler h = getMainHandler();
-        if (sFailoverTickerTask != null) {
-            if (h != null) {
-                h.removeCallbacks(sFailoverTickerTask);
+        if (sGuardianFuture != null) {
+            try {
+                sGuardianFuture.cancel(false);
+            } catch (Throwable ignored) {
             }
-            sFailoverTickerTask = null;
+            sGuardianFuture = null;
         }
         sConsecutiveHealthFailures = 0;
     }
@@ -1556,6 +1820,50 @@ public final class WireGuardManager {
             final String moduleApkPath,
             final ClassLoader telegramClassLoader
     ) {
+        if (sUserManuallyStopped) {
+            return;
+        }
+        try {
+            NativeBridgeLoader.ensureLoaded(appCtx, moduleApkPath);
+        } catch (Throwable ignored) {
+            return;
+        }
+
+        // 1. Self-heal if tunnel unexpectedly stopped while supposed to be active 24/7
+        if (!Wgbridge.isRunning()) {
+            if (isAutoConnectEnabled(appCtx) || !sConnectedProfileId.isEmpty()) {
+                TunnelConfig target = getConnectedProfile(appCtx, moduleApkPath);
+                if (target == null || !target.hasPeerConfigured()) {
+                    target = loadConfig(appCtx);
+                }
+                if (target != null && target.hasPeerConfigured()) {
+                    try {
+                        startAndBindProfile(appCtx, target, moduleApkPath, telegramClassLoader);
+                        return;
+                    } catch (Throwable ignored) {
+                    }
+                }
+            } else {
+                return;
+            }
+        }
+
+        acquireForcedContinuityLocks(appCtx);
+
+        // 2. Ensure active tunnel is responsive; if stale or stalled, EnsureTunnelAlive triggers immediate rebind + handshake
+        boolean alive = false;
+        try {
+            alive = Wgbridge.ensureTunnelAlive(2200L);
+        } catch (Throwable ignored) {
+        }
+        if (alive) {
+            sConsecutiveHealthFailures = 0;
+            if (telegramClassLoader != null) {
+                XposedProxyReflector.nudgeTelegramConnections(telegramClassLoader);
+            }
+            return;
+        }
+
         List<TunnelConfig> profiles = loadProfiles(appCtx);
         List<TunnelConfig> backups = new ArrayList<>();
         String currentId = getConnectedProfileId(appCtx, moduleApkPath);
@@ -1570,32 +1878,32 @@ public final class WireGuardManager {
                 backups.add(p);
             }
         }
-        if (backups.isEmpty() || currentCfg == null) {
+        if (currentCfg == null && !profiles.isEmpty()) {
+            currentCfg = profiles.get(0);
+        }
+        if (currentCfg == null || !currentCfg.hasPeerConfigured()) {
             return;
         }
 
-        TunnelStats stats = getLiveStats(appCtx, moduleApkPath);
-        long nowSec = System.currentTimeMillis() / 1000L;
-        boolean handshakeFresh = stats.lastHandshakeSec > 0 && (nowSec - stats.lastHandshakeSec) < 185L;
-        if (handshakeFresh) {
-            sConsecutiveHealthFailures = 0;
-            return;
-        }
-
-        // Active handshake is stale or missing -> probe current server once directly
+        // 3. Probe current server directly
         boolean useDoH = isDohEnabled(appCtx);
         try {
+            syncEndpointDnsHintsToNative(appCtx, currentCfg.endpoint);
             long rtt = Wgbridge.probeEndpointHandshakeMs(
                     normalizeKeyToHex(currentCfg.privateKey),
                     safeTrim(currentCfg.presharedKey).isEmpty() ? "" : normalizeKeyToHex(currentCfg.presharedKey),
                     normalizeKeyToHex(currentCfg.publicKey),
                     useDoH ? safeTrim(currentCfg.endpoint) : preResolveEndpoint(currentCfg.endpoint),
-                    currentCfg.toAwgParamsString(),
+                    currentCfg.toEffectiveAwgParamsString(),
                     useDoH,
-                    3000L
+                    2800L
             );
             if (rtt > 0) {
                 sConsecutiveHealthFailures = 0;
+                Wgbridge.forceRebindAndHandshake();
+                if (telegramClassLoader != null) {
+                    XposedProxyReflector.nudgeTelegramConnections(telegramClassLoader);
+                }
                 return;
             }
         } catch (Throwable ignored) {
@@ -1606,32 +1914,44 @@ public final class WireGuardManager {
             return;
         }
 
-        // Current peer failed two consecutive health checks -> fail over to first healthy backup
-        for (final TunnelConfig candidate : backups) {
-            try {
-                long candRtt = Wgbridge.probeEndpointHandshakeMs(
-                        normalizeKeyToHex(candidate.privateKey),
-                        safeTrim(candidate.presharedKey).isEmpty() ? "" : normalizeKeyToHex(candidate.presharedKey),
-                        normalizeKeyToHex(candidate.publicKey),
-                        useDoH ? safeTrim(candidate.endpoint) : preResolveEndpoint(candidate.endpoint),
-                        candidate.toAwgParamsString(),
-                        useDoH,
-                        3200L
-                );
-                if (candRtt > 0) {
-                    sPingCacheMs.put(candidate.id, (int) candRtt);
-                    startAndBindProfile(appCtx, candidate, moduleApkPath, telegramClassLoader);
-                    final boolean isAr = isArabic(appCtx);
-                    Handler h = getMainHandler();
-                    if (h != null) {
-                        h.post(() -> Toast.makeText(
-                                appCtx,
-                                WgStrings.toastFailoverSwitched(isAr, candidate.name),
-                                Toast.LENGTH_LONG
-                        ).show());
+        // 4. If Auto-Failover is enabled and backup profiles exist, switch to first healthy backup
+        if (isAutoFailoverEnabled(appCtx) && !backups.isEmpty()) {
+            for (final TunnelConfig candidate : backups) {
+                try {
+                    syncEndpointDnsHintsToNative(appCtx, candidate.endpoint);
+                    long candRtt = Wgbridge.probeEndpointHandshakeMs(
+                            normalizeKeyToHex(candidate.privateKey),
+                            safeTrim(candidate.presharedKey).isEmpty() ? "" : normalizeKeyToHex(candidate.presharedKey),
+                            normalizeKeyToHex(candidate.publicKey),
+                            useDoH ? safeTrim(candidate.endpoint) : preResolveEndpoint(candidate.endpoint),
+                            candidate.toEffectiveAwgParamsString(),
+                            useDoH,
+                            3000L
+                    );
+                    if (candRtt > 0) {
+                        sPingCacheMs.put(candidate.id, (int) candRtt);
+                        startAndBindProfile(appCtx, candidate, moduleApkPath, telegramClassLoader);
+                        final boolean isAr = isArabic(appCtx);
+                        Handler h = getMainHandler();
+                        if (h != null && sAppInForeground) {
+                            h.post(() -> Toast.makeText(
+                                    appCtx,
+                                    WgStrings.toastFailoverSwitched(isAr, candidate.name),
+                                    Toast.LENGTH_LONG
+                            ).show());
+                        }
+                        return;
                     }
-                    return;
+                } catch (Throwable ignored) {
                 }
+            }
+        }
+
+        // 5. Otherwise, hard-restart the current tunnel profile to recover from deep carrier/socket state drop
+        if (sConsecutiveHealthFailures >= 3) {
+            sConsecutiveHealthFailures = 0;
+            try {
+                startAndBindProfile(appCtx, currentCfg, moduleApkPath, telegramClassLoader);
             } catch (Throwable ignored) {
             }
         }
@@ -2022,7 +2342,22 @@ public final class WireGuardManager {
                 ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
                     @Override
                     public void onAvailable(Network network) {
-                        handleRoamingEvent(appCtx, moduleApkPath, telegramClassLoader);
+                        scheduleDebouncedRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, 150L);
+                    }
+
+                    @Override
+                    public void onLost(Network network) {
+                        scheduleDebouncedRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, 350L);
+                    }
+
+                    @Override
+                    public void onCapabilitiesChanged(Network network, NetworkCapabilities networkCapabilities) {
+                        scheduleDebouncedRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, 450L);
+                    }
+
+                    @Override
+                    public void onLinkPropertiesChanged(Network network, LinkProperties linkProperties) {
+                        scheduleDebouncedRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, 350L);
                     }
                 };
                 cm.registerNetworkCallback(req, cb);
@@ -2038,6 +2373,13 @@ public final class WireGuardManager {
             return;
         }
         synchronized (WATCHDOG_LOCK) {
+            if (sRoamingDebounceFuture != null) {
+                try {
+                    sRoamingDebounceFuture.cancel(false);
+                } catch (Throwable ignored) {
+                }
+                sRoamingDebounceFuture = null;
+            }
             if (sNetworkCallback == null) {
                 return;
             }
@@ -2053,42 +2395,74 @@ public final class WireGuardManager {
         }
     }
 
+    private static void scheduleDebouncedRoamingEvent(
+            final Context appCtx,
+            final String moduleApkPath,
+            final ClassLoader telegramClassLoader,
+            final long delayMs
+    ) {
+        synchronized (WATCHDOG_LOCK) {
+            if (sRoamingDebounceFuture != null) {
+                try {
+                    sRoamingDebounceFuture.cancel(false);
+                } catch (Throwable ignored) {
+                }
+            }
+            sRoamingDebounceFuture = getGuardianExecutor().schedule(
+                    () -> handleRoamingEvent(appCtx, moduleApkPath, telegramClassLoader),
+                    delayMs,
+                    TimeUnit.MILLISECONDS
+            );
+        }
+    }
+
     private static void handleRoamingEvent(
             final Context appCtx,
             final String moduleApkPath,
             final ClassLoader telegramClassLoader
     ) {
         long now = System.currentTimeMillis();
-        if (now - sLastRoamingUpdateMs < 2500L) {
+        if (now - sLastRoamingUpdateMs < 900L) {
             return;
         }
         sLastRoamingUpdateMs = now;
 
-        new Thread(() -> {
-            try {
-                if (!isTunnelRunning(appCtx, moduleApkPath)) {
-                    return;
+        try {
+            if (!isTunnelRunning(appCtx, moduleApkPath)) {
+                if (!sUserManuallyStopped && (isAutoConnectEnabled(appCtx) || !sConnectedProfileId.isEmpty())) {
+                    TunnelConfig cfg = loadConfig(appCtx);
+                    if (cfg.hasPeerConfigured()) {
+                        startAndBindProfile(appCtx, cfg, moduleApkPath, telegramClassLoader);
+                    }
                 }
-                int activePort = getActivePort(appCtx, moduleApkPath);
-                if (activePort <= 0) {
-                    return;
-                }
-                String rawEp = sWatchdogRawEndpoint;
-                if (rawEp != null && !rawEp.isEmpty()) {
-                    boolean useDoH = isDohEnabled(appCtx);
-                    String ep = useDoH ? rawEp : preResolveEndpoint(rawEp);
-                    Wgbridge.updatePeerEndpoint(ep);
-                }
-                postBindTelegramProxy(
-                        appCtx,
-                        telegramClassLoader,
-                        true,
-                        activePort,
-                        isRouteCallsEnabled(appCtx)
-                );
-            } catch (Throwable ignored) {
+                return;
             }
-        }, "wg-plus-roaming").start();
+            int activePort = getActivePort(appCtx, moduleApkPath);
+            if (activePort <= 0) {
+                return;
+            }
+            acquireForcedContinuityLocks(appCtx);
+            String rawEp = sWatchdogRawEndpoint;
+            if (rawEp != null && !rawEp.isEmpty()) {
+                syncEndpointDnsHintsToNative(appCtx, rawEp);
+                boolean useDoH = isDohEnabled(appCtx);
+                String ep = useDoH ? rawEp : preResolveEndpoint(rawEp);
+                Wgbridge.updatePeerEndpoint(ep);
+            } else {
+                Wgbridge.forceRebindAndHandshake();
+            }
+            if (isCellularNetworkActive(appCtx)) {
+                Wgbridge.setPeerKeepalive(20L);
+            }
+            postBindTelegramProxy(
+                    appCtx,
+                    telegramClassLoader,
+                    true,
+                    activePort,
+                    isRouteCallsEnabled(appCtx)
+            );
+        } catch (Throwable ignored) {
+        }
     }
 
     private static final class XposedProxyReflector {
@@ -2148,6 +2522,60 @@ public final class WireGuardManager {
                     );
                 } catch (Throwable ignored) {
                 }
+            }
+
+            if (enabled) {
+                nudgeTelegramConnections(classLoader);
+            }
+        }
+
+        static void nudgeTelegramConnections(ClassLoader classLoader) {
+            if (classLoader == null) {
+                return;
+            }
+            try {
+                Class<?> connectionsManagerClass = XposedHelpers.findClass(
+                        "org.telegram.tgnet.ConnectionsManager",
+                        classLoader
+                );
+                for (int acc = 0; acc < 4; acc++) {
+                    try {
+                        XposedHelpers.callStaticMethod(
+                                connectionsManagerClass,
+                                "native_resumeNetwork",
+                                new Class<?>[]{int.class, boolean.class},
+                                acc,
+                                false
+                        );
+                    } catch (Throwable ignored) {
+                    }
+                    try {
+                        Object inst = XposedHelpers.callStaticMethod(
+                                connectionsManagerClass,
+                                "getInstance",
+                                new Class<?>[]{int.class},
+                                acc
+                        );
+                        if (inst != null) {
+                            try {
+                                XposedHelpers.callMethod(
+                                        inst,
+                                        "setAppPaused",
+                                        new Class<?>[]{boolean.class, boolean.class},
+                                        false,
+                                        false
+                                );
+                            } catch (Throwable ignored) {
+                            }
+                            try {
+                                XposedHelpers.callMethod(inst, "checkConnection");
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            } catch (Throwable ignored) {
             }
         }
     }

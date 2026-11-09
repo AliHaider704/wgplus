@@ -50,17 +50,51 @@ var (
 			serverName: "dns.google",
 			url:        "https://dns.google/dns-query",
 		},
+		{
+			dialAddr:   "8.8.4.4:443",
+			serverName: "dns.google",
+			url:        "https://dns.google/dns-query",
+		},
+		{
+			dialAddr:   "9.9.9.9:443",
+			serverName: "dns.quad9.net",
+			url:        "https://dns.quad9.net/dns-query",
+		},
 	}
 
-	dohMu    sync.Mutex
-	dohCache = make(map[string]dohCacheEntry)
+	directUdpDnsServers = []string{
+		"1.1.1.1:53",
+		"8.8.8.8:53",
+		"1.0.0.1:53",
+		"9.9.9.9:53",
+	}
+
+	dohMu         sync.Mutex
+	dohCache      = make(map[string]dohCacheEntry)
+	dohStaleCache = make(map[string]string) // Last-Known-Good IP fallback across network blackouts
 )
 
-// ClearDnsCache flushes cached DoH endpoint resolutions (used on network handoff / roaming).
+// ClearDnsCache flushes TTL-cached DoH endpoint resolutions (used on network handoff / roaming)
+// while preserving last-known-good emergency fallback IPs in dohStaleCache.
 func ClearDnsCache() {
 	dohMu.Lock()
 	dohCache = make(map[string]dohCacheEntry)
 	dohMu.Unlock()
+}
+
+// RegisterEndpointIpHint records a verified or pre-resolved IPv4 address for a hostname
+// so Go can fall back to it in 0ms if carrier DNS and DoH are both unreachable on mobile data.
+func RegisterEndpointIpHint(host string, ip string) {
+	hKey := strings.ToLower(strings.TrimSpace(host))
+	ipClean := strings.TrimSpace(ip)
+	if hKey == "" || ipClean == "" {
+		return
+	}
+	if parsed, err := netip.ParseAddr(ipClean); err == nil && parsed.Is4() && !isSinkholeIPv4(parsed, false) {
+		dohMu.Lock()
+		dohStaleCache[hKey] = parsed.String()
+		dohMu.Unlock()
+	}
 }
 
 func getCachedDoH(host string) (string, bool) {
@@ -75,12 +109,23 @@ func getCachedDoH(host string) (string, bool) {
 	return ent.ip, true
 }
 
+func getStaleCachedIP(host string) (string, bool) {
+	key := strings.ToLower(strings.TrimSpace(host))
+	dohMu.Lock()
+	defer dohMu.Unlock()
+	ip, ok := dohStaleCache[key]
+	return ip, ok && ip != ""
+}
+
 func putCachedDoH(host, ip string) {
 	key := strings.ToLower(strings.TrimSpace(host))
 	dohMu.Lock()
 	dohCache[key] = dohCacheEntry{
 		ip:        ip,
 		expiresAt: time.Now().Add(dohCacheTTL),
+	}
+	if ip != "" {
+		dohStaleCache[key] = ip
 	}
 	dohMu.Unlock()
 }
@@ -156,6 +201,10 @@ func isSinkholeIPv4(addr netip.Addr, allowLoopback bool) bool {
 	b := addr.As4()
 	// 0.0.0.0/8 sinkhole block
 	if b[0] == 0 {
+		return true
+	}
+	// 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16 ISP intercept sinkholes (when not loopback)
+	if !allowLoopback && addr.IsPrivate() {
 		return true
 	}
 	return false
@@ -275,8 +324,76 @@ func newDirectDoHClient(up dohUpstream) *http.Client {
 	return &http.Client{Transport: tr}
 }
 
-// ResolveEndpointDoH resolves a host:port WireGuard endpoint using encrypted RFC 8484 DNS-over-HTTPS
-// (Cloudflare 1.1.1.1 / 1.0.0.1 and Google 8.8.8.8) with bogon/sinkhole filtering, falling back to system DNS if unavailable.
+func resolveHostViaParallelDoH(host string, timeout time.Duration) (netip.Addr, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	resCh := make(chan netip.Addr, len(dohUpstreams))
+	for _, up := range dohUpstreams {
+		upstream := up
+		go func() {
+			client := newDirectDoHClient(upstream)
+			addr, err := resolveHostViaDoHEndpoint(ctx, client, upstream.url, host, false)
+			if err == nil && addr.IsValid() {
+				select {
+				case resCh <- addr:
+				default:
+				}
+			}
+		}()
+	}
+
+	var got int
+	for got < len(dohUpstreams) {
+		select {
+		case winner := <-resCh:
+			return winner, nil
+		case <-ctx.Done():
+			return netip.Addr{}, errors.New("parallel DoH resolution timed out")
+		}
+	}
+	return netip.Addr{}, errors.New("all DoH upstreams failed")
+}
+
+func resolveHostViaDirectUdpDns(ctx context.Context, dnsServerAddr string, host string) (netip.Addr, error) {
+	wireQuery, err := encodeDnsQueryA(host)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	// Prepend non-zero transaction ID (0x5747)
+	wireQuery[0] = 0x57
+	wireQuery[1] = 0x47
+
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, "udp4", dnsServerAddr)
+	if err != nil {
+		return netip.Addr{}, err
+	}
+	defer conn.Close()
+
+	if dl, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	} else {
+		_ = conn.SetDeadline(time.Now().Add(1200 * time.Millisecond))
+	}
+
+	if _, err := conn.Write(wireQuery); err != nil {
+		return netip.Addr{}, err
+	}
+	resp := make([]byte, 1024)
+	n, err := conn.Read(resp)
+	if err != nil || n < 12 {
+		return netip.Addr{}, errors.New("short UDP DNS reply")
+	}
+	if resp[0] != 0x57 || resp[1] != 0x47 {
+		return netip.Addr{}, errors.New("UDP DNS txid mismatch")
+	}
+	return parseDnsResponseA(resp[:n], false)
+}
+
+// ResolveEndpointDoH resolves a host:port WireGuard endpoint using a parallel Happy-Eyeballs race
+// across encrypted RFC 8484 DNS-over-HTTPS upstreams (Cloudflare, Google, Quad9) with bogon/sinkhole
+// filtering, falling back to parallel direct UDP DNS, system DNS, and last-known-good IP cache.
 func ResolveEndpointDoH(rawEndpoint string, useDoH bool) (string, error) {
 	ep := strings.TrimSpace(rawEndpoint)
 	host, portStr, err := net.SplitHostPort(ep)
@@ -294,41 +411,71 @@ func ResolveEndpointDoH(rawEndpoint string, useDoH bool) (string, error) {
 		return net.JoinHostPort("127.0.0.1", strconv.Itoa(portNum)), nil
 	}
 
+	if cachedIP, ok := getCachedDoH(host); ok {
+		return net.JoinHostPort(cachedIP, strconv.Itoa(portNum)), nil
+	}
+
 	if useDoH {
-		if cachedIP, ok := getCachedDoH(host); ok {
-			return net.JoinHostPort(cachedIP, strconv.Itoa(portNum)), nil
-		}
-		for _, up := range dohUpstreams {
-			ctx, cancel := context.WithTimeout(context.Background(), 3500*time.Millisecond)
-			client := newDirectDoHClient(up)
-			addr, dohErr := resolveHostViaDoHEndpoint(ctx, client, up.url, host, false)
-			cancel()
-			if dohErr == nil && addr.IsValid() {
-				ipStr := addr.String()
-				putCachedDoH(host, ipStr)
-				return net.JoinHostPort(ipStr, strconv.Itoa(portNum)), nil
-			}
+		if addr, dohErr := resolveHostViaParallelDoH(host, 2200*time.Millisecond); dohErr == nil && addr.IsValid() {
+			ipStr := addr.String()
+			putCachedDoH(host, ipStr)
+			return net.JoinHostPort(ipStr, strconv.Itoa(portNum)), nil
 		}
 	}
 
-	return resolveEndpointSystem(host, portNum)
+	if sysAddr, sysErr := resolveEndpointFastFallback(host, portNum); sysErr == nil {
+		return sysAddr, nil
+	}
+
+	// Emergency fallback: if mobile carrier blocked both DoH and DNS during handoff, use last-known-good IP
+	if staleIP, ok := getStaleCachedIP(host); ok {
+		return net.JoinHostPort(staleIP, strconv.Itoa(portNum)), nil
+	}
+
+	return "", fmt.Errorf("failed to resolve endpoint host %q", host)
 }
 
-func resolveEndpointSystem(host string, portNum int) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+func resolveEndpointFastFallback(host string, portNum int) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 1800*time.Millisecond)
 	defer cancel()
 
-	ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-	if err != nil || len(ips) == 0 {
-		return "", fmt.Errorf("failed to resolve endpoint host %q: %w", host, err)
+	resCh := make(chan string, len(directUdpDnsServers)+1)
+
+	// Race 1: Direct UDP DNS queries to 1.1.1.1:53, 8.8.8.8:53, 1.0.0.1:53, 9.9.9.9:53
+	for _, srv := range directUdpDnsServers {
+		dnsSrv := srv
+		go func() {
+			if addr, err := resolveHostViaDirectUdpDns(ctx, dnsSrv, host); err == nil && addr.IsValid() {
+				select {
+				case resCh <- addr.String():
+				default:
+				}
+			}
+		}()
 	}
-	chosen := ips[0].Unmap()
-	for _, candidate := range ips {
-		c := candidate.Unmap()
-		if c.Is4() && !isSinkholeIPv4(c, false) {
-			chosen = c
-			break
+
+	// Race 2: System Resolver
+	go func() {
+		ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		if err == nil && len(ips) > 0 {
+			for _, candidate := range ips {
+				c := candidate.Unmap()
+				if c.Is4() && !isSinkholeIPv4(c, false) {
+					select {
+					case resCh <- c.String():
+					default:
+					}
+					return
+				}
+			}
 		}
+	}()
+
+	select {
+	case ipStr := <-resCh:
+		putCachedDoH(host, ipStr)
+		return net.JoinHostPort(ipStr, strconv.Itoa(portNum)), nil
+	case <-ctx.Done():
+		return "", fmt.Errorf("failed to resolve endpoint host %q: timeout", host)
 	}
-	return net.JoinHostPort(chosen.String(), strconv.Itoa(portNum)), nil
 }
