@@ -30,17 +30,29 @@ const (
 )
 
 var (
-	mu               sync.Mutex
-	activeDev        *device.Device
-	activeListener   net.Listener
-	activeCancel     context.CancelFunc
-	activePort       int
-	activePeerPubHex string
-	activeRawEp      string
-	activeUseDoH     bool
-	activeKeepAlive  int
-	activeStartTime  time.Time
-	running          bool
+	mu                sync.Mutex
+	rebindMu          sync.Mutex
+	activeDev         *device.Device
+	activeCtx         context.Context
+	activeCancel      context.CancelFunc
+	activeTnet        *fastNet
+	activePort        int
+	activePeerPubHex  string
+	activePskHex      string
+	activeResolvedEp  string
+	activeRawEp       string
+	activeUseDoH      bool
+	activeKeepAlive   int
+	activeStartTime   time.Time
+	baseRxBytes       uint64
+	baseTxBytes       uint64
+	running           bool
+	muxListener       net.Listener
+	muxPort           int
+	muxKillSwitch     bool
+	muxStartupPend    bool
+	muxNotifyCh       chan struct{}
+	preferredMuxPorts = []int{48729, 48730, 48731, 48732, 0}
 
 	tcpCopyBufPool = sync.Pool{
 		New: func() any {
@@ -163,6 +175,46 @@ func triggerPeerHandshakeDirect(dev *device.Device, pubHex string, isRetry bool)
 	}
 }
 
+type peerHandshakeParams struct {
+	pubHex     string
+	pskHex     string
+	resolvedEp string
+	keepAlive  int
+}
+
+func applyPeerUapi(dev *device.Device, params peerHandshakeParams, privHex string, replacePeers bool) error {
+	if dev == nil || params.pubHex == "" {
+		return errors.New("missing WireGuard peer config")
+	}
+	var uapi strings.Builder
+	if privHex != "" {
+		fmt.Fprintf(&uapi, "private_key=%s\n", privHex)
+	}
+	if replacePeers {
+		uapi.WriteString("replace_peers=true\n")
+	}
+	fmt.Fprintf(&uapi, "public_key=%s\n", params.pubHex)
+	if params.pskHex != "" {
+		fmt.Fprintf(&uapi, "preshared_key=%s\n", params.pskHex)
+	}
+	if params.resolvedEp != "" {
+		fmt.Fprintf(&uapi, "endpoint=%s\n", params.resolvedEp)
+	}
+	uapi.WriteString("allowed_ip=0.0.0.0/0\n")
+	uapi.WriteString("allowed_ip=::/0\n")
+	if params.keepAlive > 0 {
+		fmt.Fprintf(&uapi, "persistent_keepalive_interval=%d\n", params.keepAlive)
+	}
+	return dev.IpcSet(uapi.String())
+}
+
+func isActiveDevice(dev *device.Device) bool {
+	mu.Lock()
+	ok := running && activeDev == dev && dev != nil
+	mu.Unlock()
+	return ok
+}
+
 func waitForHandshakeQuick(dev *device.Device, maxWait time.Duration) bool {
 	if dev == nil {
 		return false
@@ -172,9 +224,122 @@ func waitForHandshakeQuick(dev *device.Device, maxWait time.Duration) bool {
 		if hasCompletedHandshake(dev) {
 			return true
 		}
+		if muxDeviceClosedOrReplaced(dev) {
+			return false
+		}
 		time.Sleep(12 * time.Millisecond)
 	}
 	return hasCompletedHandshake(dev)
+}
+
+func muxDeviceClosedOrReplaced(dev *device.Device) bool {
+	mu.Lock()
+	defer mu.Unlock()
+	return activeDev != nil && activeDev != dev
+}
+
+// hopActivePeer forces wireguard-go onto a fresh OS ephemeral UDP port (listen_port=0) and,
+// when forcePeerReset is true, cleanly recreates the peer so stale lastSentHandshake (5s RekeyTimeout)
+// and stale wlan0 sticky PKTINFO source addresses are wiped before initiating a fresh Noise handshake.
+func hopActivePeer(hopPort bool, forcePeerReset bool) bool {
+	rebindMu.Lock()
+	defer rebindMu.Unlock()
+
+	mu.Lock()
+	if !running || activeDev == nil || activePeerPubHex == "" {
+		mu.Unlock()
+		return false
+	}
+	dev := activeDev
+	params := peerHandshakeParams{
+		pubHex:     activePeerPubHex,
+		pskHex:     activePskHex,
+		resolvedEp: activeResolvedEp,
+		keepAlive:  activeKeepAlive,
+	}
+	mu.Unlock()
+
+	if hopPort {
+		_ = dev.IpcSet("listen_port=0\n")
+	}
+
+	if forcePeerReset && params.resolvedEp != "" {
+		rawRx, rawTx, _ := readDeviceCounters(dev)
+		mu.Lock()
+		if !running || activeDev != dev {
+			mu.Unlock()
+			return false
+		}
+		baseRxBytes += rawRx
+		baseTxBytes += rawTx
+		params = peerHandshakeParams{
+			pubHex:     activePeerPubHex,
+			pskHex:     activePskHex,
+			resolvedEp: activeResolvedEp,
+			keepAlive:  activeKeepAlive,
+		}
+		err := applyPeerUapi(dev, params, "", true)
+		if err == nil {
+			dev.DisableSomeRoamingForBrokenMobileSemantics()
+		}
+		mu.Unlock()
+	}
+
+	triggerPeerHandshakeDirect(dev, params.pubHex, !forcePeerReset)
+	return true
+}
+
+func readActiveTotals(dev *device.Device) (rx uint64, tx uint64, hsSec int64) {
+	rawRx, rawTx, hs := readDeviceCounters(dev)
+	mu.Lock()
+	if running && activeDev == dev {
+		rx = baseRxBytes + rawRx
+		tx = baseTxBytes + rawTx
+	} else {
+		rx, tx = rawRx, rawTx
+	}
+	mu.Unlock()
+	return rx, tx, hs
+}
+
+func notifyMuxWaitersLocked() {
+	if muxNotifyCh != nil {
+		close(muxNotifyCh)
+	}
+	muxNotifyCh = make(chan struct{})
+}
+
+func ensureMuxListenerLocked() (int, error) {
+	if muxListener != nil && muxPort > 0 {
+		return muxPort, nil
+	}
+	var ln net.Listener
+	var err error
+	for _, p := range preferredMuxPorts {
+		ln, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
+		if err == nil {
+			break
+		}
+	}
+	if err != nil {
+		return 0, fmt.Errorf("failed to bind local SOCKS5 mux listener: %w", err)
+	}
+	muxListener = ln
+	muxPort = ln.Addr().(*net.TCPAddr).Port
+	if muxNotifyCh == nil {
+		muxNotifyCh = make(chan struct{})
+	}
+	go muxAcceptLoop(ln)
+	return muxPort, nil
+}
+
+// SetTunnelStartupPending tells the unified local SOCKS5 mux to pause incoming proxy dials briefly
+// instead of failing them while auto-connect or profile switching negotiates a new WireGuard session.
+func SetTunnelStartupPending(pending bool) {
+	mu.Lock()
+	muxStartupPend = pending
+	notifyMuxWaitersLocked()
+	mu.Unlock()
 }
 
 // StartTunnel starts the userspace WireGuard tunnel with default MTU (1280) and no PresharedKey.
@@ -248,18 +413,21 @@ func StartTunnelAdvanced(
 	}
 
 	mu.Lock()
-	defer mu.Unlock()
 
-	stopLocked()
+	stopTunnelOnlyLocked()
 
 	tunDev, tnet, err := createFastNetTUN(clientAddrs, dnsAddrs, effectiveMTU)
 	if err != nil {
+		stopMuxIfIdleLocked()
+		mu.Unlock()
 		return 0, fmt.Errorf("failed to create fast netstack TUN: %w", err)
 	}
 
 	bindImpl, err := newAwgBind(conn.NewDefaultBind(), awgCfg, privHex, pubHex)
 	if err != nil {
 		_ = tunDev.Close()
+		stopMuxIfIdleLocked()
+		mu.Unlock()
 		return 0, fmt.Errorf("failed to initialize tunnel bind: %w", err)
 	}
 
@@ -267,91 +435,93 @@ func StartTunnelAdvanced(
 	// Essential for 4G/5G CGNAT stability: prevent stray NAT packets from corrupting peer endpoint state
 	dev.DisableSomeRoamingForBrokenMobileSemantics()
 
-	var uapi strings.Builder
-	fmt.Fprintf(&uapi, "private_key=%s\n", privHex)
-	fmt.Fprintf(&uapi, "public_key=%s\n", pubHex)
-	if pskHex != "" {
-		fmt.Fprintf(&uapi, "preshared_key=%s\n", pskHex)
+	peerParams := peerHandshakeParams{
+		pubHex:     pubHex,
+		pskHex:     pskHex,
+		resolvedEp: resolvedEndpoint,
+		keepAlive:  keepAlive,
 	}
-	fmt.Fprintf(&uapi, "endpoint=%s\n", resolvedEndpoint)
-	uapi.WriteString("allowed_ip=0.0.0.0/0\n")
-	uapi.WriteString("allowed_ip=::/0\n")
-	if keepAlive > 0 {
-		fmt.Fprintf(&uapi, "persistent_keepalive_interval=%d\n", keepAlive)
-	}
-
-	if err := dev.IpcSet(uapi.String()); err != nil {
+	if err := applyPeerUapi(dev, peerParams, privHex, false); err != nil {
 		dev.Close()
+		stopMuxIfIdleLocked()
+		mu.Unlock()
 		return 0, fmt.Errorf("failed to apply WireGuard UAPI config: %w", err)
 	}
 	if err := dev.Up(); err != nil {
 		dev.Close()
+		stopMuxIfIdleLocked()
+		mu.Unlock()
 		return 0, fmt.Errorf("failed to bring WireGuard device up: %w", err)
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	port, err := ensureMuxListenerLocked()
 	if err != nil {
 		dev.Close()
-		return 0, fmt.Errorf("failed to bind local SOCKS5 listener: %w", err)
+		stopMuxIfIdleLocked()
+		mu.Unlock()
+		return 0, err
 	}
 
-	port := ln.Addr().(*net.TCPAddr).Port
 	ctx, cancel := context.WithCancel(context.Background())
 
 	activeDev = dev
-	activeListener = ln
+	activeCtx = ctx
 	activeCancel = cancel
+	activeTnet = tnet
 	activePort = port
 	activePeerPubHex = pubHex
+	activePskHex = pskHex
+	activeResolvedEp = resolvedEndpoint
 	activeRawEp = endpoint
 	activeUseDoH = useDoH
 	activeKeepAlive = keepAlive
 	activeStartTime = time.Now()
+	baseRxBytes = 0
+	baseTxBytes = 0
 	running = true
+	muxStartupPend = false
+	notifyMuxWaitersLocked()
+
+	mu.Unlock()
 
 	// Kick off immediate Noise_IKpsk2 Handshake Initiation at t=0ms
 	triggerPeerHandshakeDirect(dev, pubHex, false)
 	// Give fast peers up to 160ms to complete handshake before returning port to Telegram
 	waitForHandshakeQuick(dev, 160*time.Millisecond)
 
-	go acceptLoop(ctx, ln, tnet)
 	go tunnelWatchdogLoop(ctx, dev, pubHex)
 
 	return port, nil
 }
 
 // tunnelWatchdogLoop runs 24/7 inside the Go runtime to guarantee cellular CGNAT continuity:
-// 1. During initial startup, performs fast retry + UDP source-port hopping (BindUpdate) every 550ms
-//    instead of waiting for WireGuard's default 5000ms RekeyTimeout.
-// 2. Continuously monitors RX/TX progress and handshake freshness, automatically rebinding the local
-//    UDP socket and re-initiating handshake whenever a mobile CGNAT pinhole dies or stalls.
+// 1. During initial startup, performs fast UDP ephemeral port hopping (listen_port=0) plus clean peer
+//    refresh to bypass wireguard-go's 5s RekeyTimeout instead of waiting 5+ seconds on cellular loss.
+// 2. Continuously monitors RX/TX progress (ignoring small 32B keepalive packets) and handshake freshness,
+//    automatically hopping ports and re-handshaking whenever a mobile CGNAT pinhole collapses or stalls.
 func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) {
-	// Phase 1: Aggressive initial handshake warmup with source-port hopping
-	for attempt := 1; attempt <= 5; attempt++ {
-		if hasCompletedHandshake(dev) {
+	// Phase 1: Aggressive initial handshake warmup with real ephemeral port hops & RekeyTimeout bypass
+	retryDelays := []time.Duration{480 * time.Millisecond, 700 * time.Millisecond, 950 * time.Millisecond}
+	for _, wait := range retryDelays {
+		if hasCompletedHandshake(dev) || !isActiveDevice(dev) {
 			break
 		}
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(520 * time.Millisecond):
+		case <-time.After(wait):
 		}
-		if hasCompletedHandshake(dev) {
+		if hasCompletedHandshake(dev) || !isActiveDevice(dev) {
 			break
 		}
-		// Hop local ephemeral UDP port on retry #2 and #4 to bypass CGNAT/DPI port blackholes
-		if attempt%2 == 0 {
-			_ = dev.BindUpdate()
-		}
-		triggerPeerHandshakeDirect(dev, pubHex, true)
+		hopActivePeer(true, true)
 	}
 
 	// Phase 2: 24/7 continuous health & CGNAT pinhole guardian
-	ticker := time.NewTicker(6 * time.Second)
+	ticker := time.NewTicker(8 * time.Second)
 	defer ticker.Stop()
 
-	var lastRx uint64
-	var lastTx uint64
+	lastRx, lastTx, _ := readActiveTotals(dev)
 	var stalledTicks int
 
 	for {
@@ -360,37 +530,45 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 			return
 		case <-ticker.C:
 		}
+		if !isActiveDevice(dev) {
+			return
+		}
 
-		rx, tx, hsSec := readDeviceCounters(dev)
+		rx, tx, hsSec := readActiveTotals(dev)
 		nowSec := time.Now().Unix()
 
-		// Case A: Handshake never completed or expired (> 135s old)
-		if hsSec <= 0 || (nowSec-hsSec) > 135 {
-			_ = dev.BindUpdate()
-			triggerPeerHandshakeDirect(dev, pubHex, true)
+		if rx < lastRx || tx < lastTx {
+			lastRx, lastTx = rx, tx
 			stalledTicks = 0
-			lastRx = rx
-			lastTx = tx
 			continue
 		}
 
-		// Case B: Outbound traffic is flowing (tx increasing) but zero inbound packets (rx frozen)
-		// for 2 consecutive 6s intervals -> CGNAT pinhole collapsed or cellular IP roamed silently!
-		if tx > lastTx && rx == lastRx {
+		txDelta := tx - lastTx
+
+		// Case A: Handshake missing, expired past 195s, or >135s stale while real data is queued
+		if hsSec <= 0 || (nowSec-hsSec) > 195 || (txDelta >= 128 && (nowSec-hsSec) > 135) {
+			hopActivePeer(true, true)
+			stalledTicks = 0
+			lastRx, lastTx, _ = readActiveTotals(dev)
+			continue
+		}
+
+		// Case B: Significant outbound payload (>= 128B, ignoring 32B empty keepalive probes)
+		// with zero inbound RX across 2 consecutive 8s intervals -> CGNAT pinhole collapsed or silent IP change.
+		if txDelta >= 128 && rx == lastRx {
 			stalledTicks++
 			if stalledTicks >= 2 {
-				_ = dev.BindUpdate()
-				triggerPeerHandshakeDirect(dev, pubHex, true)
+				hopActivePeer(true, true)
 				stalledTicks = 0
-			} else if p := lookupPeerByHex(dev, pubHex); p != nil {
-				p.SendKeepalive()
+				lastRx, lastTx, _ = readActiveTotals(dev)
+				continue
 			}
+			triggerPeerHandshakeDirect(dev, pubHex, false)
 		} else {
 			stalledTicks = 0
 		}
 
-		lastRx = rx
-		lastTx = tx
+		lastRx, lastTx = rx, tx
 	}
 }
 
@@ -415,8 +593,9 @@ func readDeviceCounters(dev *device.Device) (rx uint64, tx uint64, hsSec int64) 
 	return rx, tx, hsSec
 }
 
-// UpdatePeerEndpoint updates the WireGuard peer endpoint dynamically on network handoff,
-// rebinds the local UDP socket to the active network interface, and initiates an immediate handshake.
+// UpdatePeerEndpoint updates the WireGuard peer endpoint dynamically on genuine network handoff,
+// hops onto a fresh OS ephemeral UDP port (:0), resets peer RekeyTimeout/sticky source state,
+// and waits briefly to confirm the new Noise handshake completed across the new interface.
 func UpdatePeerEndpoint(endpoint string) error {
 	mu.Lock()
 	useDoH := activeUseDoH
@@ -427,87 +606,86 @@ func UpdatePeerEndpoint(endpoint string) error {
 	if err != nil {
 		return err
 	}
+
 	mu.Lock()
 	if !running || activeDev == nil || activePeerPubHex == "" {
 		mu.Unlock()
 		return errors.New("tunnel is not running")
 	}
 	dev := activeDev
-	pubHex := activePeerPubHex
 	activeRawEp = endpoint
-	var uapi strings.Builder
-	fmt.Fprintf(&uapi, "public_key=%s\n", pubHex)
-	fmt.Fprintf(&uapi, "endpoint=%s\n", resolved)
-	err = dev.IpcSet(uapi.String())
+	activeResolvedEp = resolved
 	mu.Unlock()
 
-	if err != nil {
-		return err
+	if !hopActivePeer(true, true) {
+		return errors.New("tunnel is not running")
 	}
-	// Rebind local UDP socket to pick up the new Wi-Fi / 4G / 5G interface and trigger immediate handshake
-	_ = dev.BindUpdate()
-	triggerPeerHandshakeDirect(dev, pubHex, true)
+	if waitForHandshakeQuick(dev, 700*time.Millisecond) {
+		return nil
+	}
+	// Second attempt after 180ms in case Android netd switched cellular routes asynchronously
+	time.Sleep(180 * time.Millisecond)
+	if !isActiveDevice(dev) {
+		return nil
+	}
+	hopActivePeer(true, true)
+	_ = waitForHandshakeQuick(dev, 850*time.Millisecond)
 	return nil
 }
 
-// ForceRebindAndHandshake hops to a fresh local UDP source port on the active network interface,
-// forces an immediate cryptographic re-handshake, and waits up to 1.2s to verify completion.
+// ForceRebindAndHandshake hops to a fresh OS ephemeral UDP source port (:0) on the active network interface,
+// forces an immediate cryptographic re-handshake (bypassing 5s RekeyTimeout), and verifies completion.
 func ForceRebindAndHandshake() bool {
 	mu.Lock()
 	dev := activeDev
-	pubHex := activePeerPubHex
 	rawEp := activeRawEp
 	useDoH := activeUseDoH
 	isUp := running
 	mu.Unlock()
 
-	if !isUp || dev == nil || pubHex == "" {
+	if !isUp || dev == nil {
 		return false
 	}
 
 	if strings.TrimSpace(rawEp) != "" {
 		ClearDnsCache()
 		if resolved, err := ResolveEndpointDoH(rawEp, useDoH); err == nil && resolved != "" {
-			var uapi strings.Builder
-			fmt.Fprintf(&uapi, "public_key=%s\n", pubHex)
-			fmt.Fprintf(&uapi, "endpoint=%s\n", resolved)
-			_ = dev.IpcSet(uapi.String())
+			mu.Lock()
+			if running && activeDev == dev {
+				activeResolvedEp = resolved
+			}
+			mu.Unlock()
 		}
 	}
 
-	_ = dev.BindUpdate()
-	if peer := lookupPeerByHex(dev, pubHex); peer != nil {
-		_ = peer.SendHandshakeInitiation(true)
+	if !hopActivePeer(true, true) {
+		return false
 	}
-
-	if waitForHandshakeQuick(dev, 550*time.Millisecond) {
+	if waitForHandshakeQuick(dev, 600*time.Millisecond) {
 		return true
 	}
 	// Second port hop if first packet was dropped during cellular radio state transition
-	_ = dev.BindUpdate()
-	triggerPeerHandshakeDirect(dev, pubHex, true)
-	return waitForHandshakeQuick(dev, 650*time.Millisecond)
+	if !hopActivePeer(true, true) {
+		return false
+	}
+	return waitForHandshakeQuick(dev, 750*time.Millisecond)
 }
 
-// EnsureTunnelAlive checks if the active tunnel has a fresh verified handshake and responsive UDP path;
-// if stale, it performs an immediate socket rebind + handshake within timeoutMs.
+// EnsureTunnelAlive checks if the active tunnel has a fresh verified handshake;
+// if stale (>= 120s) or uninitialized, it performs a fresh port hop + immediate re-handshake within timeoutMs.
 func EnsureTunnelAlive(timeoutMs int) bool {
 	mu.Lock()
 	dev := activeDev
-	pubHex := activePeerPubHex
 	isUp := running
 	mu.Unlock()
 
-	if !isUp || dev == nil || pubHex == "" {
+	if !isUp || dev == nil {
 		return false
 	}
 
 	_, _, hsSec := readDeviceCounters(dev)
 	nowSec := time.Now().Unix()
-	if hsSec > 0 && (nowSec-hsSec) < 75 {
-		if peer := lookupPeerByHex(dev, pubHex); peer != nil {
-			peer.SendKeepalive()
-		}
+	if hsSec > 0 && (nowSec-hsSec) < 120 {
 		return true
 	}
 
@@ -518,14 +696,16 @@ func EnsureTunnelAlive(timeoutMs int) bool {
 		timeoutMs = 5000
 	}
 
-	_ = dev.BindUpdate()
-	triggerPeerHandshakeDirect(dev, pubHex, true)
+	if !hopActivePeer(true, true) {
+		return false
+	}
 	half := time.Duration(timeoutMs/2) * time.Millisecond
 	if waitForHandshakeQuick(dev, half) {
 		return true
 	}
-	_ = dev.BindUpdate()
-	triggerPeerHandshakeDirect(dev, pubHex, true)
+	if !hopActivePeer(true, true) {
+		return false
+	}
 	return waitForHandshakeQuick(dev, half)
 }
 
@@ -554,82 +734,79 @@ func GetTunnelStats() string {
 	mu.Lock()
 	dev := activeDev
 	isUp := running
+	baseRx := baseRxBytes
+	baseTx := baseTxBytes
 	mu.Unlock()
 
 	if !isUp || dev == nil {
 		return ""
 	}
-	ipcOut, err := dev.IpcGet()
-	if err != nil || ipcOut == "" {
-		return ""
-	}
-
-	var rx, tx, hs string
-	for _, line := range strings.Split(ipcOut, "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "rx_bytes=") {
-			rx = strings.TrimPrefix(line, "rx_bytes=")
-		} else if strings.HasPrefix(line, "tx_bytes=") {
-			tx = strings.TrimPrefix(line, "tx_bytes=")
-		} else if strings.HasPrefix(line, "last_handshake_time_sec=") {
-			hs = strings.TrimPrefix(line, "last_handshake_time_sec=")
-		}
-	}
-	if rx == "" {
-		rx = "0"
-	}
-	if tx == "" {
-		tx = "0"
-	}
-	if hs == "" {
-		hs = "0"
-	}
-	return fmt.Sprintf("rx_bytes=%s\ntx_bytes=%s\nlast_handshake_time_sec=%s", rx, tx, hs)
+	rawRx, rawTx, hsSec := readDeviceCounters(dev)
+	return fmt.Sprintf("rx_bytes=%d\ntx_bytes=%d\nlast_handshake_time_sec=%d",
+		baseRx+rawRx, baseTx+rawTx, hsSec)
 }
 
-// StopTunnel stops the active SOCKS5 listener and closes the WireGuard device.
+// StopTunnel stops the active WireGuard device and closes the unified local SOCKS5 listener
+// unless KillSwitchGuard is currently protecting outbound traffic.
 func StopTunnel() {
 	mu.Lock()
 	defer mu.Unlock()
 	stopLocked()
 }
 
-func stopLocked() {
+func stopTunnelOnlyLocked() {
 	if activeCancel != nil {
 		activeCancel()
 		activeCancel = nil
 	}
-	if activeListener != nil {
-		_ = activeListener.Close()
-		activeListener = nil
-	}
+	activeCtx = nil
+	activeTnet = nil
 	if activeDev != nil {
 		activeDev.Close()
 		activeDev = nil
 	}
 	activePort = 0
 	activePeerPubHex = ""
+	activePskHex = ""
+	activeResolvedEp = ""
 	activeRawEp = ""
 	activeUseDoH = false
 	activeKeepAlive = 0
+	baseRxBytes = 0
+	baseTxBytes = 0
 	running = false
+}
+
+func stopMuxIfIdleLocked() {
+	if !running && !muxKillSwitch && muxListener != nil {
+		_ = muxListener.Close()
+		muxListener = nil
+		muxPort = 0
+	}
+	notifyMuxWaitersLocked()
+}
+
+func stopLocked() {
+	stopTunnelOnlyLocked()
+	muxStartupPend = false
+	stopMuxIfIdleLocked()
 }
 
 // IsRunning returns true if the tunnel and SOCKS5 listener are active.
 func IsRunning() bool {
 	mu.Lock()
 	defer mu.Unlock()
-	return running && activeListener != nil && activeDev != nil
+	return running && muxListener != nil && activeDev != nil
 }
 
 // GetActivePort returns the active local SOCKS5 port, or 0 if stopped.
 func GetActivePort() int {
 	mu.Lock()
 	defer mu.Unlock()
-	if !running {
+	if !running || muxListener == nil {
 		return 0
 	}
-	return activePort
+	return muxPort
 }
 
 func tuneLocalTcpSocket(c net.Conn) {
@@ -640,13 +817,10 @@ func tuneLocalTcpSocket(c net.Conn) {
 	}
 }
 
-func acceptLoop(ctx context.Context, ln net.Listener, tnet *fastNet) {
+func muxAcceptLoop(ln net.Listener) {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
-				return
-			}
 			if ne, ok := err.(net.Error); ok && ne.Temporary() {
 				time.Sleep(25 * time.Millisecond)
 				continue
@@ -654,7 +828,39 @@ func acceptLoop(ctx context.Context, ln net.Listener, tnet *fastNet) {
 			return
 		}
 		tuneLocalTcpSocket(c)
-		go handleSocks5Client(ctx, c, tnet)
+		go handleMuxConn(c)
+	}
+}
+
+func awaitMuxRouteReady(maxWait time.Duration) (context.Context, udpDialer, bool) {
+	deadline := time.Now().Add(maxWait)
+	for {
+		mu.Lock()
+		isUp := running
+		dialer := activeTnet
+		ctx := activeCtx
+		lnOpen := muxListener != nil
+		pending := muxStartupPend
+		ch := muxNotifyCh
+		mu.Unlock()
+
+		if isUp && dialer != nil && ctx != nil {
+			return ctx, dialer, true
+		}
+		if !lnOpen || !pending {
+			return nil, nil, false
+		}
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			return nil, nil, false
+		}
+		timer := time.NewTimer(rem)
+		select {
+		case <-ch:
+			timer.Stop()
+		case <-timer.C:
+			return nil, nil, false
+		}
 	}
 }
 
@@ -721,47 +927,46 @@ func awaitInitialHandshakeBeforeDial(ctx context.Context) {
 	}
 }
 
-func handleSocks5Client(ctx context.Context, client net.Conn, dialer udpDialer) {
-	defer client.Close()
-
-	_ = client.SetDeadline(time.Now().Add(20 * time.Second))
-
+func readSocks5HandshakeAndReq(client net.Conn) (cmd byte, host string, dstPort uint16, reqParsed bool) {
 	// 1. Greeting: VER, NMETHODS, METHODS...
 	hdr := make([]byte, 2)
 	if _, err := io.ReadFull(client, hdr); err != nil {
-		return
+		return 0, "", 0, false
 	}
 	if hdr[0] != 0x05 {
-		return
+		return 0, "", 0, false
 	}
 	nMethods := int(hdr[1])
 	if nMethods > 0 {
 		methods := make([]byte, nMethods)
 		if _, err := io.ReadFull(client, methods); err != nil {
-			return
+			return 0, "", 0, false
 		}
 	}
 	// Reply: SOCKS5, NO AUTHENTICATION REQUIRED (0x00)
 	if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
-		return
+		return 0, "", 0, false
 	}
 
 	// 2. Request: VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT
 	reqHdr := make([]byte, 4)
 	if _, err := io.ReadFull(client, reqHdr); err != nil {
-		return
+		return 0, "", 0, false
 	}
 	if reqHdr[0] != 0x05 {
-		return
+		return 0, "", 0, false
 	}
 
-	cmd := reqHdr[1]
+	cmd = reqHdr[1]
 	host, dstPort, err := readSocks5Target(client, reqHdr[3])
 	if err != nil {
 		_, _ = client.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
+		return 0, "", 0, false
 	}
+	return cmd, host, dstPort, true
+}
 
+func dispatchSocks5Cmd(ctx context.Context, client net.Conn, dialer udpDialer, cmd byte, host string, dstPort uint16) {
 	switch cmd {
 	case 0x01: // TCP CONNECT (MTProto signaling, channels, media, VoIP TCP fallback)
 		handleTcpConnect(ctx, client, dialer, host, dstPort)
@@ -770,6 +975,35 @@ func handleSocks5Client(ctx context.Context, client net.Conn, dialer udpDialer) 
 	default:
 		_, _ = client.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	}
+}
+
+func handleSocks5Client(ctx context.Context, client net.Conn, dialer udpDialer) {
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(20 * time.Second))
+
+	cmd, host, dstPort, ok := readSocks5HandshakeAndReq(client)
+	if !ok {
+		return
+	}
+	dispatchSocks5Cmd(ctx, client, dialer, cmd, host, dstPort)
+}
+
+func handleMuxConn(client net.Conn) {
+	defer client.Close()
+	_ = client.SetDeadline(time.Now().Add(20 * time.Second))
+
+	cmd, host, dstPort, ok := readSocks5HandshakeAndReq(client)
+	if !ok {
+		return
+	}
+
+	devCtx, dialer, allowed := awaitMuxRouteReady(2800 * time.Millisecond)
+	if !allowed {
+		// Fail closed: zero plaintext traffic leaves device when tunnel is down.
+		_, _ = client.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	dispatchSocks5Cmd(devCtx, client, dialer, cmd, host, dstPort)
 }
 
 type writeCloserConn interface {

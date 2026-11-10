@@ -2,8 +2,13 @@ package org.telegram.wgplus.module;
 
 import android.app.Activity;
 import android.app.Application;
+import android.app.Notification;
+import android.app.NotificationChannel;
+import android.app.NotificationManager;
+import android.app.Service;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.ServiceInfo;
 import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
@@ -60,6 +65,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
         hookProxyListActivity(lpparam);
         hookVoipCalls(lpparam);
         hookConnectionsManagerKeepAlive(lpparam);
+        hookNotificationsService(lpparam);
         hookActivityFilePickerResult(lpparam);
     }
 
@@ -81,6 +87,14 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                 final Context hostAppCtx = appContext;
                                 NativeBridgeLoader.ensureLoaded(hostAppCtx, MODULE_PATH);
 
+                                final boolean autoConnect = WireGuardManager.isAutoConnectEnabled(hostAppCtx);
+                                if (autoConnect) {
+                                    try {
+                                        wgbridge.Wgbridge.setTunnelStartupPending(true);
+                                    } catch (Throwable ignored) {
+                                    }
+                                }
+
                                 // 1. Engage strict fail-closed Kill Switch immediately before any network socket opens
                                 if (WireGuardManager.isKillSwitchEnabled(hostAppCtx)) {
                                     int ksPort = WireGuardManager.enforceKillSwitchIfDisconnected(
@@ -95,9 +109,12 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
 
                                 // 2. Register ActivityLifecycleCallbacks for 24/7 Continuity & Foreground Fast-Resume
                                 registerSmartKeepaliveLifecycle(hostAppCtx, lpparam.classLoader);
+                                if (WireGuardManager.shouldForceTelegramAlwaysAwake(hostAppCtx, MODULE_PATH)) {
+                                    WireGuardManager.syncForegroundKeepaliveService(hostAppCtx, true);
+                                }
 
                                 // 3. Auto-start configured WireGuard / AmneziaWG tunnel if enabled
-                                if (WireGuardManager.isAutoConnectEnabled(hostAppCtx)) {
+                                if (autoConnect) {
                                     new Thread(() -> {
                                         try {
                                             int port = WireGuardManager.startAndBind(
@@ -108,6 +125,11 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                             XposedBridge.log("WGPlus: Auto-started WireGuard tunnel on 127.0.0.1:" + port);
                                         } catch (Throwable err) {
                                             XposedBridge.log("WGPlus: Auto-start failed: " + err.getMessage());
+                                        } finally {
+                                            try {
+                                                wgbridge.Wgbridge.setTunnelStartupPending(false);
+                                            } catch (Throwable ignored) {
+                                            }
                                         }
                                     }, "wg-plus-autostart").start();
                                 }
@@ -200,7 +222,9 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                     return;
                                 }
                                 boolean pausing = Boolean.TRUE.equals(param.args[0]);
-                                if (!pausing) {
+                                boolean byScreenState = Boolean.TRUE.equals(param.args[1]);
+                                // Screen-state calls can also trigger native_pauseNetwork in Telegram when appResumeCount == 0
+                                if (!pausing && !byScreenState) {
                                     return;
                                 }
                                 Context ctx = getOrResolveAppContext(lpparam.classLoader);
@@ -230,8 +254,171 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                         }
                     }
             );
+            XposedHelpers.findAndHookMethod(
+                    cmClass,
+                    "native_setNetworkAvailable",
+                    int.class,
+                    boolean.class,
+                    int.class,
+                    boolean.class,
+                    new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                if (param.args == null || param.args.length < 4) {
+                                    return;
+                                }
+                                if (Boolean.TRUE.equals(param.args[3])) {
+                                    Context ctx = getOrResolveAppContext(lpparam.classLoader);
+                                    if (WireGuardManager.shouldForceTelegramAlwaysAwake(ctx, MODULE_PATH)) {
+                                        param.args[3] = false;
+                                    }
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+            );
         } catch (Throwable t) {
             XposedBridge.log("WGPlus: ConnectionsManager keepalive hook warning: " + t.getMessage());
+        }
+    }
+
+    /**
+     * Promotes Telegram's declared NotificationsService (foregroundServiceType=dataSync) to an active
+     * foreground service while 24/7 WireGuard continuity is enabled so Samsung Freecess and Doze do not
+     * freeze or demote the process into background cgroups while the screen is off.
+     */
+    private void hookNotificationsService(final XC_LoadPackage.LoadPackageParam lpparam) {
+        try {
+            final Class<?> nsClass = XposedHelpers.findClassIfExists(
+                    "org.telegram.messenger.NotificationsService",
+                    lpparam.classLoader
+            );
+            if (nsClass == null) {
+                return;
+            }
+            XposedHelpers.findAndHookMethod(
+                    nsClass,
+                    "onStartCommand",
+                    Intent.class,
+                    int.class,
+                    int.class,
+                    new XC_MethodHook(XCallback.PRIORITY_DEFAULT) {
+                        @Override
+                        protected void afterHookedMethod(MethodHookParam param) {
+                            try {
+                                if (!(param.thisObject instanceof Service)) {
+                                    return;
+                                }
+                                Service service = (Service) param.thisObject;
+                                Intent intent = param.args != null && param.args.length > 0 && param.args[0] instanceof Intent
+                                        ? (Intent) param.args[0]
+                                        : null;
+                                boolean stopRequested = intent != null && intent.getBooleanExtra(
+                                        WireGuardManager.EXTRA_STOP_FOREGROUND_KEEPALIVE,
+                                        false
+                                );
+                                boolean forceAwake = !stopRequested
+                                        && WireGuardManager.shouldForceTelegramAlwaysAwake(service, MODULE_PATH);
+                                if (forceAwake) {
+                                    promoteNotificationsServiceToForeground(service);
+                                    param.setResult(Service.START_STICKY);
+                                } else {
+                                    demoteNotificationsService(service, stopRequested);
+                                }
+                            } catch (Throwable t) {
+                                XposedBridge.log("WGPlus: NotificationsService hook warning: " + t.getMessage());
+                            }
+                        }
+                    }
+            );
+            XposedBridge.hookAllMethods(nsClass, "onTimeout", new XC_MethodHook(XCallback.PRIORITY_DEFAULT) {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (param.thisObject instanceof Service) {
+                            demoteNotificationsService((Service) param.thisObject, true);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+        } catch (Throwable t) {
+            XposedBridge.log("WGPlus: Failed hooking NotificationsService: " + t.getMessage());
+        }
+    }
+
+    private static void promoteNotificationsServiceToForeground(Service service) {
+        if (service == null) {
+            return;
+        }
+        boolean isAr = WireGuardManager.isArabic(service);
+        String title = isAr ? "حماية استمرارية الاتصال" : "Continuity Guard Active";
+        String body = isAr
+                ? "النفق المشفر يعمل باستمرار للحفاظ على الرسائل والمكالمات"
+                : "Encrypted tunnel is active for continuous messages and calls";
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            NotificationManager nm = (NotificationManager) service.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) {
+                NotificationChannel ch = new NotificationChannel(
+                        WireGuardManager.FG_NOTIFICATION_CHANNEL_ID,
+                        title,
+                        NotificationManager.IMPORTANCE_MIN
+                );
+                ch.setShowBadge(false);
+                ch.setSound(null, null);
+                ch.enableVibration(false);
+                ch.setLockscreenVisibility(Notification.VISIBILITY_SECRET);
+                nm.createNotificationChannel(ch);
+            }
+        }
+
+        int smallIcon = android.R.drawable.stat_notify_sync;
+        if (service.getApplicationInfo() != null && service.getApplicationInfo().icon != 0) {
+            smallIcon = service.getApplicationInfo().icon;
+        }
+
+        Notification.Builder builder = Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                ? new Notification.Builder(service, WireGuardManager.FG_NOTIFICATION_CHANNEL_ID)
+                : new Notification.Builder(service);
+        Notification notification = builder
+                .setSmallIcon(smallIcon)
+                .setContentTitle(title)
+                .setContentText(body)
+                .setOngoing(true)
+                .setShowWhen(false)
+                .build();
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            service.startForeground(
+                    WireGuardManager.FG_NOTIFICATION_ID,
+                    notification,
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            );
+        } else {
+            service.startForeground(WireGuardManager.FG_NOTIFICATION_ID, notification);
+        }
+    }
+
+    private static void demoteNotificationsService(Service service, boolean stopSelf) {
+        if (service == null) {
+            return;
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                service.stopForeground(Service.STOP_FOREGROUND_REMOVE);
+            } else {
+                service.stopForeground(true);
+            }
+        } catch (Throwable ignored) {
+        }
+        if (stopSelf) {
+            try {
+                service.stopSelf();
+            } catch (Throwable ignored) {
+            }
         }
     }
 

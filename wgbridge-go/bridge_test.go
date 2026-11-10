@@ -1035,5 +1035,103 @@ func TestForceRebindAndHandshakeAndEnsureTunnelAliveAndIpHint(t *testing.T) {
 	if string(resp) != "REBIND_RECOVERY_OK" {
 		t.Fatalf("expected REBIND_RECOVERY_OK, got %q", string(resp))
 	}
+
+	// Verify rapid back-to-back ForceRebindAndHandshake (<5s wireguard-go RekeyTimeout) STILL succeeds
+	// and preserves monotonic RX/TX counters across peer resets
+	statsBefore := GetTunnelStats()
+	if !ForceRebindAndHandshake() {
+		t.Fatalf("expected rapid back-to-back ForceRebindAndHandshake() to bypass 5s RekeyTimeout and succeed")
+	}
+	if err := UpdatePeerEndpoint(fmt.Sprintf("127.0.0.1:%d", srv.udpPort)); err != nil {
+		t.Fatalf("rapid UpdatePeerEndpoint failed: %v", err)
+	}
+	c2, err := dialSocks5TcpIPv4(socksPort, [4]byte{10, 96, 0, 1}, 8086)
+	if err != nil {
+		t.Fatalf("SOCKS5 dial after rapid UpdatePeerEndpoint failed: %v", err)
+	}
+	resp2, _ := io.ReadAll(c2)
+	_ = c2.Close()
+	if string(resp2) != "REBIND_RECOVERY_OK" {
+		t.Fatalf("expected REBIND_RECOVERY_OK after roaming, got %q", string(resp2))
+	}
+	statsAfter := GetTunnelStats()
+	if statsBefore == "" || statsAfter == "" {
+		t.Fatalf("expected non-empty stats before=%q after=%q", statsBefore, statsAfter)
+	}
+}
+
+func TestUnifiedMuxPreservesPortAcrossKillSwitchStartupAndPause(t *testing.T) {
+	StopKillSwitchGuard()
+	StopTunnel()
+
+	ksPort, err := StartKillSwitchGuard()
+	if err != nil || ksPort <= 0 {
+		t.Fatalf("StartKillSwitchGuard failed: port=%d err=%v", ksPort, err)
+	}
+	defer StopKillSwitchGuard()
+
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	srv := startLocalWgServer(t, "10.97.0.1", 1280, clientPub, "", "")
+	defer srv.closeAll()
+
+	tcpLn, err := srv.tnet.ListenTCP(&net.TCPAddr{IP: net.IPv4(10, 97, 0, 1), Port: 8087})
+	if err != nil {
+		t.Fatalf("ListenTCP failed: %v", err)
+	}
+	defer tcpLn.Close()
+	go func() {
+		for {
+			c, aErr := tcpLn.Accept()
+			if aErr != nil {
+				return
+			}
+			_, _ = c.Write([]byte("MUX_SEAMLESS_OK"))
+			_ = c.Close()
+		}
+	}()
+
+	// Signal startup pending and verify concurrent SOCKS5 dial waits cleanly for StartTunnelAdvanced
+	SetTunnelStartupPending(true)
+	dialRes := make(chan error, 1)
+	go func() {
+		c, dErr := dialSocks5TcpIPv4(ksPort, [4]byte{10, 97, 0, 1}, 8087)
+		if dErr != nil {
+			dialRes <- dErr
+			return
+		}
+		b, _ := io.ReadAll(c)
+		_ = c.Close()
+		if string(b) != "MUX_SEAMLESS_OK" {
+			dialRes <- fmt.Errorf("unexpected mux payload %q", string(b))
+			return
+		}
+		dialRes <- nil
+	}()
+
+	time.Sleep(120 * time.Millisecond)
+	tunPort, err := StartTunnelAdvanced(
+		clientPriv,
+		"",
+		"10.97.0.2/32",
+		"1.1.1.1",
+		srv.pubHex,
+		fmt.Sprintf("127.0.0.1:%d", srv.udpPort),
+		20,
+		1280,
+		"",
+		false,
+	)
+	if err != nil {
+		SetTunnelStartupPending(false)
+		t.Fatalf("StartTunnelAdvanced failed: %v", err)
+	}
+	defer StopTunnel()
+
+	if tunPort != ksPort {
+		t.Fatalf("expected unified mux port %d == ksPort %d (no stale port pollution)", tunPort, ksPort)
+	}
+	if err := <-dialRes; err != nil {
+		t.Fatalf("pending SOCKS5 dial during mux transition failed: %v", err)
+	}
 }
 

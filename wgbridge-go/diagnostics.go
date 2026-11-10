@@ -11,98 +11,46 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 )
 
-var (
-	ksMu       sync.Mutex
-	ksListener net.Listener
-	ksPort     int
-)
-
-// StartKillSwitchGuard starts an isolated fail-closed SOCKS5 listener on 127.0.0.1:0 that deterministically
-// rejects all outbound TCP CONNECT and UDP ASSOCIATE requests while the WireGuard tunnel is down or negotiating.
+// StartKillSwitchGuard ensures the unified fail-closed local SOCKS5 mux listener is bound on
+// 127.0.0.1 and rejects all outbound TCP CONNECT and UDP ASSOCIATE requests whenever the WireGuard
+// tunnel is stopped (and not paused by startupPending). Reuses the exact same local port as StartTunnel.
 func StartKillSwitchGuard() (int, error) {
-	ksMu.Lock()
-	defer ksMu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
 
-	if ksListener != nil && ksPort > 0 {
-		return ksPort, nil
-	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	muxKillSwitch = true
+	port, err := ensureMuxListenerLocked()
 	if err != nil {
-		return 0, fmt.Errorf("failed binding kill-switch guard: %w", err)
+		muxKillSwitch = false
+		return 0, err
 	}
-	ksListener = ln
-	ksPort = ln.Addr().(*net.TCPAddr).Port
-
-	go ksAcceptLoop(ln)
-	return ksPort, nil
+	notifyMuxWaitersLocked()
+	return port, nil
 }
 
-// StopKillSwitchGuard stops the local fail-closed kill-switch listener if active.
+// StopKillSwitchGuard disables the kill-switch guard and closes the mux listener if the tunnel is down.
 func StopKillSwitchGuard() {
-	ksMu.Lock()
-	ln := ksListener
-	ksListener = nil
-	ksPort = 0
-	ksMu.Unlock()
-
-	if ln != nil {
-		_ = ln.Close()
-	}
+	mu.Lock()
+	muxKillSwitch = false
+	muxStartupPend = false
+	stopMuxIfIdleLocked()
+	mu.Unlock()
 }
 
-// GetKillSwitchPort returns the active local kill-switch port, or 0 if inactive.
+// GetKillSwitchPort returns the active local kill-switch/mux port, or 0 if guard is disabled.
 func GetKillSwitchPort() int {
-	ksMu.Lock()
-	defer ksMu.Unlock()
-	if ksListener == nil {
+	mu.Lock()
+	defer mu.Unlock()
+	if !muxKillSwitch || muxListener == nil {
 		return 0
 	}
-	return ksPort
-}
-
-func ksAcceptLoop(ln net.Listener) {
-	for {
-		c, err := ln.Accept()
-		if err != nil {
-			return
-		}
-		go handleKillSwitchConn(c)
-	}
-}
-
-func handleKillSwitchConn(c net.Conn) {
-	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
-
-	hdr := make([]byte, 2)
-	if _, err := io.ReadFull(c, hdr); err != nil || hdr[0] != 0x05 {
-		return
-	}
-	nMethods := int(hdr[1])
-	if nMethods > 0 {
-		methods := make([]byte, nMethods)
-		if _, err := io.ReadFull(c, methods); err != nil {
-			return
-		}
-	}
-	if _, err := c.Write([]byte{0x05, 0x00}); err != nil {
-		return
-	}
-
-	reqHdr := make([]byte, 4)
-	if _, err := io.ReadFull(c, reqHdr); err != nil {
-		return
-	}
-	_, _, _ = readSocks5Target(c, reqHdr[3])
-	// Reply 0x01 (General SOCKS server failure) and close immediately: zero packets leave the device.
-	_, _ = c.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	return muxPort
 }
 
 // ProbeEndpointHandshakeMs performs an isolated cryptographic WireGuard / AmneziaWG handshake probe
@@ -165,17 +113,12 @@ func ProbeEndpointHandshakeMs(
 	probeDev.DisableSomeRoamingForBrokenMobileSemantics()
 	defer probeDev.Close()
 
-	var uapi strings.Builder
-	fmt.Fprintf(&uapi, "private_key=%s\n", privHex)
-	fmt.Fprintf(&uapi, "public_key=%s\n", pubHex)
-	if pskHex != "" {
-		fmt.Fprintf(&uapi, "preshared_key=%s\n", pskHex)
+	peerParams := peerHandshakeParams{
+		pubHex:     pubHex,
+		pskHex:     pskHex,
+		resolvedEp: resolvedEndpoint,
 	}
-	fmt.Fprintf(&uapi, "endpoint=%s\n", resolvedEndpoint)
-	uapi.WriteString("allowed_ip=0.0.0.0/0\n")
-	uapi.WriteString("allowed_ip=::/0\n")
-
-	if err := probeDev.IpcSet(uapi.String()); err != nil {
+	if err := applyPeerUapi(probeDev, peerParams, privHex, false); err != nil {
 		return 0, err
 	}
 	if err := probeDev.Up(); err != nil {
@@ -190,7 +133,7 @@ func ProbeEndpointHandshakeMs(
 	triggerHandshakePacket(probeTnet)
 
 	retryStep := 0
-	nextRetrigger := start.Add(650 * time.Millisecond)
+	nextRetrigger := start.Add(550 * time.Millisecond)
 	for time.Now().Before(deadline) {
 		if hasCompletedHandshake(probeDev) {
 			ms := int(time.Since(start).Milliseconds())
@@ -202,10 +145,12 @@ func ProbeEndpointHandshakeMs(
 		if time.Now().After(nextRetrigger) {
 			retryStep++
 			if retryStep%2 == 1 {
-				_ = probeDev.BindUpdate()
+				_ = probeDev.IpcSet("listen_port=0\n")
 			}
-			triggerPeerHandshakeDirect(probeDev, pubHex, true)
-			nextRetrigger = time.Now().Add(750 * time.Millisecond)
+			_ = applyPeerUapi(probeDev, peerParams, "", true)
+			probeDev.DisableSomeRoamingForBrokenMobileSemantics()
+			triggerPeerHandshakeDirect(probeDev, pubHex, false)
+			nextRetrigger = time.Now().Add(650 * time.Millisecond)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}

@@ -1,9 +1,11 @@
 package org.telegram.wgplus.module;
 
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.Configuration;
 import android.net.ConnectivityManager;
+import android.net.LinkAddress;
 import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
@@ -13,6 +15,7 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.SystemClock;
 import android.util.Log;
 import android.widget.Toast;
 
@@ -33,6 +36,7 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Locale;
@@ -70,6 +74,12 @@ public final class WireGuardManager {
     public static final String KEY_ACTIVE_PROFILE_ID = "wg_active_profile_id";
     public static final String KEY_CONNECTED_PROFILE_ID = "wg_connected_profile_id";
     private static final String KEY_DNS_LKG_CACHE_JSON = "wg_dns_lkg_cache_json";
+    private static final String KEY_MIGRATED_FORCED_CONTINUITY_V1 = "wg_migrated_forced_continuity_v1";
+
+    public static final String EXTRA_STOP_FOREGROUND_KEEPALIVE = "wgplus_stop_fg_keepalive";
+    public static final String FG_NOTIFICATION_CHANNEL_ID = "wgplus_keepalive_silent_channel";
+    public static final int FG_NOTIFICATION_ID = 49107;
+    private static final String FG_SERVICE_CLASS = "org.telegram.messenger.NotificationsService";
 
     // Legacy v1.1.0 single-profile keys (transparently migrated once)
     public static final String KEY_PRIVATE_KEY = "wg_private_key";
@@ -98,6 +108,11 @@ public final class WireGuardManager {
     private static volatile String sConnectedProfileId = "";
     private static volatile long sLastRoamingUpdateMs = 0L;
     private static volatile boolean sUserManuallyStopped = false;
+    private static volatile String sLastActiveNetworkSignature = "";
+    private static volatile int sActiveTunnelMtu = 1280;
+    private static volatile Boolean sLastBoundEnabled = null;
+    private static volatile int sLastBoundPort = -1;
+    private static volatile boolean sLastBoundRouteCalls = false;
 
     // Live Ping RTT cache (profileId -> ms, or -1 on timeout)
     private static final Map<String, Integer> sPingCacheMs = new ConcurrentHashMap<>();
@@ -403,14 +418,28 @@ public final class WireGuardManager {
     }
 
     public static boolean isSmartKeepaliveEnabled(Context context) {
-        return context != null && getPrefs(context).getBoolean(KEY_SMART_KEEPALIVE, false);
+        if (context == null) {
+            return false;
+        }
+        SharedPreferences prefs = getPrefs(context);
+        if (!prefs.getBoolean(KEY_MIGRATED_FORCED_CONTINUITY_V1, false)) {
+            prefs.edit()
+                    .putBoolean(KEY_SMART_KEEPALIVE, false)
+                    .putBoolean(KEY_MIGRATED_FORCED_CONTINUITY_V1, true)
+                    .commit();
+            return false;
+        }
+        return prefs.getBoolean(KEY_SMART_KEEPALIVE, false);
     }
 
     public static void setSmartKeepaliveEnabled(Context context, String moduleApkPath, boolean enabled) {
         if (context == null) {
             return;
         }
-        getPrefs(context).edit().putBoolean(KEY_SMART_KEEPALIVE, enabled).apply();
+        getPrefs(context).edit()
+                .putBoolean(KEY_SMART_KEEPALIVE, enabled)
+                .putBoolean(KEY_MIGRATED_FORCED_CONTINUITY_V1, true)
+                .apply();
         if (!enabled && sKeepalivePausedForIdle) {
             restoreActiveKeepaliveNow(context, moduleApkPath);
         }
@@ -513,6 +542,96 @@ public final class WireGuardManager {
             return caps != null && caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR);
         } catch (Throwable ignored) {
             return false;
+        }
+    }
+
+    private static int effectiveKeepAlive(Context context, int configuredKeepAlive) {
+        int clamped = clampKeepAlive(configuredKeepAlive);
+        return isCellularNetworkActive(context) ? Math.min(18, clamped) : clamped;
+    }
+
+    public static void syncForegroundKeepaliveService(Context context, boolean active) {
+        if (context == null) {
+            return;
+        }
+        try {
+            Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+            Intent intent = new Intent();
+            intent.setClassName(appCtx.getPackageName(), FG_SERVICE_CLASS);
+            if (!active) {
+                intent.putExtra(EXTRA_STOP_FOREGROUND_KEEPALIVE, true);
+                try {
+                    appCtx.startService(intent);
+                } catch (Throwable ignored) {
+                }
+                return;
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                appCtx.startForegroundService(intent);
+            } else {
+                appCtx.startService(intent);
+            }
+        } catch (Throwable ignored) {
+            // Android 12+ may restrict background startForegroundService; NotificationsService.onStartCommand
+            // still promotes on next foreground transition or Telegram push tick.
+        }
+    }
+
+    private static String computeActiveNetworkSignature(Context context) {
+        if (context == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return "";
+        }
+        try {
+            ConnectivityManager cm = (ConnectivityManager) context.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                return "";
+            }
+            Network active = cm.getActiveNetwork();
+            if (active == null) {
+                return "";
+            }
+            NetworkCapabilities caps = cm.getNetworkCapabilities(active);
+            if (caps == null) {
+                return "";
+            }
+            StringBuilder transport = new StringBuilder(4);
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR)) {
+                transport.append('C');
+            }
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI)) {
+                transport.append('W');
+            }
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) {
+                transport.append('E');
+            }
+            if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                transport.append('V');
+            }
+
+            String ifName = "";
+            List<String> addrs = new ArrayList<>();
+            LinkProperties lp = cm.getLinkProperties(active);
+            if (lp != null) {
+                ifName = safeTrim(lp.getInterfaceName());
+                for (LinkAddress la : lp.getLinkAddresses()) {
+                    if (la == null || la.getAddress() == null) {
+                        continue;
+                    }
+                    InetAddress addr = la.getAddress();
+                    if (addr.isLinkLocalAddress() || addr.isLoopbackAddress()) {
+                        continue;
+                    }
+                    // Track IPv4 and at most one non-local IPv6 fallback so temporary IPv6 privacy rotation
+                    // never causes spurious socket teardowns on carrier/Wi-Fi networks.
+                    if (addr instanceof Inet4Address || addrs.isEmpty()) {
+                        addrs.add(addr.getHostAddress() + "/" + la.getPrefixLength());
+                    }
+                }
+                Collections.sort(addrs);
+            }
+            return active.toString() + "|" + transport + "|" + ifName + "|" + String.join(",", addrs);
+        } catch (Throwable ignored) {
+            return "";
         }
     }
 
@@ -1336,13 +1455,17 @@ public final class WireGuardManager {
         String pskHex = safeTrim(cfg.presharedKey).isEmpty() ? "" : normalizeKeyToHex(cfg.presharedKey);
         String dns = safeTrim(cfg.dns).isEmpty() ? "1.1.1.1" : safeTrim(cfg.dns);
         boolean onCellular = isCellularNetworkActive(context);
-        int keepAlive = onCellular ? Math.min(20, clampKeepAlive(cfg.keepAlive)) : clampKeepAlive(cfg.keepAlive);
+        int keepAlive = effectiveKeepAlive(context, cfg.keepAlive);
         int mtu = onCellular ? 1280 : clampMtu(cfg.mtu);
         boolean useDoH = isDohEnabled(context);
         // When DoH is enabled, pass raw hostname straight to Go so zero plaintext port-53 DNS leaks occur!
         String endpointForGo = useDoH ? safeTrim(cfg.endpoint) : preResolveEndpoint(cfg.endpoint);
         String awgParams = cfg.toEffectiveAwgParamsString();
 
+        try {
+            Wgbridge.setTunnelStartupPending(true);
+        } catch (Throwable ignored) {
+        }
         long portLong;
         try {
             portLong = Wgbridge.startTunnelAdvanced(
@@ -1361,28 +1484,51 @@ public final class WireGuardManager {
             // If DoH failed on a captive network and host was a domain, attempt system fallback once
             String sysResolved = preResolveEndpoint(cfg.endpoint);
             if (useDoH && !sysResolved.equals(endpointForGo)) {
-                portLong = Wgbridge.startTunnelAdvanced(
-                        privHex,
-                        pskHex,
-                        safeTrim(cfg.address),
-                        dns,
-                        pubHex,
-                        sysResolved,
-                        keepAlive,
-                        mtu,
-                        awgParams,
-                        false
-                );
+                try {
+                    portLong = Wgbridge.startTunnelAdvanced(
+                            privHex,
+                            pskHex,
+                            safeTrim(cfg.address),
+                            dns,
+                            pubHex,
+                            sysResolved,
+                            keepAlive,
+                            mtu,
+                            awgParams,
+                            false
+                    );
+                } catch (Exception retryErr) {
+                    try {
+                        Wgbridge.setTunnelStartupPending(false);
+                    } catch (Throwable ignored) {
+                    }
+                    if (isKillSwitchEnabled(context)) {
+                        enforceKillSwitchIfDisconnected(context, moduleApkPath, telegramClassLoader);
+                    }
+                    throw retryErr;
+                }
             } else {
+                try {
+                    Wgbridge.setTunnelStartupPending(false);
+                } catch (Throwable ignored) {
+                }
                 if (isKillSwitchEnabled(context)) {
                     enforceKillSwitchIfDisconnected(context, moduleApkPath, telegramClassLoader);
                 }
                 throw firstErr;
             }
+        } finally {
+            try {
+                Wgbridge.setTunnelStartupPending(false);
+            } catch (Throwable ignored) {
+            }
         }
         int localPort = (int) portLong;
 
         sConnectedProfileId = cfg.id;
+        sActiveTunnelMtu = mtu;
+        sLastActiveNetworkSignature = computeActiveNetworkSignature(context);
+        sLastRoamingUpdateMs = System.currentTimeMillis();
         sKeepalivePausedForIdle = false;
         sConsecutiveHealthFailures = 0;
         getPrefs(context).edit()
@@ -1392,10 +1538,11 @@ public final class WireGuardManager {
         sWatchdogRawEndpoint = cfg.endpoint;
 
         if (telegramClassLoader != null) {
-            postBindTelegramProxy(context, telegramClassLoader, true, localPort, isRouteCallsEnabled(context));
+            postBindTelegramProxy(context, telegramClassLoader, true, localPort, isRouteCallsEnabled(context), true);
             registerNetworkWatchdog(context, moduleApkPath, telegramClassLoader);
         }
-        // Release local kill-switch listener AFTER Telegram has rebound to the live tunnel port
+        syncForegroundKeepaliveService(context, true);
+        // Release kill-switch flag AFTER tunnel mux owns the same local port cleanly
         try {
             Wgbridge.stopKillSwitchGuard();
         } catch (Throwable ignored) {
@@ -1412,6 +1559,10 @@ public final class WireGuardManager {
         releaseForcedContinuityLocks();
         sConnectedProfileId = "";
         sKeepalivePausedForIdle = false;
+        sLastActiveNetworkSignature = "";
+        sActiveTunnelMtu = 1280;
+        sLastBoundEnabled = null;
+        sLastBoundPort = -1;
         if (context != null) {
             getPrefs(context).edit().remove(KEY_CONNECTED_PROFILE_ID).commit();
         }
@@ -1424,8 +1575,11 @@ public final class WireGuardManager {
 
         if (isKillSwitchEnabled(context)) {
             enforceKillSwitchIfDisconnected(context, moduleApkPath, telegramClassLoader);
-        } else if (telegramClassLoader != null) {
-            postBindTelegramProxy(context, telegramClassLoader, false, 1080, false);
+        } else {
+            syncForegroundKeepaliveService(context, false);
+            if (telegramClassLoader != null) {
+                postBindTelegramProxy(context, telegramClassLoader, false, 1080, false, true);
+            }
         }
     }
 
@@ -1718,7 +1872,8 @@ public final class WireGuardManager {
                     }
                     if (isTunnelRunning(context, moduleApkPath)) {
                         acquireForcedContinuityLocks(context);
-                        Wgbridge.ensureTunnelAlive(1400L);
+                        syncForegroundKeepaliveService(context, true);
+                        boolean recovered = !Wgbridge.ensureTunnelAlive(1400L);
                         int activePort = getActivePort(context, moduleApkPath);
                         if (activePort > 0 && telegramClassLoader != null) {
                             postBindTelegramProxy(
@@ -1726,7 +1881,8 @@ public final class WireGuardManager {
                                     telegramClassLoader,
                                     true,
                                     activePort,
-                                    isRouteCallsEnabled(context)
+                                    isRouteCallsEnabled(context),
+                                    recovered
                             );
                         }
                     }
@@ -1734,24 +1890,22 @@ public final class WireGuardManager {
                 }
             });
         } else {
-            // In background: keep WakeLock/WifiLock held and keep CGNAT pinhole alive (25s max interval, never 0)
+            // In background: keep WakeLock/WifiLock/FG service held and keep CGNAT pinhole alive (<=18s cellular)
             getGuardianExecutor().execute(() -> {
                 try {
                     if (isTunnelRunning(context, moduleApkPath)) {
                         acquireForcedContinuityLocks(context);
+                        syncForegroundKeepaliveService(context, true);
                         if (isSmartKeepaliveEnabled(context)) {
                             Wgbridge.setPeerKeepalive(25L);
                             sKeepalivePausedForIdle = true;
                         } else {
                             TunnelConfig activeCfg = getConnectedProfile(context, moduleApkPath);
-                            int ka = activeCfg != null ? clampKeepAlive(activeCfg.keepAlive) : 20;
-                            if (isCellularNetworkActive(context)) {
-                                ka = Math.min(20, ka);
-                            }
+                            int ka = effectiveKeepAlive(context, activeCfg != null ? activeCfg.keepAlive : 20);
                             Wgbridge.setPeerKeepalive(ka);
                         }
                         if (telegramClassLoader != null) {
-                            XposedProxyReflector.nudgeTelegramConnections(telegramClassLoader);
+                            XposedProxyReflector.nudgeTelegramConnections(telegramClassLoader, false);
                         }
                     }
                 } catch (Throwable ignored) {
@@ -1768,10 +1922,7 @@ public final class WireGuardManager {
                     return;
                 }
                 TunnelConfig activeCfg = getConnectedProfile(context, moduleApkPath);
-                int ka = activeCfg != null ? clampKeepAlive(activeCfg.keepAlive) : 20;
-                if (isCellularNetworkActive(context)) {
-                    ka = Math.min(20, ka);
-                }
+                int ka = effectiveKeepAlive(context, activeCfg != null ? activeCfg.keepAlive : 20);
                 Wgbridge.setPeerKeepalive(ka);
                 sKeepalivePausedForIdle = false;
             } catch (Throwable ignored) {
@@ -1859,7 +2010,8 @@ public final class WireGuardManager {
         if (alive) {
             sConsecutiveHealthFailures = 0;
             if (telegramClassLoader != null) {
-                XposedProxyReflector.nudgeTelegramConnections(telegramClassLoader);
+                // Only nudge Telegram accounts whose ConnectionState != Connected (3)
+                XposedProxyReflector.nudgeTelegramConnections(telegramClassLoader, false);
             }
             return;
         }
@@ -1902,7 +2054,7 @@ public final class WireGuardManager {
                 sConsecutiveHealthFailures = 0;
                 Wgbridge.forceRebindAndHandshake();
                 if (telegramClassLoader != null) {
-                    XposedProxyReflector.nudgeTelegramConnections(telegramClassLoader);
+                    XposedProxyReflector.nudgeTelegramConnections(telegramClassLoader, true);
                 }
                 return;
             }
@@ -2224,10 +2376,21 @@ public final class WireGuardManager {
             final int localPort,
             final boolean routeCalls
     ) {
+        postBindTelegramProxy(context, classLoader, enabled, localPort, routeCalls, false);
+    }
+
+    public static void postBindTelegramProxy(
+            final Context context,
+            final ClassLoader classLoader,
+            final boolean enabled,
+            final int localPort,
+            final boolean routeCalls,
+            final boolean force
+    ) {
         if (classLoader == null) {
             return;
         }
-        Runnable task = () -> bindTelegramProxyInternal(context, classLoader, enabled, localPort, routeCalls);
+        Runnable task = () -> bindTelegramProxyInternal(context, classLoader, enabled, localPort, routeCalls, force);
         if (Looper.myLooper() == Looper.getMainLooper()) {
             task.run();
         } else {
@@ -2243,11 +2406,26 @@ public final class WireGuardManager {
             ClassLoader classLoader,
             boolean enabled,
             int localPort,
-            boolean routeCalls
+            boolean routeCalls,
+            boolean force
     ) {
         try {
+            Boolean prevEnabled = sLastBoundEnabled;
+            int prevPort = sLastBoundPort;
+            boolean prevRoute = sLastBoundRouteCalls;
+            boolean changed = prevEnabled == null
+                    || prevEnabled != enabled
+                    || prevPort != localPort
+                    || prevRoute != routeCalls;
+
             syncTelegramMainConfigForCalls(context, enabled, localPort, routeCalls);
-            XposedProxyReflector.apply(classLoader, enabled, localPort);
+            if (!changed && !force) {
+                return;
+            }
+            XposedProxyReflector.apply(classLoader, enabled, localPort, true);
+            sLastBoundEnabled = enabled;
+            sLastBoundPort = localPort;
+            sLastBoundRouteCalls = routeCalls;
             Log.i(TAG, "Applied Telegram proxy & call settings (enabled=" + enabled
                     + ", port=" + localPort + ", routeCalls=" + routeCalls + ")");
         } catch (Throwable t) {
@@ -2336,31 +2514,45 @@ public final class WireGuardManager {
                 if (cm == null) {
                     return;
                 }
-                NetworkRequest req = new NetworkRequest.Builder()
-                        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
-                        .build();
                 ConnectivityManager.NetworkCallback cb = new ConnectivityManager.NetworkCallback() {
                     @Override
                     public void onAvailable(Network network) {
-                        scheduleDebouncedRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, 150L);
+                        scheduleDebouncedRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, 160L, true);
                     }
 
                     @Override
                     public void onLost(Network network) {
-                        scheduleDebouncedRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, 350L);
+                        sLastActiveNetworkSignature = "";
+                        scheduleDebouncedRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, 400L, true);
                     }
 
                     @Override
                     public void onCapabilitiesChanged(Network network, NetworkCapabilities networkCapabilities) {
-                        scheduleDebouncedRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, 450L);
+                        String sig = computeActiveNetworkSignature(appCtx);
+                        if (!sig.isEmpty() && sig.equals(sLastActiveNetworkSignature)) {
+                            return;
+                        }
+                        scheduleDebouncedRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, 300L, false);
                     }
 
                     @Override
                     public void onLinkPropertiesChanged(Network network, LinkProperties linkProperties) {
-                        scheduleDebouncedRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, 350L);
+                        String sig = computeActiveNetworkSignature(appCtx);
+                        if (!sig.isEmpty() && sig.equals(sLastActiveNetworkSignature)) {
+                            return;
+                        }
+                        scheduleDebouncedRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, 260L, false);
                     }
                 };
-                cm.registerNetworkCallback(req, cb);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    // Track ONLY the OS default active network instead of every background IMS/carrier net
+                    cm.registerDefaultNetworkCallback(cb);
+                } else {
+                    NetworkRequest req = new NetworkRequest.Builder()
+                            .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                            .build();
+                    cm.registerNetworkCallback(req, cb);
+                }
                 sNetworkCallback = cb;
             } catch (Throwable t) {
                 Log.w(TAG, "Could not register network watchdog: " + t.getMessage());
@@ -2399,7 +2591,8 @@ public final class WireGuardManager {
             final Context appCtx,
             final String moduleApkPath,
             final ClassLoader telegramClassLoader,
-            final long delayMs
+            final long delayMs,
+            final boolean forceRecovery
     ) {
         synchronized (WATCHDOG_LOCK) {
             if (sRoamingDebounceFuture != null) {
@@ -2409,7 +2602,7 @@ public final class WireGuardManager {
                 }
             }
             sRoamingDebounceFuture = getGuardianExecutor().schedule(
-                    () -> handleRoamingEvent(appCtx, moduleApkPath, telegramClassLoader),
+                    () -> handleRoamingEvent(appCtx, moduleApkPath, telegramClassLoader, forceRecovery),
                     delayMs,
                     TimeUnit.MILLISECONDS
             );
@@ -2419,12 +2612,20 @@ public final class WireGuardManager {
     private static void handleRoamingEvent(
             final Context appCtx,
             final String moduleApkPath,
-            final ClassLoader telegramClassLoader
+            final ClassLoader telegramClassLoader,
+            final boolean forceRecovery
     ) {
-        long now = System.currentTimeMillis();
-        if (now - sLastRoamingUpdateMs < 900L) {
+        String currentSig = computeActiveNetworkSignature(appCtx);
+        if (currentSig.isEmpty()) {
             return;
         }
+
+        long now = System.currentTimeMillis();
+        boolean sigChanged = !currentSig.equals(sLastActiveNetworkSignature);
+        if (!sigChanged && (!forceRecovery || (now - sLastRoamingUpdateMs < 5000L))) {
+            return;
+        }
+        sLastActiveNetworkSignature = currentSig;
         sLastRoamingUpdateMs = now;
 
         try {
@@ -2437,11 +2638,22 @@ public final class WireGuardManager {
                 }
                 return;
             }
+
+            boolean onCellular = isCellularNetworkActive(appCtx);
+            TunnelConfig activeCfg = getConnectedProfile(appCtx, moduleApkPath);
+            // Moving from high-MTU Wi-Fi onto cellular CGNAT requires dropping inner MTU to 1280 cleanly
+            if (onCellular && sActiveTunnelMtu > 1280 && activeCfg != null && activeCfg.hasPeerConfigured()) {
+                startAndBindProfile(appCtx, activeCfg, moduleApkPath, telegramClassLoader);
+                return;
+            }
+
             int activePort = getActivePort(appCtx, moduleApkPath);
             if (activePort <= 0) {
                 return;
             }
             acquireForcedContinuityLocks(appCtx);
+            syncForegroundKeepaliveService(appCtx, true);
+
             String rawEp = sWatchdogRawEndpoint;
             if (rawEp != null && !rawEp.isEmpty()) {
                 syncEndpointDnsHintsToNative(appCtx, rawEp);
@@ -2451,22 +2663,23 @@ public final class WireGuardManager {
             } else {
                 Wgbridge.forceRebindAndHandshake();
             }
-            if (isCellularNetworkActive(appCtx)) {
-                Wgbridge.setPeerKeepalive(20L);
-            }
+            int desiredKa = effectiveKeepAlive(appCtx, activeCfg != null ? activeCfg.keepAlive : 20);
+            Wgbridge.setPeerKeepalive(desiredKa);
+
             postBindTelegramProxy(
                     appCtx,
                     telegramClassLoader,
                     true,
                     activePort,
-                    isRouteCallsEnabled(appCtx)
+                    isRouteCallsEnabled(appCtx),
+                    true
             );
         } catch (Throwable ignored) {
         }
     }
 
     private static final class XposedProxyReflector {
-        static void apply(ClassLoader classLoader, boolean enabled, int localPort) {
+        static void apply(ClassLoader classLoader, boolean enabled, int localPort, boolean forceNudge) {
             Class<?> connectionsManagerClass = XposedHelpers.findClass(
                     "org.telegram.tgnet.ConnectionsManager",
                     classLoader
@@ -2483,29 +2696,7 @@ public final class WireGuardManager {
                     ""
             );
 
-            try {
-                Class<?> sharedConfigClass = XposedHelpers.findClass(
-                        "org.telegram.messenger.SharedConfig",
-                        classLoader
-                );
-                if (enabled) {
-                    Class<?> proxyInfoClass = XposedHelpers.findClass(
-                            "org.telegram.messenger.SharedConfig$ProxyInfo",
-                            classLoader
-                    );
-                    Constructor<?> ctor = proxyInfoClass.getDeclaredConstructor(
-                            String.class, int.class, String.class, String.class, String.class
-                    );
-                    ctor.setAccessible(true);
-                    Object proxyInfo = ctor.newInstance("127.0.0.1", localPort, "", "", "");
-                    XposedHelpers.setStaticObjectField(sharedConfigClass, "currentProxy", proxyInfo);
-                }
-                try {
-                    XposedHelpers.setStaticBooleanField(sharedConfigClass, "proxyEnabled", enabled);
-                } catch (Throwable ignored) {
-                }
-            } catch (Throwable ignored) {
-            }
+            syncSharedConfigProxyList(classLoader, enabled, localPort);
 
             for (int acc = 0; acc < 4; acc++) {
                 try {
@@ -2525,11 +2716,96 @@ public final class WireGuardManager {
             }
 
             if (enabled) {
-                nudgeTelegramConnections(classLoader);
+                nudgeTelegramConnections(classLoader, forceNudge);
+            }
+        }
+
+        private static void syncSharedConfigProxyList(ClassLoader classLoader, boolean enabled, int localPort) {
+            try {
+                Class<?> sharedConfigClass = XposedHelpers.findClass(
+                        "org.telegram.messenger.SharedConfig",
+                        classLoader
+                );
+                try {
+                    XposedHelpers.callStaticMethod(sharedConfigClass, "loadProxyList");
+                } catch (Throwable ignored) {
+                }
+
+                @SuppressWarnings("unchecked")
+                List<Object> proxyList = (List<Object>) XposedHelpers.getStaticObjectField(sharedConfigClass, "proxyList");
+                Object keptLoopback = null;
+                if (proxyList != null) {
+                    for (int i = proxyList.size() - 1; i >= 0; i--) {
+                        Object item = proxyList.get(i);
+                        if (item == null) {
+                            proxyList.remove(i);
+                            continue;
+                        }
+                        String addr = safeTrim((String) XposedHelpers.getObjectField(item, "address"));
+                        int port = XposedHelpers.getIntField(item, "port");
+                        if ("127.0.0.1".equals(addr)) {
+                            if (enabled && port == localPort && keptLoopback == null) {
+                                keptLoopback = item;
+                            } else {
+                                proxyList.remove(i);
+                            }
+                        }
+                    }
+                }
+
+                if (enabled) {
+                    if (keptLoopback == null) {
+                        Class<?> proxyInfoClass = XposedHelpers.findClass(
+                                "org.telegram.messenger.SharedConfig$ProxyInfo",
+                                classLoader
+                        );
+                        Constructor<?> ctor = proxyInfoClass.getDeclaredConstructor(
+                                String.class, int.class, String.class, String.class, String.class
+                        );
+                        ctor.setAccessible(true);
+                        keptLoopback = ctor.newInstance("127.0.0.1", localPort, "", "", "");
+                        try {
+                            XposedHelpers.callStaticMethod(sharedConfigClass, "addProxy", keptLoopback);
+                        } catch (Throwable ignored) {
+                            if (proxyList != null) {
+                                proxyList.add(keptLoopback);
+                            }
+                        }
+                    }
+                    try {
+                        XposedHelpers.setBooleanField(keptLoopback, "available", true);
+                        XposedHelpers.setBooleanField(keptLoopback, "checking", false);
+                        XposedHelpers.setLongField(keptLoopback, "availableCheckTime", SystemClock.elapsedRealtime());
+                    } catch (Throwable ignored) {
+                    }
+                    XposedHelpers.setStaticObjectField(sharedConfigClass, "currentProxy", keptLoopback);
+                } else {
+                    try {
+                        Object cur = XposedHelpers.getStaticObjectField(sharedConfigClass, "currentProxy");
+                        if (cur != null && "127.0.0.1".equals(safeTrim((String) XposedHelpers.getObjectField(cur, "address")))) {
+                            XposedHelpers.setStaticObjectField(sharedConfigClass, "currentProxy", null);
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+
+                try {
+                    XposedHelpers.setStaticBooleanField(sharedConfigClass, "proxyEnabled", enabled);
+                } catch (Throwable ignored) {
+                }
+                try {
+                    XposedHelpers.callStaticMethod(sharedConfigClass, "saveProxyList");
+                } catch (Throwable ignored) {
+                }
+            } catch (Throwable ignored) {
             }
         }
 
         static void nudgeTelegramConnections(ClassLoader classLoader) {
+            nudgeTelegramConnections(classLoader, false);
+        }
+
+        static void nudgeTelegramConnections(ClassLoader classLoader, boolean force) {
             if (classLoader == null) {
                 return;
             }
@@ -2539,6 +2815,31 @@ public final class WireGuardManager {
                         classLoader
                 );
                 for (int acc = 0; acc < 4; acc++) {
+                    Object inst = null;
+                    try {
+                        inst = XposedHelpers.callStaticMethod(
+                                connectionsManagerClass,
+                                "getInstance",
+                                new Class<?>[]{int.class},
+                                acc
+                        );
+                    } catch (Throwable ignored) {
+                    }
+
+                    boolean needsWake = force;
+                    if (!needsWake && inst != null) {
+                        try {
+                            int state = (Integer) XposedHelpers.callMethod(inst, "getConnectionState");
+                            // ConnectionStateConnected == 3; only wake accounts not already connected
+                            needsWake = (state != 3);
+                        } catch (Throwable ignored) {
+                            needsWake = true;
+                        }
+                    }
+                    if (!needsWake) {
+                        continue;
+                    }
+
                     try {
                         XposedHelpers.callStaticMethod(
                                 connectionsManagerClass,
@@ -2549,30 +2850,21 @@ public final class WireGuardManager {
                         );
                     } catch (Throwable ignored) {
                     }
-                    try {
-                        Object inst = XposedHelpers.callStaticMethod(
-                                connectionsManagerClass,
-                                "getInstance",
-                                new Class<?>[]{int.class},
-                                acc
-                        );
-                        if (inst != null) {
-                            try {
-                                XposedHelpers.callMethod(
-                                        inst,
-                                        "setAppPaused",
-                                        new Class<?>[]{boolean.class, boolean.class},
-                                        false,
-                                        false
-                                );
-                            } catch (Throwable ignored) {
-                            }
-                            try {
-                                XposedHelpers.callMethod(inst, "checkConnection");
-                            } catch (Throwable ignored) {
-                            }
+                    if (inst != null) {
+                        try {
+                            XposedHelpers.callMethod(
+                                    inst,
+                                    "setAppPaused",
+                                    new Class<?>[]{boolean.class, boolean.class},
+                                    false,
+                                    false
+                            );
+                        } catch (Throwable ignored) {
                         }
-                    } catch (Throwable ignored) {
+                        try {
+                            XposedHelpers.callMethod(inst, "checkConnection");
+                        } catch (Throwable ignored) {
+                        }
                     }
                 }
             } catch (Throwable ignored) {
