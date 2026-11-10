@@ -16,12 +16,16 @@
 
 ```mermaid
 flowchart LR
-    subgraph L1["Layer 1: Host Hooking, QR & UI (Java)"]
+    subgraph L1["Layer 1: Host Hooking, QR, Hybrid Continuity & UI (Java)"]
         XP["XposedInit"]
         DLG["WireGuardDialog"]
         QR["WgQrCodec (ZXing)"]
         MGR["WireGuardManager"]
         KS["WgKeystoreCrypto"]
+        KSP["KeepaliveStatusProvider"]
+        CBM["ContinuityBridgeManager"]
+        SHZ["ShizukuBridge + ShizukuProcessHelper (uid=2000)"]
+        KBL["KeepaliveBridgeListenerService (0x1041 Boot Guard)"]
     end
 
     subgraph L2["Layer 2: Dynamic Native Linker"]
@@ -40,6 +44,10 @@ flowchart LR
     DLG --> MGR
     DLG --> QR
     MGR --> KS
+    MGR --> KSP
+    KSP --> CBM
+    CBM --> SHZ
+    CBM --> KBL
     MGR --> NBL
     NBL --> SEQ
     SEQ --> S5

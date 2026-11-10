@@ -39,7 +39,7 @@ There are three setup options. Pick **A** (recommended modern setup) or **B** if
 This mode makes future updates effortless (just install the new `WireGuardPlus` APK without re-patching Telegram) and eliminates the persistent keepalive notification and Samsung's `"1 active app"` panel entry.
 
 1. Install **Shizuku** and start its service using Wireless Debugging (Android Settings -> Developer Options -> Wireless Debugging).
-2. Download and install the latest `WireGuardPlus-<version>.apk` from [Releases](../../releases).
+2. Download and install the latest `WireGuardPlus-<version>.apk` from [Releases](https://github.com/AliHaider704/wgplus/releases).
 3. Install the [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch) manager and link it to Shizuku when prompted.
 4. Patch your Telegram Plus / official Telegram APK in **Local** mode (uninstall original Telegram first if signature differs; back up secret chats).
 5. Open **LSPatch -> Modules -> WireGuard Plus**, enable it, and check **Telegram Plus** and/or **Telegram** in its scope.
@@ -49,7 +49,7 @@ This mode makes future updates effortless (just install the new `WireGuardPlus` 
 
 LSPatch rebuilds the Telegram app with the module baked in. When Shizuku is absent, standard foreground service continuity protects your connection automatically.
 
-1. Download the latest `WireGuardPlus-<version>.apk` from the [Releases](../../releases) page and install it. Allow installs from your browser or file manager if Android asks.
+1. Download the latest `WireGuardPlus-<version>.apk` from the [Releases](https://github.com/AliHaider704/wgplus/releases) page and install it. Allow installs from your browser or file manager if Android asks.
 2. Get **LSPatch** (the manager app) from its GitHub releases and install it. The [JingMatrix fork](https://github.com/JingMatrix/LSPatch) is the one that is kept up to date.
 3. Get the Telegram APK you want to patch: Telegram Plus or Telegram. If you already have it installed, you will need to uninstall it first, because the patched app has a different signature. Back up your chats first, cloud chats come back when you log in again but secret chats do not.
 4. In LSPatch open **Manage**, tap **+**, and choose the Telegram APK.
