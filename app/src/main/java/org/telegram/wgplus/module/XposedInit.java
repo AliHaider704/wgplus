@@ -10,8 +10,11 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
 import android.graphics.Typeface;
+import android.os.Binder;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -298,6 +301,29 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
             if (nsClass == null) {
                 return;
             }
+            final Binder keepaliveBridgeBinder = new Binder();
+            XposedHelpers.findAndHookMethod(
+                    nsClass,
+                    "onBind",
+                    Intent.class,
+                    new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+                        @Override
+                        protected void beforeHookedMethod(MethodHookParam param) {
+                            try {
+                                Intent intent = param.args != null && param.args.length > 0 && param.args[0] instanceof Intent
+                                        ? (Intent) param.args[0]
+                                        : null;
+                                if (intent != null && WireGuardManager.ACTION_KEEPALIVE_BRIDGE.equals(intent.getAction())) {
+                                    param.setResult(keepaliveBridgeBinder);
+                                    if (param.thisObject instanceof Service) {
+                                        demoteNotificationsService((Service) param.thisObject, false);
+                                    }
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        }
+                    }
+            );
             XposedHelpers.findAndHookMethod(
                     nsClass,
                     "onStartCommand",
@@ -319,13 +345,38 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                         WireGuardManager.EXTRA_STOP_FOREGROUND_KEEPALIVE,
                                         false
                                 );
+                                boolean expectFgPromote = intent != null && intent.getBooleanExtra(
+                                        WireGuardManager.EXTRA_EXPECT_FOREGROUND_PROMOTE,
+                                        false
+                                );
+                                boolean syncAction = intent != null && WireGuardManager.ACTION_SYNC_CONTINUITY.equals(
+                                        intent.getAction()
+                                );
                                 boolean forceAwake = !stopRequested
                                         && WireGuardManager.shouldForceTelegramAlwaysAwake(service, MODULE_PATH);
-                                if (forceAwake) {
+                                if (!forceAwake) {
+                                    WireGuardManager.queryAndSyncStealthContinuity(service, false, false);
+                                    demoteNotificationsService(service, stopRequested);
+                                    return;
+                                }
+                                boolean stealth = WireGuardManager.queryAndSyncStealthContinuity(
+                                        service,
+                                        true,
+                                        syncAction
+                                );
+                                if (stealth) {
+                                    if (expectFgPromote) {
+                                        promoteNotificationsServiceToForeground(service);
+                                        new Handler(Looper.getMainLooper()).post(
+                                                () -> demoteNotificationsService(service, false)
+                                        );
+                                    } else {
+                                        demoteNotificationsService(service, false);
+                                    }
+                                    param.setResult(Service.START_NOT_STICKY);
+                                } else {
                                     promoteNotificationsServiceToForeground(service);
                                     param.setResult(Service.START_STICKY);
-                                } else {
-                                    demoteNotificationsService(service, stopRequested);
                                 }
                             } catch (Throwable t) {
                                 XposedBridge.log("WGPlus: NotificationsService hook warning: " + t.getMessage());
@@ -411,6 +462,13 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                 service.stopForeground(Service.STOP_FOREGROUND_REMOVE);
             } else {
                 service.stopForeground(true);
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            NotificationManager nm = (NotificationManager) service.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) {
+                nm.cancel(WireGuardManager.FG_NOTIFICATION_ID);
             }
         } catch (Throwable ignored) {
         }

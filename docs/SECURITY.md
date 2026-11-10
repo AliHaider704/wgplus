@@ -1,6 +1,6 @@
-﻿# Security & Privacy Model
+# Security & Privacy Model
 
-This document states the exact cryptographic, network-isolation, and storage boundaries of **WireGuard Plus** (`v1.3.0`) based on verifiable implementation behavior.
+This document states the exact cryptographic, network-isolation, and storage boundaries of **WireGuard Plus** (`v1.4.0`) based on verifiable implementation behavior.
 
 ---
 
@@ -28,4 +28,4 @@ This document states the exact cryptographic, network-isolation, and storage bou
 
 - **Loopback-Only Binding**: Both the SOCKS5 TCP listener and per-call `UDP ASSOCIATE` sockets bind strictly to `127.0.0.1` (`IPv4 loopback`). Packet handlers explicitly drop any UDP packet whose source IP is not loopback (`!srcAddr.IP.IsLoopback()`), preventing LAN peers on shared Wi-Fi networks from reaching the local proxy.
 - **Android 14+ Read-Only Native Binary**: `libgojni.so` is extracted atomically into Telegram's private internal `files/wg_native/` directory with `0500` (`r-x------`) permissions owned solely by the host app UID.
-- **Minimal OS Permissions**: The module declares only `android.permission.INTERNET` (for standalone self-testing in `ModuleLauncherActivity`) and `android.permission.ACCESS_NETWORK_STATE` (for roaming detection). `android:allowBackup="false"` is enforced in `AndroidManifest.xml`.
+- **Minimal OS Permissions & Zero-Capture Boot Guard**: The core tunnel requires only `android.permission.INTERNET` and `android.permission.ACCESS_NETWORK_STATE`. Optional Silent Hybrid Continuity adds `moe.shizuku.manager.permission.API_V23` (user-granted in Shizuku) and `KeepaliveBridgeListenerService` (`BIND_NOTIFICATION_LISTENER_SERVICE`) configured with empty `android.service.notification.default_filter_types` and `disabled_filter_types="ongoing|conversations|alerting|silent"` plus no-op callbacks so zero notification content or metadata is ever read, stored, or transmitted. `android:allowBackup="false"` is enforced in `AndroidManifest.xml`.

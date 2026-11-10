@@ -1,13 +1,14 @@
-﻿# Architecture Deep Dive
+# Architecture Deep Dive
 
 ## 1. System Design Goals
 
-**WireGuard Plus (`v1.3.0`)** solves five engineering challenges simultaneously:
+**WireGuard Plus (`v1.4.0`)** solves six engineering challenges simultaneously:
 1. **Per-App Tunneling Without `VpnService`**: Runs a complete WireGuard / AmneziaWG cryptographic and TCP/UDP/IP stack inside Telegram's userspace process so no system-wide VPN slot or root privilege is required.
 2. **DPI Censorship Resistance & Zero Leak Resilience**: Supports AmneziaWG packet obfuscation (`Jc`, `Jmin`, `Jmax`, `S1..S4`, `H1..H4`), direct-IP Encrypted DoH (`RFC 8484`) endpoint resolution, and a fail-closed loopback SOCKS5 Kill Switch.
 3. **Full Messaging + VoIP Call Coverage**: Routes both Telegram's C++ `tgnet` MTProto sockets (TCP) and `tgcalls` WebRTC voice/video media streams (UDP/TCP) through the encrypted tunnel without P2P IP leaks.
-4. **Rootless LSPatch & Android 14-16 Compatibility**: Loads native Go shared libraries cleanly inside LSPatch's `InMemoryDexClassLoader` under strict HiddenAPI and read-only Dynamic Code Loading (`0500`) enforcement.
-5. **Zero-Conflict TeleVip Coexistence**: Uses additive `XC_MethodHook` callbacks and isolated preferences so other Telegram Xposed modules operate undisturbed.
+4. **24/7 Silent Hybrid Continuity (`v1.4.0`)**: Eliminates ongoing foreground service notifications (`49107`) and Samsung `"1 active app"` indicators by combining a pure-SDK **Shizuku** client (`ShizukuBridge`, `uid=2000`, `IActivityManager.setProcessImportant`, Doze/MARs/NetPolicy whitelisting) with a zero-capture `NotificationListenerService` Boot Guard (`KeepaliveBridgeListenerService` holding `BIND_AUTO_CREATE | BIND_IMPORTANT | BIND_INCLUDE_CAPABILITIES`), coordinated synchronously over `KeepaliveStatusProvider` with transparent FGS fallback.
+5. **Rootless LSPatch & Android 14-17 Compatibility**: Loads native Go shared libraries cleanly inside LSPatch's `InMemoryDexClassLoader` under strict HiddenAPI and read-only Dynamic Code Loading (`0500`) enforcement.
+6. **Zero-Conflict TeleVip Coexistence**: Uses additive `XC_MethodHook` callbacks and isolated preferences so other Telegram Xposed modules operate undisturbed.
 
 ---
 
@@ -53,6 +54,7 @@ flowchart LR
   2. `ProxyListActivity.createView`: Appends a compact typographic trigger button (`wg_plus_floating_trigger`) with a live semantic status dot directly onto the root `FrameLayout`.
   3. `Instance.makeNativeInstance` & `VoIPController.start`: Injects `Instance$Proxy("127.0.0.1", effectivePort, "", "")` into Telegram's VoIP media engine.
   4. `Activity.onActivityResult` & `LaunchActivity.onActivityResult`: Captures strictly `0x5747` (`.conf` file import) and `0x5748` (gallery QR image import).
+  5. `NotificationsService.onStartCommand` & `onBind`: Queries `KeepaliveStatusProvider` (`ensure_stealth`); when Hybrid (`adj=200` `force-imp` via `ShizukuBridge`) or silent Boot Guard (`KeepaliveBridgeListenerService` `0x1041` binding) protects the host PID, omits `startForeground` and cancels any stale notification (`49107`), otherwise promoting safely to Foreground Service.
 - **`WgQrCodec`**: Uses pure-Java `com.google.zxing:core` to generate scannable QR bitmaps and decode gallery screenshots (including inverted dark-mode QR screenshots) with zero `CAMERA` permission.
 - **`WgKeystoreCrypto`**: Wraps `PrivateKey` and `PresharedKey` values using a non-exportable 256-bit `AES/GCM/NoPadding` key inside `AndroidKeyStore`.
 

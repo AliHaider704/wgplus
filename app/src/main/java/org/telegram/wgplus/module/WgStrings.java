@@ -12,7 +12,7 @@ public final class WgStrings {
 
     public static final String LANG_AR = "ar";
     public static final String LANG_EN = "en";
-    public static final String VERSION_LABEL = "1.3.0";
+    public static final String VERSION_LABEL = "1.4.0";
 
     private static final Map<String, String> AR_COUNTRIES = new HashMap<>();
 
@@ -803,6 +803,107 @@ public final class WgStrings {
 
     public static String launcherOpenConfigBtn(boolean ar) {
         return ar ? "إدارة الخوادم وفحص النفق" : "Manage profiles & test tunnel";
+    }
+
+    public static String hybridHeading(boolean ar) {
+        return ar ? "الحماية الهجينة الصامتة (بدون إشعار)" : "Silent Hybrid Continuity";
+    }
+
+    public static String hybridTierLabel(boolean ar, ContinuityBridgeManager.ContinuityTier tier) {
+        ContinuityBridgeManager.ContinuityTier safe = tier != null
+                ? tier
+                : ContinuityBridgeManager.ContinuityTier.STANDARD_FGS;
+        switch (safe) {
+            case HYBRID_FULL:
+                return ar
+                        ? "هجين متكامل نشط (شيزوكو + حارس الإقلاع)"
+                        : "Full Hybrid active (Shizuku + Boot Guard)";
+            case SHIZUKU_ONLY:
+                return ar
+                        ? "حماية شيزوكو نشطة (بدون إشعار)"
+                        : "Shizuku protection active (silent)";
+            case LISTENER_BOOT_GUARD:
+                return ar
+                        ? "حارس الإقلاع الصامت نشط (بدون إشعار)"
+                        : "Silent Boot Guard active (no notification)";
+            case STANDARD_FGS:
+            default:
+                return ar
+                        ? "الوضع القياسي (إشعار النظام الثابت)"
+                        : "Standard mode (persistent notification)";
+        }
+    }
+
+    public static String hybridDetailLine(boolean ar, ContinuityBridgeManager.StealthSnapshot snap) {
+        if (snap == null) {
+            return ar
+                    ? "شيزوكو: قيد التحقق • حارس الإقلاع: قيد التحقق"
+                    : "Shizuku: checking • Boot Guard: checking";
+        }
+        String shizukuPart;
+        if (snap.shizukuGranted) {
+            shizukuPart = ar ? "شيزوكو: مصرح وجاهز" : "Shizuku: granted";
+        } else if (snap.shizukuRunning) {
+            shizukuPart = ar ? "شيزوكو: يعمل ويحتاج صلاحية" : "Shizuku: running (needs permission)";
+        } else if (snap.shizukuInstalled) {
+            shizukuPart = ar ? "شيزوكو: مثبت وغير مشغّل" : "Shizuku: installed, not running";
+        } else {
+            shizukuPart = ar ? "شيزوكو: غير مثبت" : "Shizuku: not installed";
+        }
+        String listenerPart;
+        if (snap.listenerConnected) {
+            listenerPart = ar ? "حارس الإقلاع: مفعّل ومتصل" : "Boot Guard: active";
+        } else if (snap.listenerEnabled) {
+            listenerPart = ar ? "حارس الإقلاع: مفعّل" : "Boot Guard: enabled";
+        } else {
+            listenerPart = ar ? "حارس الإقلاع: غير مفعّل" : "Boot Guard: off";
+        }
+        return shizukuPart + " • " + listenerPart;
+    }
+
+    public static String hybridStealthToggleTitle(boolean ar) {
+        return ar
+                ? "إخفاء الإشعار عبر الحماية الهجينة عند توفرها"
+                : "Hide ongoing notification via Hybrid when ready";
+    }
+
+    public static String hybridActionGrantShizuku(boolean ar) {
+        return ar ? "منح صلاحية شيزوكو وتفعيل الهجين" : "Grant Shizuku & enable Hybrid";
+    }
+
+    public static String hybridActionActivateNow(boolean ar) {
+        return ar ? "تفعيل الهجين وتطبيق استثناءات النظام الآن" : "Activate Hybrid & apply OS exemptions";
+    }
+
+    public static String hybridActionOpenShizuku(boolean ar) {
+        return ar ? "تشغيل خدمة شيزوكو أولاً" : "Open Shizuku to start service";
+    }
+
+    public static String hybridActionOpenListenerSettings(boolean ar) {
+        return ar ? "فتح صلاحية مستمع النظام الصامت" : "Open silent listener access settings";
+    }
+
+    public static String hybridHelperNote(boolean ar) {
+        return ar
+                ? "يجمع بين أولوية شيزوكو وحارس الإقلاع الصامت لإزالة الإشعار الثابت وبند التطبيق النشط تلقائياً بعد التشغيل وبدون قراءة أي إشعارات."
+                : "Combines Shizuku process priority with a zero-capture Boot Guard listener to remove persistent notifications and active-app banners cleanly.";
+    }
+
+    public static String hybridAppliedToast(boolean ar, boolean protectedNow) {
+        if (ar) {
+            return protectedNow
+                    ? "تم تفعيل الحماية الهجينة الصامتة وإخفاء الإشعار"
+                    : "تم تحديث حالة الاستمرارية";
+        }
+        return protectedNow
+                ? "Silent Hybrid Continuity active; ongoing notification removed"
+                : "Continuity status updated";
+    }
+
+    public static String hybridOpenShizukuHintToast(boolean ar) {
+        return ar
+                ? "شغّل خدمة شيزوكو ثم ارجع هنا لمنح الصلاحية وتفعيل الهجين"
+                : "Start the Shizuku service first, then return here to grant permission and enable Hybrid.";
     }
 
     public static String localizedCountryName(String isoCode, boolean ar) {

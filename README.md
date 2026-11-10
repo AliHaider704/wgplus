@@ -17,10 +17,11 @@ It works with **Telegram Plus** (`org.telegram.plus`) and the official **Telegra
 - **Encrypted DNS for the server name.** The endpoint hostname is looked up over DNS-over-HTTPS, so your ISP does not see or poison the lookup.
 - **Ping and auto-failover.** Test all your servers at once, jump to the fastest, and optionally switch to a backup if the current one stops responding.
 - **Auto MTU.** Finds a packet size that works on your mobile network.
+- **24/7 Silent Hybrid Continuity (v1.4.0).** Combines **Shizuku** (`uid=2000` process priority elevation + Doze/Data-Saver/OEM standby exemptions) with a zero-capture **Boot Guard** (`NotificationListenerService` with all notification categories filtered out) so Telegram stays alive in background and Deep Doze with **zero persistent notification** and **zero Samsung "1 active app" banner**. Falls back seamlessly to standard foreground service protection if Shizuku/Boot Guard are not set up.
 - **Battery saver.** Pauses keepalives when Telegram has been in the background for a while.
 - **Many profiles.** Import `.conf` files, paste from the clipboard, read a QR code from a screenshot in your gallery (no camera permission), show a QR code for sharing, and back up or restore everything as JSON.
 - **Arabic and English**, right to left and left to right, dark and light themes.
-- **Private keys are encrypted** with the Android Keystore. The app asks only for `INTERNET` and `ACCESS_NETWORK_STATE`.
+- **Private keys are encrypted** with the Android Keystore. The core tunnel uses only `INTERNET` and `ACCESS_NETWORK_STATE`; optional Shizuku integration adds `moe.shizuku.manager.permission.API_V23` and zero-capture `BIND_NOTIFICATION_LISTENER_SERVICE`.
 
 ## What it does not do
 
@@ -31,11 +32,22 @@ It works with **Telegram Plus** (`org.telegram.plus`) and the official **Telegra
 
 You need an Android phone (Android 5.0 or newer) and a WireGuard config file (`.conf`) from a provider or your own server.
 
-There are two ways. Pick **A** if your phone is not rooted.
+There are three setup options. Pick **A** (recommended modern setup) or **B** if your phone is not rooted.
 
-### A. No root, with LSPatch
+### A. Modern No-Root Setup: LSPatch Local + Shizuku + Silent Hybrid (Recommended)
 
-LSPatch rebuilds the Telegram app with the module baked in.
+This mode makes future updates effortless (just install the new `WireGuardPlus` APK without re-patching Telegram) and eliminates the persistent keepalive notification and Samsung's `"1 active app"` panel entry.
+
+1. Install **Shizuku** and start its service using Wireless Debugging (Android Settings -> Developer Options -> Wireless Debugging).
+2. Download and install the latest `WireGuardPlus-<version>.apk` from [Releases](../../releases).
+3. Install the [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch) manager and link it to Shizuku when prompted.
+4. Patch your Telegram Plus / official Telegram APK in **Local** mode (uninstall original Telegram first if signature differs; back up secret chats).
+5. Open **LSPatch -> Modules -> WireGuard Plus**, enable it, and check **Telegram Plus** and/or **Telegram** in its scope.
+6. Open **WireGuard Plus** (`نفق وايرجارد بلس`), tap **Grant Shizuku & enable Hybrid**, and tap **Allow all the time**. This automatically applies OS Doze/OEM freezer/background-network exemptions and activates the silent **Boot Guard** (which even protects Telegram after a reboot before you re-start Shizuku).
+
+### B. No Root without Shizuku: LSPatch Portable
+
+LSPatch rebuilds the Telegram app with the module baked in. When Shizuku is absent, standard foreground service continuity protects your connection automatically.
 
 1. Download the latest `WireGuardPlus-<version>.apk` from the [Releases](../../releases) page and install it. Allow installs from your browser or file manager if Android asks.
 2. Get **LSPatch** (the manager app) from its GitHub releases and install it. The [JingMatrix fork](https://github.com/JingMatrix/LSPatch) is the one that is kept up to date.
@@ -46,7 +58,7 @@ LSPatch rebuilds the Telegram app with the module baked in.
 7. Tap **Start Patch**, then install the patched APK it produces.
 8. Open the patched Telegram and log in.
 
-### B. Rooted phone, with LSPosed
+### C. Rooted phone, with LSPosed
 
 1. Install `WireGuardPlus-<version>.apk`.
 2. Open **LSPosed**, go to **Modules**, open **WireGuard Plus** and enable it.

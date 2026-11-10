@@ -415,6 +415,43 @@ public class WgPlusFeatureSuiteTest {
                 contrastRatio(c.get("stoppedText"), c.get("stoppedBg")) >= 4.5);
     }
 
+    @Test
+    public void testHybridContinuityTierResolutionAndVersionLabel() {
+        assertEquals("1.4.0", WgStrings.VERSION_LABEL);
+
+        assertEquals(
+                ContinuityBridgeManager.ContinuityTier.HYBRID_FULL,
+                ContinuityBridgeManager.computeContinuityTier(true, true, true)
+        );
+        assertEquals(
+                ContinuityBridgeManager.ContinuityTier.SHIZUKU_ONLY,
+                ContinuityBridgeManager.computeContinuityTier(true, true, false)
+        );
+        assertEquals(
+                ContinuityBridgeManager.ContinuityTier.LISTENER_BOOT_GUARD,
+                ContinuityBridgeManager.computeContinuityTier(true, false, true)
+        );
+        assertEquals(
+                ContinuityBridgeManager.ContinuityTier.STANDARD_FGS,
+                ContinuityBridgeManager.computeContinuityTier(true, false, false)
+        );
+        assertEquals(
+                ContinuityBridgeManager.ContinuityTier.STANDARD_FGS,
+                ContinuityBridgeManager.computeContinuityTier(false, true, true)
+        );
+
+        for (ContinuityBridgeManager.ContinuityTier tier : ContinuityBridgeManager.ContinuityTier.values()) {
+            assertFalse(WgStrings.hybridTierLabel(true, tier).isEmpty());
+            assertFalse(WgStrings.hybridTierLabel(false, tier).isEmpty());
+        }
+        ContinuityBridgeManager.StealthSnapshot snap = new ContinuityBridgeManager.StealthSnapshot(
+                true, true, true, true, true, true, true, true,
+                ContinuityBridgeManager.ContinuityTier.HYBRID_FULL
+        );
+        assertFalse(WgStrings.hybridDetailLine(true, snap).matches(".*[A-Za-z].*"));
+        assertFalse(WgStrings.hybridDetailLine(false, snap).matches(".*[\\u0600-\\u06FF].*"));
+    }
+
     private static double contrastRatio(int rgb1, int rgb2) {
         double l1 = relativeLuminance(rgb1);
         double l2 = relativeLuminance(rgb2);

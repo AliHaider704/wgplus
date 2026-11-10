@@ -8,6 +8,7 @@ import android.content.pm.PackageManager;
 import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
+import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -16,18 +17,43 @@ import android.view.Window;
 import android.widget.Button;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.Switch;
 import android.widget.TextView;
+import android.widget.Toast;
 
 /**
  * Clean, icon-free standalone companion screen for WireGuard Plus.
  */
 public class ModuleLauncherActivity extends Activity {
 
+    private volatile boolean mResumedActivationInFlight;
+    private volatile boolean mDestroyed;
+    private final ShizukuBridge.BinderListener mShizukuBinderListener = alive -> runOnUiThread(() -> {
+        if (!mDestroyed) {
+            if (alive && ContinuityBridgeManager.isStealthHybridEnabled(this)
+                    && ShizukuBridge.hasPermission(this)
+                    && !mResumedActivationInFlight) {
+                triggerHybridActivation(WireGuardManager.isArabic(this));
+            } else {
+                renderScreen();
+            }
+        }
+    });
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         ensureLauncherComponentVisible();
+        ShizukuBridge.addBinderListener(mShizukuBinderListener);
+        ShizukuBridge.requestBinderBroadcastAsync(this);
         renderScreen();
+    }
+
+    @Override
+    protected void onDestroy() {
+        mDestroyed = true;
+        ShizukuBridge.removeBinderListener(mShizukuBinderListener);
+        super.onDestroy();
     }
 
     private void ensureLauncherComponentVisible() {
@@ -48,7 +74,20 @@ public class ModuleLauncherActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        ShizukuBridge.requestBinderBroadcastAsync(this);
         renderScreen();
+        if (!mResumedActivationInFlight && ContinuityBridgeManager.isStealthHybridEnabled(this)) {
+            ContinuityBridgeManager.StealthSnapshot snap = ContinuityBridgeManager.captureStatusSnapshot(this);
+            if (snap.shizukuGranted && (!snap.forcedImportant || !snap.listenerConnected)) {
+                mResumedActivationInFlight = true;
+                ContinuityBridgeManager.activateHybridAsync(this, () -> runOnUiThread(() -> {
+                    mResumedActivationInFlight = false;
+                    if (!mDestroyed) {
+                        renderScreen();
+                    }
+                }));
+            }
+        }
     }
 
     @Override
@@ -249,7 +288,10 @@ public class ModuleLauncherActivity extends Activity {
         statusCardLp.bottomMargin = WgTheme.dp(this, 16);
         content.addView(statusCard, statusCardLp);
 
-        // 2. Real 4-Step Activation Guide Card
+        // 2. Silent Hybrid Continuity (Shizuku + Boot Guard Listener) Card
+        content.addView(buildHybridContinuityCard(isAr, theme, cardPad), createCardParamsWithBottom(16));
+
+        // 3. Real 4-Step Activation Guide Card
         LinearLayout guideCard = new LinearLayout(this);
         guideCard.setOrientation(LinearLayout.VERTICAL);
         guideCard.setBackground(WgTheme.cardBackground(this, theme.surfaceCard, theme.borderSubtle, 12f));
@@ -287,6 +329,211 @@ public class ModuleLauncherActivity extends Activity {
         ));
 
         setContentView(screenRoot);
+    }
+
+    private LinearLayout buildHybridContinuityCard(boolean isAr, WgTheme theme, int cardPad) {
+        LinearLayout hybridCard = new LinearLayout(this);
+        hybridCard.setOrientation(LinearLayout.VERTICAL);
+        hybridCard.setBackground(WgTheme.cardBackground(this, theme.surfaceCard, theme.borderSubtle, 12f));
+        hybridCard.setPadding(cardPad, cardPad, cardPad, cardPad);
+
+        TextView heading = new TextView(this);
+        styleText(heading, isAr, theme.textSecondary, 12.5f, true);
+        heading.setText(WgStrings.hybridHeading(isAr));
+        LinearLayout.LayoutParams hLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        hLp.bottomMargin = WgTheme.dp(this, 8);
+        hybridCard.addView(heading, hLp);
+
+        ContinuityBridgeManager.StealthSnapshot snap = ContinuityBridgeManager.captureStatusSnapshot(this);
+
+        LinearLayout tierRow = new LinearLayout(this);
+        tierRow.setOrientation(LinearLayout.HORIZONTAL);
+        tierRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        View dot = new View(this);
+        int dotPx = WgTheme.dp(this, 8);
+        int dotCol = snap.tier == ContinuityBridgeManager.ContinuityTier.HYBRID_FULL
+                ? theme.activeDot
+                : (snap.stealthProtected ? theme.pendingDot : theme.stoppedDot);
+        dot.setBackground(WgTheme.statusDot(this, dotCol));
+        LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dotPx, dotPx);
+        setMarginEnd(dotLp, WgTheme.dp(this, 9), isAr);
+        tierRow.addView(dot, dotLp);
+
+        TextView tierLabel = new TextView(this);
+        int tierColor = snap.tier == ContinuityBridgeManager.ContinuityTier.HYBRID_FULL
+                ? theme.activeText
+                : (snap.stealthProtected ? theme.pendingText : theme.textPrimary);
+        styleText(tierLabel, isAr, tierColor, 14.5f, true);
+        tierLabel.setText(WgStrings.hybridTierLabel(isAr, snap.tier));
+        tierRow.addView(tierLabel, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        hybridCard.addView(tierRow);
+
+        TextView detailView = new TextView(this);
+        styleText(detailView, isAr, theme.textSecondary, 12.5f, false);
+        detailView.setText(WgStrings.hybridDetailLine(isAr, snap));
+        LinearLayout.LayoutParams detLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        detLp.topMargin = WgTheme.dp(this, 5);
+        hybridCard.addView(detailView, detLp);
+
+        LinearLayout toggleRow = new LinearLayout(this);
+        toggleRow.setOrientation(LinearLayout.HORIZONTAL);
+        toggleRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams trLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        trLp.topMargin = WgTheme.dp(this, 10);
+
+        TextView toggleLabel = new TextView(this);
+        styleText(toggleLabel, isAr, theme.textPrimary, 13.5f, false);
+        toggleLabel.setText(WgStrings.hybridStealthToggleTitle(isAr));
+        LinearLayout.LayoutParams tlLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        setMarginEnd(tlLp, WgTheme.dp(this, 8), isAr);
+        toggleRow.addView(toggleLabel, tlLp);
+
+        Switch stealthSwitch = new Switch(this);
+        stealthSwitch.setChecked(snap.stealthHybridEnabled);
+        stealthSwitch.setMinHeight(WgTheme.dp(this, 44));
+        stealthSwitch.setOnCheckedChangeListener((btn, isChecked) -> {
+            ContinuityBridgeManager.setStealthHybridEnabled(this, isChecked);
+            renderScreen();
+        });
+        toggleRow.addView(stealthSwitch);
+        hybridCard.addView(toggleRow, trLp);
+
+        Button primaryBtn = createActionButton(
+                snap.shizukuGranted
+                        ? WgStrings.hybridActionActivateNow(isAr)
+                        : (snap.shizukuRunning
+                            ? WgStrings.hybridActionGrantShizuku(isAr)
+                            : WgStrings.hybridActionOpenShizuku(isAr)),
+                theme,
+                !snap.shizukuInstalled || !snap.shizukuRunning
+        );
+        primaryBtn.setOnClickListener(v -> {
+            if (!snap.shizukuInstalled || !snap.shizukuRunning) {
+                openShizukuOrToast(isAr);
+            } else if (!snap.shizukuGranted) {
+                ShizukuBridge.requestPermission(this, granted -> runOnUiThread(() -> {
+                    if (mDestroyed) {
+                        return;
+                    }
+                    if (granted) {
+                        triggerHybridActivation(isAr);
+                    } else {
+                        renderScreen();
+                    }
+                }));
+            } else {
+                triggerHybridActivation(isAr);
+            }
+        });
+        LinearLayout.LayoutParams pLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        pLp.topMargin = WgTheme.dp(this, 10);
+        hybridCard.addView(primaryBtn, pLp);
+
+        if (!snap.listenerEnabled && (!snap.shizukuRunning || !snap.shizukuGranted)) {
+            Button listenerBtn = createActionButton(
+                    WgStrings.hybridActionOpenListenerSettings(isAr),
+                    theme,
+                    true
+            );
+            listenerBtn.setOnClickListener(v -> {
+                try {
+                    startActivity(new Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS));
+                } catch (Throwable ignored) {
+                }
+            });
+            LinearLayout.LayoutParams lLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            );
+            lLp.topMargin = WgTheme.dp(this, 8);
+            hybridCard.addView(listenerBtn, lLp);
+        }
+
+        TextView noteView = new TextView(this);
+        styleText(noteView, isAr, theme.textHint, 12f, false);
+        noteView.setLineSpacing(WgTheme.dp(this, 2), 1.0f);
+        noteView.setText(WgStrings.hybridHelperNote(isAr));
+        LinearLayout.LayoutParams nLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        nLp.topMargin = WgTheme.dp(this, 10);
+        hybridCard.addView(noteView, nLp);
+
+        return hybridCard;
+    }
+
+    private void triggerHybridActivation(boolean isAr) {
+        ContinuityBridgeManager.activateHybridAsync(this, () -> runOnUiThread(() -> {
+            if (mDestroyed) {
+                return;
+            }
+            ContinuityBridgeManager.StealthSnapshot now = ContinuityBridgeManager.captureStatusSnapshot(this);
+            Toast.makeText(
+                    this,
+                    WgStrings.hybridAppliedToast(isAr, now.stealthProtected),
+                    Toast.LENGTH_SHORT
+            ).show();
+            renderScreen();
+        }));
+    }
+
+    private void openShizukuOrToast(boolean isAr) {
+        try {
+            Intent launch = getPackageManager() != null
+                    ? getPackageManager().getLaunchIntentForPackage(ShizukuBridge.SHIZUKU_PACKAGE)
+                    : null;
+            if (launch != null) {
+                startActivity(launch);
+            }
+        } catch (Throwable ignored) {
+        }
+        Toast.makeText(this, WgStrings.hybridOpenShizukuHintToast(isAr), Toast.LENGTH_LONG).show();
+    }
+
+    private Button createActionButton(String text, WgTheme theme, boolean secondary) {
+        Button btn = new Button(this);
+        btn.setAllCaps(false);
+        btn.setText(text);
+        btn.setTextColor(secondary ? theme.textPrimary : theme.onAccent);
+        btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
+        btn.setTypeface(Typeface.SANS_SERIF, Typeface.BOLD);
+        int minH = WgTheme.dp(this, 44);
+        btn.setMinHeight(minH);
+        btn.setMinimumHeight(minH);
+        btn.setFocusable(true);
+        btn.setPadding(WgTheme.dp(this, 14), WgTheme.dp(this, 9), WgTheme.dp(this, 14), WgTheme.dp(this, 9));
+        btn.setBackground(WgTheme.interactiveBackground(
+                this,
+                secondary ? theme.surfaceSecondaryBtn : theme.accentPrimary,
+                secondary ? theme.surfaceSecondaryBtnPressed : theme.accentPressed,
+                secondary ? theme.borderSubtle : theme.accentPrimary,
+                theme.textPrimary,
+                10f
+        ));
+        return btn;
+    }
+
+    private LinearLayout.LayoutParams createCardParamsWithBottom(int bottomDp) {
+        LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        lp.bottomMargin = WgTheme.dp(this, bottomDp);
+        return lp;
     }
 
     private Button createHeaderChip(String text, WgTheme theme) {

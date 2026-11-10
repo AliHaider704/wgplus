@@ -10,11 +10,14 @@ import android.net.LinkProperties;
 import android.net.Network;
 import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
+import android.net.Uri;
 import android.net.wifi.WifiManager;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.PowerManager;
+import android.os.Process;
 import android.os.SystemClock;
 import android.util.Log;
 import android.widget.Toast;
@@ -77,9 +80,17 @@ public final class WireGuardManager {
     private static final String KEY_MIGRATED_FORCED_CONTINUITY_V1 = "wg_migrated_forced_continuity_v1";
 
     public static final String EXTRA_STOP_FOREGROUND_KEEPALIVE = "wgplus_stop_fg_keepalive";
+    public static final String EXTRA_EXPECT_FOREGROUND_PROMOTE = "wgplus_expect_fg_promote";
+    public static final String ACTION_KEEPALIVE_BRIDGE = "org.telegram.wgplus.ACTION_KEEPALIVE_BRIDGE";
+    public static final String ACTION_SYNC_CONTINUITY = "org.telegram.wgplus.ACTION_SYNC_CONTINUITY";
+    private static final Uri STATUS_PROVIDER_URI = Uri.parse("content://" + KeepaliveStatusProvider.AUTHORITY);
     public static final String FG_NOTIFICATION_CHANNEL_ID = "wgplus_keepalive_silent_channel";
     public static final int FG_NOTIFICATION_ID = 49107;
     private static final String FG_SERVICE_CLASS = "org.telegram.messenger.NotificationsService";
+
+    private static volatile long sLastStealthQueryMs;
+    private static volatile boolean sLastStealthProtected;
+    private static volatile boolean sLastStealthWantsAwake;
 
     // Legacy v1.1.0 single-profile keys (transparently migrated once)
     public static final String KEY_PRIVATE_KEY = "wg_private_key";
@@ -550,6 +561,43 @@ public final class WireGuardManager {
         return isCellularNetworkActive(context) ? Math.min(18, clamped) : clamped;
     }
 
+    /**
+     * Queries the companion module's {@link KeepaliveStatusProvider} to apply Shizuku
+     * {@code setProcessImportant} + silent {@link KeepaliveBridgeListenerService} protection
+     * for this host process before falling back to a standard foreground service notification.
+     */
+    public static boolean queryAndSyncStealthContinuity(Context context, boolean wantsAwake, boolean forceFresh) {
+        if (context == null) {
+            return false;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (!forceFresh && wantsAwake == sLastStealthWantsAwake && (now - sLastStealthQueryMs) < 1500L) {
+            return sLastStealthProtected;
+        }
+        try {
+            Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+            Bundle extras = new Bundle();
+            extras.putInt(KeepaliveStatusProvider.EXTRA_PID, Process.myPid());
+            extras.putBoolean(KeepaliveStatusProvider.EXTRA_WANTS_ALWAYS_AWAKE, wantsAwake);
+            Bundle res = appCtx.getContentResolver().call(
+                    STATUS_PROVIDER_URI,
+                    KeepaliveStatusProvider.METHOD_ENSURE_STEALTH,
+                    appCtx.getPackageName(),
+                    extras
+            );
+            boolean stealth = res != null && res.getBoolean(KeepaliveStatusProvider.RESULT_STEALTH_PROTECTED, false);
+            sLastStealthWantsAwake = wantsAwake;
+            sLastStealthProtected = stealth;
+            sLastStealthQueryMs = now;
+            return stealth;
+        } catch (Throwable ignored) {
+            sLastStealthWantsAwake = wantsAwake;
+            sLastStealthProtected = false;
+            sLastStealthQueryMs = now;
+            return false;
+        }
+    }
+
     public static void syncForegroundKeepaliveService(Context context, boolean active) {
         if (context == null) {
             return;
@@ -559,6 +607,7 @@ public final class WireGuardManager {
             Intent intent = new Intent();
             intent.setClassName(appCtx.getPackageName(), FG_SERVICE_CLASS);
             if (!active) {
+                queryAndSyncStealthContinuity(appCtx, false, true);
                 intent.putExtra(EXTRA_STOP_FOREGROUND_KEEPALIVE, true);
                 try {
                     appCtx.startService(intent);
@@ -566,6 +615,17 @@ public final class WireGuardManager {
                 }
                 return;
             }
+            if (queryAndSyncStealthContinuity(appCtx, true, true)) {
+                // Stealth protection active (Shizuku force-imp and/or silent NotificationListener bind):
+                // Do NOT call startForegroundService (avoids 5s timer crash and removes any old FG notification).
+                intent.setAction(ACTION_SYNC_CONTINUITY);
+                try {
+                    appCtx.startService(intent);
+                } catch (Throwable ignored) {
+                }
+                return;
+            }
+            intent.putExtra(EXTRA_EXPECT_FOREGROUND_PROMOTE, true);
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 appCtx.startForegroundService(intent);
             } else {
@@ -2168,7 +2228,7 @@ public final class WireGuardManager {
                         OutputStream out = ssl.getOutputStream();
                         String req = "GET /cdn-cgi/trace HTTP/1.1\r\n"
                                 + "Host: one.one.one.one\r\n"
-                                + "User-Agent: WGPlus/1.3.0\r\n"
+                                + "User-Agent: WGPlus/1.4.0\r\n"
                                 + "Connection: close\r\n\r\n";
                         out.write(req.getBytes(StandardCharsets.US_ASCII));
                         out.flush();

@@ -2,6 +2,15 @@
 
 All notable changes to **WireGuard Plus** (`org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [1.4.0] - 2026-11-10
+
+### Added
+- **24/7 Silent Hybrid Continuity Engine (Zero Root, Zero Persistent Notification, Zero Samsung "1 Active App" Banner)**:
+  - **`ShizukuBridge`, `ShizukuClientProvider`, `ShizukuProcessHelper` & `moe.shizuku.api.BinderContainer`**: Pure Android-SDK Shizuku v13 client receiving live `IShizukuService` binders via `sendBinder` and `REQUEST_BINDER`, applying `deviceidle` Doze + Samsung MARs whitelist, `netpolicy` unrestricted background allowance, `exempted` standby bucket, and `IActivityManager.setProcessImportant` (`adj=200` `force-imp` + `mKeepSEMPrcp` token) cleanly without third-party dependencies.
+  - **`KeepaliveBridgeListenerService` (Zero-Capture Silent Boot Guard)**: Declared with empty `default_filter_types` and `disabled_filter_types="ongoing|conversations|alerting|silent"` so zero user notifications are ever read or processed, binding Telegram's `NotificationsService` (`BIND_AUTO_CREATE | BIND_IMPORTANT | BIND_INCLUDE_CAPABILITIES`) to hold `adj=200 / BFGS` silently across Deep Doze and device reboots even before Shizuku is restarted.
+  - **`KeepaliveStatusProvider` & `ContinuityBridgeManager`**: Synchronous IPC bridge between hooked Telegram (`XposedInit` / `WireGuardManager`) and the companion app, automatically stripping ongoing FGS notification `49107` whenever Hybrid or Boot Guard protection is active, while transparently falling back to Foreground Service keepalive when neither is configured.
+  - **Companion App Hybrid Card (`ModuleLauncherActivity`)**: Added live Hybrid tier telemetry, Stealth mode toggle, one-tap Shizuku authorization + OS exemption setup, and one-tap Boot Guard launcher in Arabic (`RTL`) and English (`LTR`).
+
 ## [1.3.0] - 2026-11-05
 
 ### Added

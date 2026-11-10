@@ -2,4 +2,5 @@
 <resources>
     <string name="app_name">WireGuard Plus</string>
     <string name="xposed_desc">Embedded WireGuard tunnel and VoIP call proxy for Telegram Plus (TeleVip compatible)</string>
+    <string name="listener_service_name">WireGuard Plus Silent Continuity Guard</string>
 </resources>
