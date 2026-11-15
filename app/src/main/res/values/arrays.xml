@@ -3,5 +3,6 @@
     <string-array name="xposed_scope">
         <item>org.telegram.plus</item>
         <item>org.telegram.messenger</item>
+        <item>org.telegram.gold</item>
     </string-array>
 </resources>

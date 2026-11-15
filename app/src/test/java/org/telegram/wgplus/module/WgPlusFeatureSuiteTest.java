@@ -417,14 +417,14 @@ public class WgPlusFeatureSuiteTest {
 
     @Test
     public void testHybridContinuityTierResolutionAndVersionLabel() {
-        assertEquals("1.4.0", WgStrings.VERSION_LABEL);
+        assertEquals("1.5.0", WgStrings.VERSION_LABEL);
 
         assertEquals(
                 ContinuityBridgeManager.ContinuityTier.HYBRID_FULL,
                 ContinuityBridgeManager.computeContinuityTier(true, true, true)
         );
         assertEquals(
-                ContinuityBridgeManager.ContinuityTier.SHIZUKU_ONLY,
+                ContinuityBridgeManager.ContinuityTier.PRIVILEGED_ONLY,
                 ContinuityBridgeManager.computeContinuityTier(true, true, false)
         );
         assertEquals(
@@ -445,11 +445,99 @@ public class WgPlusFeatureSuiteTest {
             assertFalse(WgStrings.hybridTierLabel(false, tier).isEmpty());
         }
         ContinuityBridgeManager.StealthSnapshot snap = new ContinuityBridgeManager.StealthSnapshot(
-                true, true, true, true, true, true, true, true,
-                ContinuityBridgeManager.ContinuityTier.HYBRID_FULL
+                true, true, true, true, true,
+                ContinuityBridgeManager.ContinuityTier.HYBRID_FULL,
+                false, true, true, true
         );
         assertFalse(WgStrings.hybridDetailLine(true, snap).matches(".*[A-Za-z].*"));
         assertFalse(WgStrings.hybridDetailLine(false, snap).matches(".*[\\u0600-\\u06FF].*"));
+
+        assertTrue(DaemonProcessHelper.isSafeToken("org.telegram.wgplus.module"));
+        assertFalse(DaemonProcessHelper.isSafeToken("org.telegram.plus; rm -rf /"));
+        assertTrue(DaemonProcessHelper.isSafeComponent("org.telegram.wgplus.module/org.telegram.wgplus.module.KeepaliveBridgeListenerService"));
+        assertFalse(DaemonProcessHelper.isSafeComponent("bad;component"));
+
+        String script = DaemonProcessHelper.buildDeepExemptionsShellScript(
+                "org.telegram.wgplus.module",
+                java.util.Arrays.asList("org.telegram.plus", "bad;pkg"),
+                "org.telegram.wgplus.module/org.telegram.wgplus.module.KeepaliveBridgeListenerService",
+                true
+        );
+        assertTrue(script.contains("pm grant org.telegram.wgplus.module android.permission.SET_PROCESS_LIMIT"));
+        assertTrue(script.contains("SYSTEM_EXEMPT_FROM_HIBERNATION"));
+        assertTrue(script.contains("set-background-networking-enabled-for-uid"));
+        assertFalse(script.contains("bad;pkg"));
+
+        assertTrue(BuiltinAdbKeyManager.isValidPairingCode("123456"));
+        assertFalse(BuiltinAdbKeyManager.isValidPairingCode("12345"));
+        assertFalse(BuiltinAdbKeyManager.isValidPairingCode("12ab56"));
+        String[] plainPin = BuiltinAdbKeyManager.parsePairingInput("654321");
+        assertNotNull(plainPin);
+        assertEquals("654321", plainPin[0]);
+        assertEquals("", plainPin[1]);
+        String[] pinPort = BuiltinAdbKeyManager.parsePairingInput("654321:39121");
+        assertNotNull(pinPort);
+        assertEquals("654321", pinPort[0]);
+        assertEquals("39121", pinPort[1]);
+        assertTrue(BuiltinAdbKeyManager.isValidDynamicPort(5557));
+        assertFalse(BuiltinAdbKeyManager.isValidDynamicPort(80));
+
+        String[] arNewStrings = new String[]{
+                WgStrings.hybridHeading(true),
+                WgStrings.hybridDetailLine(true, snap),
+                WgStrings.hybridStealthToggleTitle(true),
+                WgStrings.hybridMobileTcpToggleTitle(true),
+                WgStrings.hybridActionOneTimeSetup(true),
+                WgStrings.hybridActionActivateNow(true),
+                WgStrings.hybridActionOpenListenerSettings(true),
+                WgStrings.hybridHelperNote(true),
+                WgStrings.hybridAppliedToast(true, true),
+                WgStrings.hybridPairingHintToast(true),
+                WgStrings.adbPairingChannelName(true),
+                WgStrings.adbPairingNotifTitle(true, 0),
+                WgStrings.adbPairingNotifTitle(true, 39121),
+                WgStrings.adbPairingNotifBody(true),
+                WgStrings.adbPairingActionReply(true),
+                WgStrings.adbPairingHint(true),
+                WgStrings.adbPairingCancel(true),
+                WgStrings.adbPairingResultToast(true, true),
+                WgStrings.adbPairingResultToast(true, false)
+        };
+        for (String s : arNewStrings) {
+            assertFalse("Expected no Latin leak in Arabic UI string: " + s, s.matches(".*[A-Za-z].*"));
+            assertFalse("Forbidden em-dash in string: " + s, s.contains("\u2014"));
+            assertFalse("Forbidden Shizuku/jargon in string: " + s,
+                    s.contains("شيزوكو") || s.contains("-1000") || s.contains("١٠٠٠"));
+        }
+        String[] enNewStrings = new String[]{
+                WgStrings.hybridHeading(false),
+                WgStrings.hybridDetailLine(false, snap),
+                WgStrings.hybridStealthToggleTitle(false),
+                WgStrings.hybridMobileTcpToggleTitle(false),
+                WgStrings.hybridActionOneTimeSetup(false),
+                WgStrings.hybridActionActivateNow(false),
+                WgStrings.hybridActionOpenListenerSettings(false),
+                WgStrings.hybridHelperNote(false),
+                WgStrings.hybridAppliedToast(false, true),
+                WgStrings.hybridPairingHintToast(false),
+                WgStrings.adbPairingChannelName(false),
+                WgStrings.adbPairingNotifTitle(false, 0),
+                WgStrings.adbPairingNotifTitle(false, 39121),
+                WgStrings.adbPairingNotifBody(false),
+                WgStrings.adbPairingActionReply(false),
+                WgStrings.adbPairingHint(false),
+                WgStrings.adbPairingCancel(false),
+                WgStrings.adbPairingResultToast(false, true),
+                WgStrings.adbPairingResultToast(false, false)
+        };
+        for (String s : enNewStrings) {
+            assertFalse("Expected no Arabic leak in English UI string: " + s, s.matches(".*[\\u0600-\\u06FF].*"));
+            assertFalse("Forbidden em-dash in string: " + s, s.contains("\u2014"));
+            String lower = s.toLowerCase(java.util.Locale.ROOT);
+            assertFalse("Forbidden Shizuku/jargon in EN string: " + s,
+                    lower.contains("shizuku") || lower.contains("daemon") || lower.contains("loopback")
+                            || lower.contains("-1000") || lower.contains("39121") || lower.contains("adb"));
+        }
     }
 
     private static double contrastRatio(int rgb1, int rgb2) {

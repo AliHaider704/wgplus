@@ -4,6 +4,11 @@ import android.content.Context;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
+import android.net.ConnectivityManager;
+import android.net.Network;
+import android.net.NetworkCapabilities;
+import android.net.NetworkRequest;
+import android.os.Build;
 import android.os.Process;
 import android.util.Log;
 
@@ -16,12 +21,13 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Coordinates the non-root Hybrid Continuity stack across Shizuku (uid=2000), silent
- * {@link KeepaliveBridgeListenerService} capability binding, and OS Doze/MARs/Data-Saver
- * exemptions so Telegram stays continuously responsive with zero persistent notifications
- * and zero "1 active app" Samsung Quick Panel banners.
+ * Coordinates the Sovereign Continuity stack across built-in Wireless ADB, self-privileged
+ * Binder elevation, detached {@code wgplus_daemon}, silent {@link KeepaliveBridgeListenerService}
+ * capability binding, and OS Doze/MARs/Data-Saver exemptions so Telegram stays continuously
+ * responsive with zero persistent notifications and zero "1 active app" banners.
  */
 public final class ContinuityBridgeManager {
 
@@ -33,9 +39,11 @@ public final class ContinuityBridgeManager {
     public static final String TELEGRAM_KEEPALIVE_SERVICE = "org.telegram.messenger.NotificationsService";
     private static final String PKG_PLUS = "org.telegram.plus";
     private static final String PKG_OFFICIAL = "org.telegram.messenger";
-    private static final List<String> DEFAULT_TARGET_PACKAGES = Arrays.asList(
+    private static final String PKG_GOLD = "org.telegram.gold";
+    static final List<String> DEFAULT_TARGET_PACKAGES = Arrays.asList(
             PKG_PLUS,
             PKG_OFFICIAL,
+            PKG_GOLD,
             "org.telegram.messenger.beta",
             "org.telegram.messenger.web"
     );
@@ -43,45 +51,49 @@ public final class ContinuityBridgeManager {
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor();
     private static final ConcurrentHashMap<Integer, Long> sElevatedPids = new ConcurrentHashMap<>();
     private static volatile boolean sExemptionsAppliedOnce;
+    private static final AtomicBoolean sWifiCallbackRegistered = new AtomicBoolean(false);
 
     public enum ContinuityTier {
         HYBRID_FULL,
-        SHIZUKU_ONLY,
+        PRIVILEGED_ONLY,
         LISTENER_BOOT_GUARD,
         STANDARD_FGS
     }
 
     public static final class StealthSnapshot {
         public final boolean stealthHybridEnabled;
-        public final boolean shizukuInstalled;
-        public final boolean shizukuRunning;
-        public final boolean shizukuGranted;
         public final boolean forcedImportant;
         public final boolean listenerEnabled;
         public final boolean listenerConnected;
         public final boolean stealthProtected;
         public final ContinuityTier tier;
+        public final boolean rootActive;
+        public final boolean selfPrivileged;
+        public final boolean daemonActive;
+        public final boolean builtinAdbPaired;
 
         public StealthSnapshot(
                 boolean stealthHybridEnabled,
-                boolean shizukuInstalled,
-                boolean shizukuRunning,
-                boolean shizukuGranted,
                 boolean forcedImportant,
                 boolean listenerEnabled,
                 boolean listenerConnected,
                 boolean stealthProtected,
-                ContinuityTier tier
+                ContinuityTier tier,
+                boolean rootActive,
+                boolean selfPrivileged,
+                boolean daemonActive,
+                boolean builtinAdbPaired
         ) {
             this.stealthHybridEnabled = stealthHybridEnabled;
-            this.shizukuInstalled = shizukuInstalled;
-            this.shizukuRunning = shizukuRunning;
-            this.shizukuGranted = shizukuGranted;
             this.forcedImportant = forcedImportant;
             this.listenerEnabled = listenerEnabled;
             this.listenerConnected = listenerConnected;
             this.stealthProtected = stealthProtected;
             this.tier = tier;
+            this.rootActive = rootActive;
+            this.selfPrivileged = selfPrivileged;
+            this.daemonActive = daemonActive;
+            this.builtinAdbPaired = builtinAdbPaired;
         }
     }
 
@@ -129,6 +141,9 @@ public final class ContinuityBridgeManager {
             if (isPackageInstalled(context, PKG_OFFICIAL)) {
                 result.add(PKG_OFFICIAL);
             }
+            if (isPackageInstalled(context, PKG_GOLD)) {
+                result.add(PKG_GOLD);
+            }
         }
         return result;
     }
@@ -167,22 +182,123 @@ public final class ContinuityBridgeManager {
 
     public static ContinuityTier computeContinuityTier(
             boolean stealthEnabled,
-            boolean shizukuElevated,
+            boolean privilegedElevated,
             boolean listenerActive
     ) {
         if (!stealthEnabled) {
             return ContinuityTier.STANDARD_FGS;
         }
-        if (shizukuElevated && listenerActive) {
+        if (privilegedElevated && listenerActive) {
             return ContinuityTier.HYBRID_FULL;
         }
-        if (shizukuElevated) {
-            return ContinuityTier.SHIZUKU_ONLY;
+        if (privilegedElevated) {
+            return ContinuityTier.PRIVILEGED_ONLY;
         }
         if (listenerActive) {
             return ContinuityTier.LISTENER_BOOT_GUARD;
         }
         return ContinuityTier.STANDARD_FGS;
+    }
+
+    public static String getActivePrivilegeMode(Context context) {
+        if (PrivilegeBridge.hasRootAccess()) {
+            return "ROOT";
+        }
+        if (context != null && PrivilegeBridge.isStandaloneDaemonAlive(context)) {
+            return "WGPLUS_DAEMON";
+        }
+        if (context != null && PrivilegeBridge.hasSelfProcessLimitPermission(context)) {
+            return BuiltinAdbKeyManager.isPaired(context) ? "BUILTIN_ADB_SELF" : "SELF_PRIVILEGED";
+        }
+        if (context != null && BuiltinAdbKeyManager.isPaired(context)) {
+            return "BUILTIN_ADB";
+        }
+        if (KeepaliveBridgeListenerService.isConnected()
+                || (context != null && KeepaliveBridgeListenerService.isNotificationListenerEnabled(context))) {
+            return "BOOT_GUARD";
+        }
+        return "STANDARD";
+    }
+
+    public static boolean hasAnyPrivilegeBackend(Context context) {
+        if (PrivilegeBridge.hasRootAccess()) {
+            return true;
+        }
+        if (context == null) {
+            return false;
+        }
+        return PrivilegeBridge.hasSelfProcessLimitPermission(context)
+                || PrivilegeBridge.isStandaloneDaemonAlive(context)
+                || BuiltinAdbKeyManager.isPaired(context);
+    }
+
+    public static void registerPassiveWifiRecovery(Context context) {
+        if (context == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            return;
+        }
+        if (!sWifiCallbackRegistered.compareAndSet(false, true)) {
+            return;
+        }
+        final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        try {
+            ConnectivityManager cm = (ConnectivityManager) appCtx.getSystemService(Context.CONNECTIVITY_SERVICE);
+            if (cm == null) {
+                sWifiCallbackRegistered.set(false);
+                return;
+            }
+            NetworkRequest req = new NetworkRequest.Builder()
+                    .addTransportType(NetworkCapabilities.TRANSPORT_WIFI)
+                    .build();
+            cm.registerNetworkCallback(req, new ConnectivityManager.NetworkCallback() {
+                @Override
+                public void onAvailable(Network network) {
+                    if (!isStealthHybridEnabled(appCtx)) {
+                        return;
+                    }
+                    if (!BuiltinAdbKeyManager.isPaired(appCtx) && !PrivilegeBridge.hasRootAccess()) {
+                        return;
+                    }
+                    WORKER.execute(() -> {
+                        try {
+                            if (!PrivilegeBridge.isStandaloneDaemonAlive(appCtx)) {
+                                if (PrivilegeBridge.hasRootAccess()) {
+                                    PrivilegeBridge.bootstrapStandaloneDaemonAsync(appCtx, new ArrayList<>(getWantedPackages(appCtx)));
+                                } else {
+                                    WgAdbConnectionManager.getInstance(appCtx).bootstrapSovereignShell(true);
+                                }
+                                activateHybridOneTap(appCtx);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    });
+                }
+            });
+        } catch (Throwable t) {
+            sWifiCallbackRegistered.set(false);
+            Log.w(TAG, "registerPassiveWifiRecovery warning: " + t.getMessage());
+        }
+    }
+
+    public static void onDeviceBootOrPackageUpdated(Context context) {
+        if (context == null) {
+            return;
+        }
+        Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        registerPassiveWifiRecovery(appCtx);
+        if (!isStealthHybridEnabled(appCtx)) {
+            return;
+        }
+        activateHybridOneTap(appCtx);
+        if (!PrivilegeBridge.isStandaloneDaemonAlive(appCtx)) {
+            if (PrivilegeBridge.hasRootAccess()) {
+                PrivilegeBridge.bootstrapStandaloneDaemonAsync(appCtx, new ArrayList<>(getWantedPackages(appCtx)));
+            } else if (BuiltinAdbKeyManager.isPaired(appCtx)) {
+                try {
+                    WgAdbConnectionManager.getInstance(appCtx).bootstrapSovereignShell(true);
+                } catch (Throwable ignored) {
+                }
+            }
+        }
     }
 
     public static StealthSnapshot ensureStealthProtection(
@@ -192,7 +308,7 @@ public final class ContinuityBridgeManager {
             boolean wantsAlwaysAwake
     ) {
         if (context == null) {
-            return new StealthSnapshot(true, false, false, false, false, false, false, false, ContinuityTier.STANDARD_FGS);
+            return new StealthSnapshot(true, false, false, false, false, ContinuityTier.STANDARD_FGS, false, false, false, false);
         }
         Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         boolean stealthEnabled = isStealthHybridEnabled(appCtx);
@@ -201,43 +317,53 @@ public final class ContinuityBridgeManager {
             markPackageAwakeWanted(appCtx, targetPkg, wantsAlwaysAwake);
         }
 
-        boolean shizukuInstalled = ShizukuBridge.isShizukuInstalled(appCtx);
-        boolean shizukuRunning = shizukuInstalled && ShizukuBridge.isRunning(appCtx);
-        boolean shizukuGranted = shizukuRunning && ShizukuBridge.hasPermission(appCtx);
         boolean listenerEnabled = KeepaliveBridgeListenerService.isNotificationListenerEnabled(appCtx);
+        if (!listenerEnabled && stealthEnabled && wantsAlwaysAwake) {
+            PrivilegeBridge.selfHealNotificationListener(appCtx);
+            listenerEnabled = KeepaliveBridgeListenerService.isNotificationListenerEnabled(appCtx);
+        }
         boolean listenerConnected = KeepaliveBridgeListenerService.isConnected();
 
+        boolean rootReady = PrivilegeBridge.hasRootAccess();
+        boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
+        boolean daemonAlive = PrivilegeBridge.isStandaloneDaemonAlive(appCtx);
+        boolean builtinAdbPaired = BuiltinAdbKeyManager.isPaired(appCtx);
+        boolean privilegeReady = rootReady || selfPrivileged || daemonAlive || builtinAdbPaired;
+
         if (!stealthEnabled || !wantsAlwaysAwake) {
-            if (targetPid > 0 && shizukuGranted && sElevatedPids.containsKey(targetPid)) {
-                ShizukuBridge.applyProcessImportant(appCtx, targetPid, false);
+            if (targetPid > 0 && privilegeReady && sElevatedPids.containsKey(targetPid)) {
+                PrivilegeBridge.applyProcessImportant(appCtx, targetPid, false);
                 sElevatedPids.remove(targetPid);
             }
             KeepaliveBridgeListenerService.syncBindings();
             return new StealthSnapshot(
                     stealthEnabled,
-                    shizukuInstalled,
-                    shizukuRunning,
-                    shizukuGranted,
                     false,
                     listenerEnabled,
                     listenerConnected,
                     false,
-                    ContinuityTier.STANDARD_FGS
+                    ContinuityTier.STANDARD_FGS,
+                    rootReady,
+                    selfPrivileged,
+                    daemonAlive,
+                    builtinAdbPaired
             );
         }
 
         boolean forcedImportant = false;
-        if (shizukuGranted) {
+        if (privilegeReady) {
             ensureOsExemptionsAsync(appCtx, true);
+            if ((rootReady || builtinAdbPaired) && !daemonAlive) {
+                PrivilegeBridge.bootstrapStandaloneDaemonAsync(appCtx, new ArrayList<>(getWantedPackages(appCtx)));
+            }
             if (targetPid > 0) {
-                forcedImportant = ShizukuBridge.applyProcessImportant(appCtx, targetPid, true);
+                forcedImportant = PrivilegeBridge.applyProcessImportant(appCtx, targetPid, true);
                 if (forcedImportant) {
                     sElevatedPids.put(targetPid, System.currentTimeMillis());
                 }
             }
-            // Keep our own companion process elevated while holding the death-linked binder token
             if (!listenerConnected) {
-                ShizukuBridge.applyProcessImportant(appCtx, Process.myPid(), true);
+                PrivilegeBridge.applyProcessImportant(appCtx, Process.myPid(), true);
             }
         }
 
@@ -248,65 +374,77 @@ public final class ContinuityBridgeManager {
         boolean stealthProtected = tier != ContinuityTier.STANDARD_FGS;
         return new StealthSnapshot(
                 true,
-                shizukuInstalled,
-                shizukuRunning,
-                shizukuGranted,
                 forcedImportant,
                 listenerEnabled,
                 listenerConnected,
                 stealthProtected,
-                tier
+                tier,
+                rootReady,
+                selfPrivileged,
+                daemonAlive,
+                builtinAdbPaired
         );
     }
 
     public static StealthSnapshot captureStatusSnapshot(Context context) {
         Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         boolean stealthEnabled = isStealthHybridEnabled(appCtx);
-        boolean shizukuInstalled = ShizukuBridge.isShizukuInstalled(appCtx);
-        boolean shizukuRunning = shizukuInstalled && ShizukuBridge.isRunning(appCtx);
-        boolean shizukuGranted = shizukuRunning && ShizukuBridge.hasPermission(appCtx);
         boolean listenerEnabled = KeepaliveBridgeListenerService.isNotificationListenerEnabled(appCtx);
         boolean listenerConnected = KeepaliveBridgeListenerService.isConnected();
 
-        boolean forcedImportant = shizukuGranted && !sElevatedPids.isEmpty();
-        ContinuityTier tier = computeContinuityTier(stealthEnabled, forcedImportant || shizukuGranted, listenerConnected || listenerEnabled);
+        boolean rootReady = PrivilegeBridge.hasRootAccess();
+        boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
+        boolean daemonAlive = PrivilegeBridge.isStandaloneDaemonAlive(appCtx);
+        boolean builtinAdbPaired = BuiltinAdbKeyManager.isPaired(appCtx);
+        boolean sovereignReady = rootReady || selfPrivileged || daemonAlive;
+        boolean backendReady = sovereignReady || builtinAdbPaired;
+        boolean forcedImportant = backendReady && (!sElevatedPids.isEmpty() || sovereignReady);
+        ContinuityTier tier = computeContinuityTier(stealthEnabled, backendReady, listenerConnected || listenerEnabled);
         boolean stealthProtected = tier != ContinuityTier.STANDARD_FGS;
         return new StealthSnapshot(
                 stealthEnabled,
-                shizukuInstalled,
-                shizukuRunning,
-                shizukuGranted,
                 forcedImportant,
                 listenerEnabled,
                 listenerConnected,
                 stealthProtected,
-                tier
+                tier,
+                rootReady,
+                selfPrivileged,
+                daemonAlive,
+                builtinAdbPaired
         );
     }
 
     public static StealthSnapshot activateHybridOneTap(Context context) {
         Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
         prefs(appCtx).edit().putBoolean(KEY_STEALTH_HYBRID_ENABLED, true).apply();
+        registerPassiveWifiRecovery(appCtx);
 
-        boolean shizukuInstalled = ShizukuBridge.isShizukuInstalled(appCtx);
-        boolean shizukuRunning = shizukuInstalled && ShizukuBridge.isRunning(appCtx);
-        boolean shizukuGranted = shizukuRunning && ShizukuBridge.hasPermission(appCtx);
+        boolean rootReady = PrivilegeBridge.hasRootAccess();
+        boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
+        boolean daemonAlive = PrivilegeBridge.isStandaloneDaemonAlive(appCtx);
+        boolean builtinAdbPaired = BuiltinAdbKeyManager.isPaired(appCtx);
 
-        if (shizukuGranted) {
+        if (rootReady || selfPrivileged || daemonAlive || builtinAdbPaired) {
+            PrivilegeBridge.selfHealNotificationListener(appCtx);
             List<String> pkgs = collectInstalledTargetsAndModule(appCtx);
             String listenerComp = appCtx.getPackageName() + "/" + KeepaliveBridgeListenerService.class.getName();
-            sExemptionsAppliedOnce = ShizukuBridge.applyOsContinuityExemptions(appCtx, pkgs, listenerComp, true);
+            sExemptionsAppliedOnce = PrivilegeBridge.applyOsContinuityExemptions(appCtx, pkgs, listenerComp, true);
+
+            if ((rootReady || builtinAdbPaired) && !daemonAlive) {
+                PrivilegeBridge.bootstrapStandaloneDaemonAsync(appCtx, pkgs);
+            }
 
             for (String pkg : getWantedPackages(appCtx)) {
                 List<Integer> pids = resolveRunningPids(appCtx, pkg);
                 for (int pid : pids) {
-                    if (ShizukuBridge.applyProcessImportant(appCtx, pid, true)) {
+                    if (PrivilegeBridge.applyProcessImportant(appCtx, pid, true)) {
                         sElevatedPids.put(pid, System.currentTimeMillis());
                     }
                 }
             }
             if (!KeepaliveBridgeListenerService.isConnected()) {
-                ShizukuBridge.applyProcessImportant(appCtx, Process.myPid(), true);
+                PrivilegeBridge.applyProcessImportant(appCtx, Process.myPid(), true);
             }
         }
 
@@ -335,7 +473,7 @@ public final class ContinuityBridgeManager {
         WORKER.execute(() -> {
             try {
                 if (isStealthHybridEnabled(appCtx)) {
-                    if (ShizukuBridge.hasPermission(appCtx)) {
+                    if (hasAnyPrivilegeBackend(appCtx)) {
                         activateHybridOneTap(appCtx);
                     } else {
                         notifyInstalledTelegramServices(appCtx);
@@ -355,7 +493,7 @@ public final class ContinuityBridgeManager {
             try {
                 List<String> pkgs = collectInstalledTargetsAndModule(appCtx);
                 String listenerComp = appCtx.getPackageName() + "/" + KeepaliveBridgeListenerService.class.getName();
-                ShizukuBridge.applyOsContinuityExemptions(appCtx, pkgs, listenerComp, grantListener);
+                PrivilegeBridge.applyOsContinuityExemptions(appCtx, pkgs, listenerComp, grantListener);
             } catch (Throwable ignored) {
             }
         });
@@ -365,7 +503,7 @@ public final class ContinuityBridgeManager {
         WORKER.execute(() -> {
             for (Integer pid : new ArrayList<>(sElevatedPids.keySet())) {
                 if (pid != null && pid > 0) {
-                    ShizukuBridge.applyProcessImportant(appCtx, pid, false);
+                    PrivilegeBridge.applyProcessImportant(appCtx, pid, false);
                 }
                 sElevatedPids.remove(pid);
             }
@@ -375,9 +513,6 @@ public final class ContinuityBridgeManager {
     private static List<String> collectInstalledTargetsAndModule(Context context) {
         ArrayList<String> pkgs = new ArrayList<>();
         pkgs.add(context.getPackageName());
-        if (isPackageInstalled(context, ShizukuBridge.SHIZUKU_PACKAGE)) {
-            pkgs.add(ShizukuBridge.SHIZUKU_PACKAGE);
-        }
         for (String p : DEFAULT_TARGET_PACKAGES) {
             if (isPackageInstalled(context, p) && !pkgs.contains(p)) {
                 pkgs.add(p);
@@ -388,7 +523,7 @@ public final class ContinuityBridgeManager {
 
     private static List<Integer> resolveRunningPids(Context context, String pkg) {
         ArrayList<Integer> pids = new ArrayList<>();
-        ShizukuBridge.ShellResult res = ShizukuBridge.runShellCommand(context, "pidof " + pkg, 3000);
+        PrivilegeBridge.ShellResult res = PrivilegeBridge.runShellCommand(context, "pidof " + pkg, 3000);
         if (!res.output.isEmpty()) {
             String[] parts = res.output.trim().split("\\s+");
             for (String p : parts) {

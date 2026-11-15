@@ -26,33 +26,22 @@ import android.widget.Toast;
  */
 public class ModuleLauncherActivity extends Activity {
 
+    private static final int REQ_POST_NOTIFICATIONS = 7102;
+
     private volatile boolean mResumedActivationInFlight;
     private volatile boolean mDestroyed;
-    private final ShizukuBridge.BinderListener mShizukuBinderListener = alive -> runOnUiThread(() -> {
-        if (!mDestroyed) {
-            if (alive && ContinuityBridgeManager.isStealthHybridEnabled(this)
-                    && ShizukuBridge.hasPermission(this)
-                    && !mResumedActivationInFlight) {
-                triggerHybridActivation(WireGuardManager.isArabic(this));
-            } else {
-                renderScreen();
-            }
-        }
-    });
+    private boolean mPendingPairingAfterNotifPermission;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         ensureLauncherComponentVisible();
-        ShizukuBridge.addBinderListener(mShizukuBinderListener);
-        ShizukuBridge.requestBinderBroadcastAsync(this);
         renderScreen();
     }
 
     @Override
     protected void onDestroy() {
         mDestroyed = true;
-        ShizukuBridge.removeBinderListener(mShizukuBinderListener);
         super.onDestroy();
     }
 
@@ -74,11 +63,12 @@ public class ModuleLauncherActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
-        ShizukuBridge.requestBinderBroadcastAsync(this);
+        ContinuityBridgeManager.registerPassiveWifiRecovery(this);
         renderScreen();
         if (!mResumedActivationInFlight && ContinuityBridgeManager.isStealthHybridEnabled(this)) {
             ContinuityBridgeManager.StealthSnapshot snap = ContinuityBridgeManager.captureStatusSnapshot(this);
-            if (snap.shizukuGranted && (!snap.forcedImportant || !snap.listenerConnected)) {
+            boolean sovereignReady = ContinuityBridgeManager.hasAnyPrivilegeBackend(this);
+            if (sovereignReady && (!snap.forcedImportant || !snap.listenerConnected)) {
                 mResumedActivationInFlight = true;
                 ContinuityBridgeManager.activateHybridAsync(this, () -> runOnUiThread(() -> {
                     mResumedActivationInFlight = false;
@@ -288,7 +278,7 @@ public class ModuleLauncherActivity extends Activity {
         statusCardLp.bottomMargin = WgTheme.dp(this, 16);
         content.addView(statusCard, statusCardLp);
 
-        // 2. Silent Hybrid Continuity (Shizuku + Boot Guard Listener) Card
+        // 2. Silent Background Continuity Card
         content.addView(buildHybridContinuityCard(isAr, theme, cardPad), createCardParamsWithBottom(16));
 
         // 3. Real 4-Step Activation Guide Card
@@ -408,29 +398,44 @@ public class ModuleLauncherActivity extends Activity {
         toggleRow.addView(stealthSwitch);
         hybridCard.addView(toggleRow, trLp);
 
-        Button primaryBtn = createActionButton(
-                snap.shizukuGranted
-                        ? WgStrings.hybridActionActivateNow(isAr)
-                        : (snap.shizukuRunning
-                            ? WgStrings.hybridActionGrantShizuku(isAr)
-                            : WgStrings.hybridActionOpenShizuku(isAr)),
-                theme,
-                !snap.shizukuInstalled || !snap.shizukuRunning
+        LinearLayout tcpToggleRow = new LinearLayout(this);
+        tcpToggleRow.setOrientation(LinearLayout.HORIZONTAL);
+        tcpToggleRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams tcpLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
         );
+        tcpLp.topMargin = WgTheme.dp(this, 6);
+
+        TextView tcpLabel = new TextView(this);
+        styleText(tcpLabel, isAr, theme.textPrimary, 13.0f, false);
+        tcpLabel.setText(WgStrings.hybridMobileTcpToggleTitle(isAr));
+        LinearLayout.LayoutParams tcpLblLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        setMarginEnd(tcpLblLp, WgTheme.dp(this, 8), isAr);
+        tcpToggleRow.addView(tcpLabel, tcpLblLp);
+
+        Switch tcpSwitch = new Switch(this);
+        tcpSwitch.setChecked(BuiltinAdbKeyManager.isMobileTcpHealEnabled(this));
+        tcpSwitch.setMinHeight(WgTheme.dp(this, 44));
+        tcpSwitch.setOnCheckedChangeListener((btn, isChecked) -> {
+            BuiltinAdbKeyManager.setMobileTcpHealEnabled(this, isChecked);
+            renderScreen();
+        });
+        tcpToggleRow.addView(tcpSwitch);
+        hybridCard.addView(tcpToggleRow, tcpLp);
+
+        final boolean sovereignReady = ContinuityBridgeManager.hasAnyPrivilegeBackend(this);
+        final boolean wirelessPairingAvailable = !snap.rootActive
+                && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R
+                && !snap.builtinAdbPaired;
+        final boolean needsOneTimeSetup = !sovereignReady && wirelessPairingAvailable;
+        String primaryLabel = needsOneTimeSetup
+                ? WgStrings.hybridActionOneTimeSetup(isAr)
+                : WgStrings.hybridActionActivateNow(isAr);
+        Button primaryBtn = createActionButton(primaryLabel, theme, false);
         primaryBtn.setOnClickListener(v -> {
-            if (!snap.shizukuInstalled || !snap.shizukuRunning) {
-                openShizukuOrToast(isAr);
-            } else if (!snap.shizukuGranted) {
-                ShizukuBridge.requestPermission(this, granted -> runOnUiThread(() -> {
-                    if (mDestroyed) {
-                        return;
-                    }
-                    if (granted) {
-                        triggerHybridActivation(isAr);
-                    } else {
-                        renderScreen();
-                    }
-                }));
+            if (needsOneTimeSetup) {
+                startBuiltinWirelessPairingFlow(isAr);
             } else {
                 triggerHybridActivation(isAr);
             }
@@ -442,7 +447,22 @@ public class ModuleLauncherActivity extends Activity {
         pLp.topMargin = WgTheme.dp(this, 10);
         hybridCard.addView(primaryBtn, pLp);
 
-        if (!snap.listenerEnabled && (!snap.shizukuRunning || !snap.shizukuGranted)) {
+        if (sovereignReady && wirelessPairingAvailable) {
+            Button pairBtn = createActionButton(
+                    WgStrings.hybridActionOneTimeSetup(isAr),
+                    theme,
+                    true
+            );
+            pairBtn.setOnClickListener(v -> startBuiltinWirelessPairingFlow(isAr));
+            LinearLayout.LayoutParams pairLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            );
+            pairLp.topMargin = WgTheme.dp(this, 8);
+            hybridCard.addView(pairBtn, pairLp);
+        }
+
+        if (!snap.listenerEnabled && !sovereignReady) {
             Button listenerBtn = createActionButton(
                     WgStrings.hybridActionOpenListenerSettings(isAr),
                     theme,
@@ -491,17 +511,46 @@ public class ModuleLauncherActivity extends Activity {
         }));
     }
 
-    private void openShizukuOrToast(boolean isAr) {
-        try {
-            Intent launch = getPackageManager() != null
-                    ? getPackageManager().getLaunchIntentForPackage(ShizukuBridge.SHIZUKU_PACKAGE)
-                    : null;
-            if (launch != null) {
-                startActivity(launch);
+    private void startBuiltinWirelessPairingFlow(boolean isAr) {
+        if (Build.VERSION.SDK_INT >= 33
+                && checkSelfPermission("android.permission.POST_NOTIFICATIONS") != PackageManager.PERMISSION_GRANTED) {
+            mPendingPairingAfterNotifPermission = true;
+            requestPermissions(new String[]{"android.permission.POST_NOTIFICATIONS"}, REQ_POST_NOTIFICATIONS);
+            return;
+        }
+        launchPairingServiceAndDevSettings(isAr);
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == REQ_POST_NOTIFICATIONS && mPendingPairingAfterNotifPermission) {
+            mPendingPairingAfterNotifPermission = false;
+            boolean granted = grantResults != null
+                    && grantResults.length > 0
+                    && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (granted) {
+                launchPairingServiceAndDevSettings(WireGuardManager.isArabic(this));
+            } else {
+                Toast.makeText(
+                        this,
+                        WgStrings.hybridPairingHintToast(WireGuardManager.isArabic(this)),
+                        Toast.LENGTH_LONG
+                ).show();
             }
+        }
+    }
+
+    private void launchPairingServiceAndDevSettings(boolean isAr) {
+        AdbPairingService.startForPairing(this);
+        try {
+            Intent devSettings = new Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS);
+            devSettings.putExtra(":settings:fragment_args_key", "toggle_adb_wireless");
+            devSettings.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(devSettings);
         } catch (Throwable ignored) {
         }
-        Toast.makeText(this, WgStrings.hybridOpenShizukuHintToast(isAr), Toast.LENGTH_LONG).show();
+        Toast.makeText(this, WgStrings.hybridPairingHintToast(isAr), Toast.LENGTH_LONG).show();
     }
 
     private Button createActionButton(String text, WgTheme theme, boolean secondary) {

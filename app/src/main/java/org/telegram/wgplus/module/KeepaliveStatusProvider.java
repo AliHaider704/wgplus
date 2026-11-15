@@ -5,31 +5,45 @@ import android.content.ContentValues;
 import android.content.Context;
 import android.database.Cursor;
 import android.net.Uri;
+import android.os.Binder;
 import android.os.Bundle;
+import android.os.Process;
 
 /**
  * Synchronous Binder IPC bridge queried by hooked Telegram processes ({@code WireGuardManager})
- * via {@code ContentResolver.call} to elevate PID importance via Shizuku and ensure silent
- * {@link KeepaliveBridgeListenerService} capability binding before deciding foreground service promotion.
+ * via {@code ContentResolver.call} to elevate PID importance via Sovereign Self-Privilege /
+ * Root / Standalone Daemon and ensure silent {@link KeepaliveBridgeListenerService}
+ * capability binding before deciding foreground service promotion.
  */
 public class KeepaliveStatusProvider extends ContentProvider {
 
     public static final String AUTHORITY = "org.telegram.wgplus.module.status";
     public static final String METHOD_ENSURE_STEALTH = "ensure_stealth";
     public static final String METHOD_QUERY_STATUS = "query_status";
+    public static final String METHOD_REGISTER_DAEMON = "register_daemon";
+    public static final String METHOD_CACHE_TX_CODE = "cache_tx_code";
 
     public static final String EXTRA_PID = "pid";
     public static final String EXTRA_WANTS_ALWAYS_AWAKE = "wants_always_awake";
 
     public static final String RESULT_STEALTH_PROTECTED = "stealth_protected";
-    public static final String RESULT_SHIZUKU_RUNNING = "shizuku_running";
-    public static final String RESULT_SHIZUKU_GRANTED = "shizuku_granted";
     public static final String RESULT_FORCED_IMPORTANT = "forced_important";
     public static final String RESULT_LISTENER_ACTIVE = "listener_active";
     public static final String RESULT_TIER = "tier";
+    public static final String RESULT_PRIVILEGE_MODE = "privilege_mode";
+    public static final String RESULT_SELF_PRIVILEGED = "self_privileged";
+    public static final String RESULT_DAEMON_ACTIVE = "daemon_active";
+    public static final String RESULT_ROOT_ACTIVE = "root_active";
+    public static final String RESULT_SECURE_SETTINGS = "secure_settings_granted";
+    public static final String RESULT_ADB_PAIRED = "adb_paired";
+    public static final String RESULT_ADB_TCP_PORT = "adb_tcp_port";
 
     @Override
     public boolean onCreate() {
+        Context ctx = getContext();
+        if (ctx != null) {
+            ContinuityBridgeManager.registerPassiveWifiRecovery(ctx);
+        }
         return true;
     }
 
@@ -38,6 +52,33 @@ public class KeepaliveStatusProvider extends ContentProvider {
         Context ctx = getContext();
         if (ctx == null) {
             return null;
+        }
+        if (METHOD_REGISTER_DAEMON.equals(method)) {
+            if (!isPrivilegedCaller()) {
+                return null;
+            }
+            if (extras != null) {
+                int port = extras.getInt("port", -1);
+                int pid = extras.getInt("pid", -1);
+                int uid = extras.getInt("uid", -1);
+                int tx = extras.getInt("tx", -1);
+                String token = extras.getString("token", "");
+                PrivilegeBridge.registerDaemonEndpoint(ctx, port, pid, uid, tx, token);
+                Bundle out = new Bundle();
+                out.putBoolean("registered", port > 0 && !token.isEmpty());
+                return out;
+            }
+            return null;
+        }
+        if (METHOD_CACHE_TX_CODE.equals(method)) {
+            if (!isPrivilegedCaller()) {
+                return null;
+            }
+            int tx = extras != null ? extras.getInt("tx", -1) : -1;
+            PrivilegeBridge.cacheResolvedTxCode(ctx, tx);
+            Bundle out = new Bundle();
+            out.putInt("tx", tx);
+            return out;
         }
         String safePkg = sanitizePackageName(arg);
         if (METHOD_ENSURE_STEALTH.equals(method)) {
@@ -49,22 +90,32 @@ public class KeepaliveStatusProvider extends ContentProvider {
                     pid,
                     wantsAwake
             );
-            return toBundle(snap);
+            return toBundle(ctx, snap);
         }
         if (METHOD_QUERY_STATUS.equals(method)) {
-            return toBundle(ContinuityBridgeManager.captureStatusSnapshot(ctx));
+            return toBundle(ctx, ContinuityBridgeManager.captureStatusSnapshot(ctx));
         }
         return null;
     }
 
-    private static Bundle toBundle(ContinuityBridgeManager.StealthSnapshot snap) {
+    private static boolean isPrivilegedCaller() {
+        int caller = Binder.getCallingUid();
+        return caller == Process.myUid() || caller == 0 || caller == 2000;
+    }
+
+    private static Bundle toBundle(Context ctx, ContinuityBridgeManager.StealthSnapshot snap) {
         Bundle b = new Bundle();
         b.putBoolean(RESULT_STEALTH_PROTECTED, snap.stealthProtected);
-        b.putBoolean(RESULT_SHIZUKU_RUNNING, snap.shizukuRunning);
-        b.putBoolean(RESULT_SHIZUKU_GRANTED, snap.shizukuGranted);
         b.putBoolean(RESULT_FORCED_IMPORTANT, snap.forcedImportant);
         b.putBoolean(RESULT_LISTENER_ACTIVE, snap.listenerConnected || snap.listenerEnabled);
         b.putString(RESULT_TIER, snap.tier.name());
+        b.putString(RESULT_PRIVILEGE_MODE, ContinuityBridgeManager.getActivePrivilegeMode(ctx));
+        b.putBoolean(RESULT_SELF_PRIVILEGED, PrivilegeBridge.hasSelfProcessLimitPermission(ctx));
+        b.putBoolean(RESULT_DAEMON_ACTIVE, PrivilegeBridge.isStandaloneDaemonAlive(ctx));
+        b.putBoolean(RESULT_ROOT_ACTIVE, snap.rootActive);
+        b.putBoolean(RESULT_SECURE_SETTINGS, PrivilegeBridge.hasSelfWriteSecureSettingsPermission(ctx));
+        b.putBoolean(RESULT_ADB_PAIRED, snap.builtinAdbPaired);
+        b.putInt(RESULT_ADB_TCP_PORT, BuiltinAdbKeyManager.getDynamicTcpPort(ctx));
         return b;
     }
 

@@ -562,7 +562,7 @@ public final class WireGuardManager {
     }
 
     /**
-     * Queries the companion module's {@link KeepaliveStatusProvider} to apply Shizuku
+     * Queries the companion module's {@link KeepaliveStatusProvider} to apply elevated
      * {@code setProcessImportant} + silent {@link KeepaliveBridgeListenerService} protection
      * for this host process before falling back to a standard foreground service notification.
      */
@@ -616,7 +616,7 @@ public final class WireGuardManager {
                 return;
             }
             if (queryAndSyncStealthContinuity(appCtx, true, true)) {
-                // Stealth protection active (Shizuku force-imp and/or silent NotificationListener bind):
+                // Stealth protection active (elevated force-imp and/or silent NotificationListener bind):
                 // Do NOT call startForegroundService (avoids 5s timer crash and removes any old FG notification).
                 intent.setAction(ACTION_SYNC_CONTINUITY);
                 try {

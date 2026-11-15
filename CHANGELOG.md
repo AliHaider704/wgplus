@@ -2,6 +2,22 @@
 
 All notable changes to **WireGuard Plus** (`org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [1.5.0] - 2026-11-16
+
+### Added
+- **Self-Contained Sovereign Silent Continuity (Zero External Helper Apps)**:
+  - **`WgAdbConnectionManager`, `BuiltinAdbKeyManager` & `AdbPairingService`**: Built-in SPAKE2 + Conscrypt TLS 1.3 Wireless Debugging client (`libadb-android:3.1.1`) storing its RSA-2048 identity encrypted in `AndroidKeyStore` (`AES-256-GCM`), paired once via a 6-digit notification `RemoteInput` reply on Android 11+ with automatic silent `WRITE_SECURE_SETTINGS` Wi-Fi reconnection and dynamic local loopback TCP auto-heal (`adb_tcp_port`, e.g. `5561`) when switching to Mobile Data.
+  - **`PrivilegeBridge` & `DaemonProcessHelper`**: Unified dual-mode continuity engine supporting Root (`uid=0`, `oom_score_adj = -800`, foreground cpuset), detached loopback-authenticated `wgplus_daemon`, and direct self-granted `SET_PROCESS_LIMIT` Binder `IActivityManager.setProcessImportant` (`adj=200` `force-imp`), applying `deviceidle`, Samsung MARs, `appops`, `netpolicy`, and `max_phantom_processes` exemptions silently.
+  - **`BootContinuityReceiver` & Passive Wi-Fi Callback**: Automatically re-applies stealth protection on `LOCKED_BOOT_COMPLETED`, `BOOT_COMPLETED`, `MY_PACKAGE_REPLACED`, and Wi-Fi availability changes with zero ongoing notifications.
+  - **Plain Non-Technical Companion UI**: Simplified Arabic (`RTL`) and English (`LTR`) status strings in `ModuleLauncherActivity` and `WgStrings` with zero internal protocol or debugging jargon.
+
+### Removed
+- Complete removal of third-party Shizuku integration (`ShizukuBridge`, `ShizukuClientProvider`, `ShizukuProcessHelper`, `moe.shizuku.api.BinderContainer`, `<queries>` entries, and `moe.shizuku.manager.permission.API_V23`).
+
+### Fixed
+- **Notification Permission Sequencing**: Requests `POST_NOTIFICATIONS` before opening Wireless Debugging Developer Options on Android 13+, and strips `RemoteInput` before stopping/cancelling the pairing notification so `LIFETIME_EXTENDED_BY_DIRECT_REPLY` clears immediately upon submission.
+- **Fast Daemon Bootstrap Race**: Registers the `wgplus_daemon` loopback endpoint with `KeepaliveStatusProvider` prior to running asynchronous OS exemptions (`wgplus-daemon-init`) and prevents unprivileged fallback shells from invoking `pm grant` under app UID.
+
 ## [1.4.0] - 2026-11-10
 
 ### Added

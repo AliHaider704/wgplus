@@ -12,7 +12,7 @@ public final class WgStrings {
 
     public static final String LANG_AR = "ar";
     public static final String LANG_EN = "en";
-    public static final String VERSION_LABEL = "1.4.0";
+    public static final String VERSION_LABEL = "1.5.0";
 
     private static final Map<String, String> AR_COUNTRIES = new HashMap<>();
 
@@ -806,7 +806,7 @@ public final class WgStrings {
     }
 
     public static String hybridHeading(boolean ar) {
-        return ar ? "الحماية الهجينة الصامتة (بدون إشعار)" : "Silent Hybrid Continuity";
+        return ar ? "الحماية الصامتة بالخلفية" : "Silent Background Protection";
     }
 
     public static String hybridTierLabel(boolean ar, ContinuityBridgeManager.ContinuityTier tier) {
@@ -816,94 +816,140 @@ public final class WgStrings {
         switch (safe) {
             case HYBRID_FULL:
                 return ar
-                        ? "هجين متكامل نشط (شيزوكو + حارس الإقلاع)"
-                        : "Full Hybrid active (Shizuku + Boot Guard)";
-            case SHIZUKU_ONLY:
+                        ? "الحماية الدائمة نشطة (بدون إشعار)"
+                        : "Always-on protection active (no notification)";
+            case PRIVILEGED_ONLY:
                 return ar
-                        ? "حماية شيزوكو نشطة (بدون إشعار)"
-                        : "Shizuku protection active (silent)";
+                        ? "الحماية الخلفية نشطة (بدون إشعار)"
+                        : "Background protection active (no notification)";
             case LISTENER_BOOT_GUARD:
                 return ar
-                        ? "حارس الإقلاع الصامت نشط (بدون إشعار)"
-                        : "Silent Boot Guard active (no notification)";
+                        ? "التشغيل التلقائي الصامت نشط (بدون إشعار)"
+                        : "Silent auto-start active (no notification)";
             case STANDARD_FGS:
             default:
                 return ar
-                        ? "الوضع القياسي (إشعار النظام الثابت)"
-                        : "Standard mode (persistent notification)";
+                        ? "الوضع العادي (بإشعار النظام)"
+                        : "Standard mode (system notification)";
         }
     }
 
     public static String hybridDetailLine(boolean ar, ContinuityBridgeManager.StealthSnapshot snap) {
         if (snap == null) {
             return ar
-                    ? "شيزوكو: قيد التحقق • حارس الإقلاع: قيد التحقق"
-                    : "Shizuku: checking • Boot Guard: checking";
+                    ? "حالة الحماية: قيد التحقق"
+                    : "Protection status: checking";
         }
-        String shizukuPart;
-        if (snap.shizukuGranted) {
-            shizukuPart = ar ? "شيزوكو: مصرح وجاهز" : "Shizuku: granted";
-        } else if (snap.shizukuRunning) {
-            shizukuPart = ar ? "شيزوكو: يعمل ويحتاج صلاحية" : "Shizuku: running (needs permission)";
-        } else if (snap.shizukuInstalled) {
-            shizukuPart = ar ? "شيزوكو: مثبت وغير مشغّل" : "Shizuku: installed, not running";
+        String stabilityPart;
+        if (snap.rootActive) {
+            stabilityPart = ar ? "صلاحيات النظام الكاملة: مفعّلة" : "Full system access: active";
+        } else if (snap.daemonActive || snap.selfPrivileged) {
+            stabilityPart = ar ? "استقرار الخلفية: مفعّل وجاهز" : "Background stability: active";
+        } else if (snap.builtinAdbPaired) {
+            stabilityPart = ar ? "التفعيل محفوظ: قيد التشغيل التلقائي" : "Setup saved: activating automatically";
         } else {
-            shizukuPart = ar ? "شيزوكو: غير مثبت" : "Shizuku: not installed";
+            stabilityPart = ar ? "الإعداد السريع: يحتاج تفعيلاً لمرة واحدة" : "Quick setup: one-time activation needed";
         }
-        String listenerPart;
+        String autoStartPart;
         if (snap.listenerConnected) {
-            listenerPart = ar ? "حارس الإقلاع: مفعّل ومتصل" : "Boot Guard: active";
+            autoStartPart = ar ? "التشغيل التلقائي: نشط" : "Auto-start: active";
         } else if (snap.listenerEnabled) {
-            listenerPart = ar ? "حارس الإقلاع: مفعّل" : "Boot Guard: enabled";
+            autoStartPart = ar ? "التشغيل التلقائي: جاهز" : "Auto-start: ready";
         } else {
-            listenerPart = ar ? "حارس الإقلاع: غير مفعّل" : "Boot Guard: off";
+            autoStartPart = ar ? "التشغيل التلقائي: غير مفعّل" : "Auto-start: off";
         }
-        return shizukuPart + " • " + listenerPart;
+        return stabilityPart + " • " + autoStartPart;
     }
 
     public static String hybridStealthToggleTitle(boolean ar) {
         return ar
-                ? "إخفاء الإشعار عبر الحماية الهجينة عند توفرها"
-                : "Hide ongoing notification via Hybrid when ready";
+                ? "العمل بالخلفية بصمت بدون إشعار"
+                : "Run silently in background without notification";
     }
 
-    public static String hybridActionGrantShizuku(boolean ar) {
-        return ar ? "منح صلاحية شيزوكو وتفعيل الهجين" : "Grant Shizuku & enable Hybrid";
+    public static String hybridMobileTcpToggleTitle(boolean ar) {
+        return ar
+                ? "استمرار الحماية التلقائية على بيانات الهاتف"
+                : "Keep automatic protection active on Mobile Data";
+    }
+
+    public static String hybridActionOneTimeSetup(boolean ar) {
+        return ar ? "تفعيل الحماية المتقدمة لمرة واحدة" : "One-time protection setup";
     }
 
     public static String hybridActionActivateNow(boolean ar) {
-        return ar ? "تفعيل الهجين وتطبيق استثناءات النظام الآن" : "Activate Hybrid & apply OS exemptions";
-    }
-
-    public static String hybridActionOpenShizuku(boolean ar) {
-        return ar ? "تشغيل خدمة شيزوكو أولاً" : "Open Shizuku to start service";
+        return ar ? "تنشيط الحماية واستثناءات البطارية الآن" : "Activate protection & battery exemptions";
     }
 
     public static String hybridActionOpenListenerSettings(boolean ar) {
-        return ar ? "فتح صلاحية مستمع النظام الصامت" : "Open silent listener access settings";
+        return ar ? "منح صلاحية التشغيل التلقائي بالخلفية" : "Enable background auto-start permission";
     }
 
     public static String hybridHelperNote(boolean ar) {
         return ar
-                ? "يجمع بين أولوية شيزوكو وحارس الإقلاع الصامت لإزالة الإشعار الثابت وبند التطبيق النشط تلقائياً بعد التشغيل وبدون قراءة أي إشعارات."
-                : "Combines Shizuku process priority with a zero-capture Boot Guard listener to remove persistent notifications and active-app banners cleanly.";
+                ? "يُفعّل لمرة واحدة فقط برمز من ٦ أرقام، وبعدها يستمر الاتصال تلقائياً عند إعادة التشغيل وعلى الوايفاي وبيانات الهاتف بدون أي إشعارات دائمة."
+                : "Set up once with a 6-digit code so your connection stays protected across reboots, Wi-Fi, and Mobile Data with zero ongoing notifications.";
     }
 
     public static String hybridAppliedToast(boolean ar, boolean protectedNow) {
         if (ar) {
             return protectedNow
-                    ? "تم تفعيل الحماية الهجينة الصامتة وإخفاء الإشعار"
-                    : "تم تحديث حالة الاستمرارية";
+                    ? "تم تفعيل الحماية الصامتة بنجاح"
+                    : "تم تحديث حالة الحماية";
         }
         return protectedNow
-                ? "Silent Hybrid Continuity active; ongoing notification removed"
-                : "Continuity status updated";
+                ? "Silent protection enabled"
+                : "Protection status updated";
     }
 
-    public static String hybridOpenShizukuHintToast(boolean ar) {
+    public static String hybridPairingHintToast(boolean ar) {
         return ar
-                ? "شغّل خدمة شيزوكو ثم ارجع هنا لمنح الصلاحية وتفعيل الهجين"
-                : "Start the Shizuku service first, then return here to grant permission and enable Hybrid.";
+                ? "فعّل تصحيح الأخطاء اللاسلكي من خيارات المطور ثم أدخل الرمز داخل الإشعار"
+                : "Enable Wireless debugging in Developer options, then enter the 6-digit code in the notification.";
+    }
+
+    public static String adbPairingChannelName(boolean ar) {
+        return ar ? "تفعيل الحماية لمرة واحدة" : "One-time protection setup";
+    }
+
+    public static String adbPairingNotifTitle(boolean ar, int discoveredPort) {
+        if (ar) {
+            return discoveredPort > 0
+                    ? "جاهز لإدخال رمز التفعيل"
+                    : "جاري التحضير للربط اللاسلكي...";
+        }
+        return discoveredPort > 0
+                ? "Ready for setup code"
+                : "Preparing wireless pairing...";
+    }
+
+    public static String adbPairingNotifBody(boolean ar) {
+        return ar
+                ? "افتح إقران الجهاز برمز الإقران ثم اضغط إدخال الرمز واكتب الأرقام الستة."
+                : "Open 'Pair device with pairing code', tap Enter code, and type the 6-digit code.";
+    }
+
+    public static String adbPairingActionReply(boolean ar) {
+        return ar ? "إدخال الرمز" : "Enter code";
+    }
+
+    public static String adbPairingHint(boolean ar) {
+        return ar ? "اكتب الأرقام الستة" : "6-digit code";
+    }
+
+    public static String adbPairingCancel(boolean ar) {
+        return ar ? "إغلاق" : "Cancel";
+    }
+
+    public static String adbPairingResultToast(boolean ar, boolean ok) {
+        if (ar) {
+            return ok
+                    ? "تم التفعيل بنجاح! الحماية الدائمة تعمل الآن بصمت"
+                    : "تعذر الإكمال، تأكد من الرمز وتفعيل تصحيح الأخطاء اللاسلكي";
+        }
+        return ok
+                ? "Setup complete! Permanent silent protection is now active."
+                : "Setup failed. Check the 6-digit code and ensure Wireless debugging is enabled.";
     }
 
     public static String localizedCountryName(String isoCode, boolean ar) {
