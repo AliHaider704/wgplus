@@ -281,6 +281,10 @@ public class WgPlusFeatureSuiteTest {
                 // R-02: Zero em dashes anywhere
                 assertFalse("Em dash found in " + name + " (ar=" + ar + "): " + out, out.contains("\u2014"));
 
+                // Quranic tanween fath: tanween must sit on the letter before alef (\u064B\u0627), never on the alef (\u0627\u064B)
+                assertFalse("Tanween fath placed on alef instead of preceding letter in " + name + ": " + out,
+                        out.contains("\u0627\u064B"));
+
                 // No marketing buzzwords in UI copy
                 String lower = out.toLowerCase(Locale.ROOT);
                 for (String buzz : bannedBuzzwords) {
@@ -311,6 +315,15 @@ public class WgPlusFeatureSuiteTest {
             }
         }
         assertTrue("Expected at least 60 localized methods checked, got " + checkedMethods, checkedMethods >= 60);
+
+        // Default profile names ("خادم N" / "Server N") must dynamically localize across languages
+        assertEquals("Server 1", WgStrings.localizeProfileName("خادم 1", false));
+        assertEquals("Server 1", WgStrings.localizeProfileName("خادم ١", false));
+        assertEquals("خادم 1", WgStrings.localizeProfileName("Server 1", true));
+        assertEquals("Server 2 (2)", WgStrings.localizeProfileName("خادم 2 (2)", false));
+        assertEquals("Germany WireGuard", WgStrings.localizeProfileName("Germany WireGuard", false));
+        assertFalse(WgStrings.statusStoppedWithProfile(false, "خادم 1").matches(".*[\\u0600-\\u06FF].*"));
+        assertTrue(WgStrings.statusActiveWithProfile(false, "خادم 1", 1080).contains("Server 1"));
     }
 
     private static Object[] buildSampleArgs(String methodName, Class<?>[] types, boolean ar) {

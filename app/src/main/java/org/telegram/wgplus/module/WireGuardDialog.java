@@ -7,6 +7,7 @@ import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.ContextWrapper;
 import android.content.Intent;
+import android.content.res.ColorStateList;
 import android.database.Cursor;
 import android.graphics.Bitmap;
 import android.graphics.Color;
@@ -17,8 +18,10 @@ import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.provider.OpenableColumns;
+import android.text.Editable;
 import android.text.InputType;
 import android.text.TextUtils;
+import android.text.TextWatcher;
 import android.text.method.PasswordTransformationMethod;
 import android.text.method.SingleLineTransformationMethod;
 import android.util.DisplayMetrics;
@@ -471,7 +474,7 @@ public final class WireGuardDialog {
 
         // Pre-create editor inputs (including AmneziaWG fields) so captureDraftInputs works from any action
         final EditText profileNameInput = createProseEditText(
-                ctx, WgStrings.hintProfileName(isAr), state.draft.name, isAr, theme
+                ctx, WgStrings.hintProfileName(isAr), WgStrings.localizeProfileName(state.draft.name, isAr), isAr, theme
         );
         final EditText privateKeyInput = createSecretTechnicalEditText(
                 ctx, WgStrings.hintPrivateKey(isAr), state.draft.privateKey, state.showPrivateKey, theme
@@ -726,17 +729,8 @@ public final class WireGuardDialog {
 
             addFieldToContainer(formWrap, ctx, WgStrings.labelPublicKey(isAr), publicKeyInput, isAr, theme, WgTheme.dp(ctx, 10));
 
-            if (useTwoColumns) {
-                formWrap.addView(createTwoColumnRow(
-                        ctx,
-                        WgStrings.labelEndpoint(isAr), endpointInput, 1.45f,
-                        WgStrings.labelKeepAlive(isAr), keepAliveInput, 0.85f,
-                        isAr, theme, WgTheme.dp(ctx, 10)
-                ));
-            } else {
-                addFieldToContainer(formWrap, ctx, WgStrings.labelEndpoint(isAr), endpointInput, isAr, theme, WgTheme.dp(ctx, 10));
-                addFieldToContainer(formWrap, ctx, WgStrings.labelKeepAlive(isAr), keepAliveInput, isAr, theme, WgTheme.dp(ctx, 10));
-            }
+            addFieldToContainer(formWrap, ctx, WgStrings.labelEndpoint(isAr), endpointInput, isAr, theme, WgTheme.dp(ctx, 10));
+            addFieldToContainer(formWrap, ctx, WgStrings.labelKeepAlive(isAr), keepAliveInput, isAr, theme, WgTheme.dp(ctx, 10));
 
             Button saveDraftBtn = createSecondaryButton(ctx, WgStrings.saveChangesBtn(isAr), theme);
             saveDraftBtn.setOnClickListener(v -> {
@@ -1146,9 +1140,7 @@ public final class WireGuardDialog {
             final WireGuardManager.TunnelConfig item = allProfiles.get(i);
             final boolean isConnectedRow = isRunningAtRender && item.id.equals(connectedIdAtRender);
             final boolean isSelectedRow = item.id.equals(state.draft.id);
-            final String displayLabel = (item.name == null || item.name.trim().isEmpty())
-                    ? WgStrings.defaultProfileName(isAr, i + 1)
-                    : item.name.trim();
+            final String displayLabel = WgStrings.localizeProfileName(item.name, isAr, i + 1);
 
             LinearLayout rowCard = new LinearLayout(ctx);
             rowCard.setOrientation(compactRowActions ? LinearLayout.HORIZONTAL : LinearLayout.VERTICAL);
@@ -1959,21 +1951,37 @@ public final class WireGuardDialog {
         LinearLayout row = new LinearLayout(ctx);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
-        row.setMinimumHeight(WgTheme.dp(ctx, 44));
+        row.setMinimumHeight(WgTheme.dp(ctx, 46));
         row.setClickable(true);
         row.setFocusable(true);
-        row.setPadding(0, WgTheme.dp(ctx, 4), 0, WgTheme.dp(ctx, 4));
+        row.setPadding(0, WgTheme.dp(ctx, 7), 0, WgTheme.dp(ctx, 7));
 
         TextView tv = new TextView(ctx);
         applyProseTextStyle(tv, isAr, theme.textPrimary, 13.5f, false);
         tv.setText(labelText);
         LinearLayout.LayoutParams tvLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
-        setMarginEndCompat(tvLp, WgTheme.dp(ctx, 8), isAr);
+        setMarginEndCompat(tvLp, WgTheme.dp(ctx, 10), isAr);
         row.addView(tv, tvLp);
 
+        styleSwitchColors(sw, theme);
         row.addView(sw);
         row.setOnClickListener(v -> sw.toggle());
         return row;
+    }
+
+    private static void styleSwitchColors(Switch sw, WgTheme theme) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            int[][] states = new int[][]{
+                    new int[]{android.R.attr.state_checked},
+                    new int[]{}
+            };
+            int thumbOn = theme.isDark ? theme.activeDot : theme.accentPrimary;
+            int thumbOff = theme.isDark ? theme.textSecondary : theme.surfaceCard;
+            int trackOn = theme.isDark ? theme.activeBorder : theme.pendingBorder;
+            int trackOff = theme.borderSubtle;
+            sw.setThumbTintList(new ColorStateList(states, new int[]{thumbOn, thumbOff}));
+            sw.setTrackTintList(new ColorStateList(states, new int[]{trackOn, trackOff}));
+        }
     }
 
     private static View createTwoColumnRow(
@@ -2082,7 +2090,10 @@ public final class WireGuardDialog {
         edit.setHintTextColor(theme.textHint);
         edit.setTextColor(theme.textPrimary);
         edit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
-        edit.setTypeface(Typeface.SANS_SERIF);
+        edit.setTypeface(Typeface.DEFAULT);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            edit.setLetterSpacing(0f);
+        }
         edit.setSingleLine(true);
         edit.setInputType(InputType.TYPE_CLASS_TEXT);
         edit.setFocusable(true);
@@ -2093,10 +2104,10 @@ public final class WireGuardDialog {
         }
         edit.setText(initialValue != null ? initialValue : "");
         edit.setBackground(WgTheme.inputWellBackground(ctx, theme));
-        int pH = WgTheme.dp(ctx, 11);
-        int pV = WgTheme.dp(ctx, 10);
+        int pH = WgTheme.dp(ctx, 12);
+        int pV = WgTheme.dp(ctx, 11);
         edit.setPadding(pH, pV, pH, pV);
-        edit.setMinimumHeight(WgTheme.dp(ctx, 44));
+        edit.setMinimumHeight(WgTheme.dp(ctx, 46));
         return edit;
     }
 
@@ -2117,38 +2128,84 @@ public final class WireGuardDialog {
         edit.setTransformationMethod(visible
                 ? SingleLineTransformationMethod.getInstance()
                 : PasswordTransformationMethod.getInstance());
-        edit.setTypeface(Typeface.MONOSPACE);
+        syncTechnicalHintOrValueStyle(edit, hintText);
         return edit;
     }
 
     private static EditText createTechnicalEditText(
             Context ctx,
-            String hintText,
+            final String hintText,
             String initialValue,
             int inputType,
             WgTheme theme
     ) {
-        EditText edit = new EditText(ctx);
+        final EditText edit = new EditText(ctx);
         edit.setHint(hintText);
         edit.setHintTextColor(theme.textHint);
         edit.setTextColor(theme.textPrimary);
         edit.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
-        edit.setTypeface(Typeface.MONOSPACE);
         edit.setSingleLine(true);
         edit.setInputType(inputType);
         edit.setFocusable(true);
         edit.setFocusableInTouchMode(true);
-        edit.setGravity(Gravity.LEFT | Gravity.CENTER_VERTICAL);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
-            edit.setTextDirection(View.TEXT_DIRECTION_LTR);
-        }
         edit.setText(initialValue != null ? initialValue : "");
+        syncTechnicalHintOrValueStyle(edit, hintText);
+        if (containsArabicScript(hintText)) {
+            edit.addTextChangedListener(new TextWatcher() {
+                @Override
+                public void beforeTextChanged(CharSequence s, int start, int count, int after) {
+                }
+
+                @Override
+                public void onTextChanged(CharSequence s, int start, int before, int count) {
+                }
+
+                @Override
+                public void afterTextChanged(Editable s) {
+                    syncTechnicalHintOrValueStyle(edit, hintText);
+                }
+            });
+        }
         edit.setBackground(WgTheme.inputWellBackground(ctx, theme));
-        int pH = WgTheme.dp(ctx, 11);
-        int pV = WgTheme.dp(ctx, 10);
+        int pH = WgTheme.dp(ctx, 12);
+        int pV = WgTheme.dp(ctx, 11);
         edit.setPadding(pH, pV, pH, pV);
-        edit.setMinimumHeight(WgTheme.dp(ctx, 44));
+        edit.setMinimumHeight(WgTheme.dp(ctx, 46));
         return edit;
+    }
+
+    private static void syncTechnicalHintOrValueStyle(EditText edit, String hintText) {
+        boolean emptyWithArabicHint = (edit.getText() == null || edit.getText().length() == 0)
+                && containsArabicScript(hintText);
+        if (emptyWithArabicHint) {
+            edit.setTypeface(Typeface.DEFAULT);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+                edit.setLetterSpacing(0f);
+            }
+            edit.setGravity(Gravity.RIGHT | Gravity.CENTER_VERTICAL);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+                edit.setTextDirection(View.TEXT_DIRECTION_RTL);
+            }
+        } else {
+            edit.setTypeface(Typeface.MONOSPACE);
+            edit.setGravity(Gravity.LEFT | Gravity.CENTER_VERTICAL);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+                edit.setTextDirection(View.TEXT_DIRECTION_LTR);
+            }
+        }
+    }
+
+    private static boolean containsArabicScript(String text) {
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c >= '\u0600' && c <= '\u06FF') {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static void addFieldToContainer(
@@ -2223,14 +2280,18 @@ public final class WireGuardDialog {
         btn.setText(text);
         btn.setTextColor(selected ? theme.onAccent : theme.textPrimary);
         btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
-        btn.setTypeface(Typeface.SANS_SERIF, Typeface.BOLD);
+        btn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        btn.setLineSpacing(WgTheme.dp(ctx, 2), 1.05f);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            btn.setLetterSpacing(0f);
+        }
         int minH = WgTheme.dp(ctx, 44);
         btn.setMinHeight(minH);
         btn.setMinimumHeight(minH);
         btn.setMinWidth(WgTheme.dp(ctx, 44));
         btn.setMinimumWidth(WgTheme.dp(ctx, 44));
         btn.setFocusable(true);
-        btn.setPadding(WgTheme.dp(ctx, 10), WgTheme.dp(ctx, 6), WgTheme.dp(ctx, 10), WgTheme.dp(ctx, 6));
+        btn.setPadding(WgTheme.dp(ctx, 11), WgTheme.dp(ctx, 7), WgTheme.dp(ctx, 11), WgTheme.dp(ctx, 7));
         btn.setBackground(WgTheme.interactiveBackground(
                 ctx,
                 selected ? theme.accentPrimary : theme.surfaceSecondaryBtn,
@@ -2248,14 +2309,18 @@ public final class WireGuardDialog {
         btn.setText(text);
         btn.setTextColor(theme.stoppedText);
         btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
-        btn.setTypeface(Typeface.SANS_SERIF, Typeface.BOLD);
+        btn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        btn.setLineSpacing(WgTheme.dp(ctx, 2), 1.05f);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            btn.setLetterSpacing(0f);
+        }
         int minH = WgTheme.dp(ctx, 44);
         btn.setMinHeight(minH);
         btn.setMinimumHeight(minH);
         btn.setMinWidth(WgTheme.dp(ctx, 44));
         btn.setMinimumWidth(WgTheme.dp(ctx, 44));
         btn.setFocusable(true);
-        btn.setPadding(WgTheme.dp(ctx, 10), WgTheme.dp(ctx, 6), WgTheme.dp(ctx, 10), WgTheme.dp(ctx, 6));
+        btn.setPadding(WgTheme.dp(ctx, 11), WgTheme.dp(ctx, 7), WgTheme.dp(ctx, 11), WgTheme.dp(ctx, 7));
         btn.setBackground(WgTheme.interactiveBackground(
                 ctx,
                 theme.stoppedBg,
@@ -2273,7 +2338,11 @@ public final class WireGuardDialog {
         btn.setText(text);
         btn.setTextColor(textColor);
         btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
-        btn.setTypeface(Typeface.SANS_SERIF, Typeface.BOLD);
+        btn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        btn.setLineSpacing(WgTheme.dp(ctx, 2), 1.06f);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            btn.setLetterSpacing(0f);
+        }
         int minH = WgTheme.dp(ctx, minHeightDp);
         btn.setMinHeight(minH);
         btn.setMinimumHeight(minH);
@@ -2285,8 +2354,12 @@ public final class WireGuardDialog {
     private static void applyProseTextStyle(TextView tv, boolean isAr, int color, float sizeSp, boolean bold) {
         tv.setTextColor(color);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp);
-        tv.setTypeface(Typeface.SANS_SERIF, bold ? Typeface.BOLD : Typeface.NORMAL);
+        tv.setTypeface(Typeface.DEFAULT, bold ? Typeface.BOLD : Typeface.NORMAL);
         tv.setGravity(isAr ? Gravity.RIGHT : Gravity.LEFT);
+        tv.setLineSpacing(WgTheme.dp(tv.getContext(), isAr ? 4f : 2f), isAr ? 1.12f : 1.06f);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            tv.setLetterSpacing(0f);
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
             tv.setTextDirection(isAr ? View.TEXT_DIRECTION_RTL : View.TEXT_DIRECTION_LTR);
         }

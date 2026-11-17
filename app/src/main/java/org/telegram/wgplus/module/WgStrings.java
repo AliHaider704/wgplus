@@ -132,6 +132,91 @@ public final class WgStrings {
         return "\u2066" + token + "\u2069";
     }
 
+    /**
+     * Normalizes auto-generated default profile names ("خادم N" / "Server N") to the active UI language
+     * so switching languages never leaks a localized default name into the opposite language.
+     */
+    public static String localizeProfileName(String rawName, boolean ar) {
+        String clean = rawName == null ? "" : rawName.trim();
+        if (clean.isEmpty()) {
+            return "";
+        }
+        String suffix = extractDefaultProfileSuffix(clean);
+        if (suffix != null) {
+            return (ar ? "خادم " : "Server ") + suffix;
+        }
+        return clean;
+    }
+
+    public static String localizeProfileName(String rawName, boolean ar, int fallbackIndex) {
+        String localized = localizeProfileName(rawName, ar);
+        return localized.isEmpty() ? defaultProfileName(ar, fallbackIndex) : localized;
+    }
+
+    public static boolean isDefaultProfileName(String rawName) {
+        if (rawName == null) {
+            return false;
+        }
+        return extractDefaultProfileSuffix(rawName.trim()) != null;
+    }
+
+    private static String extractDefaultProfileSuffix(String trimmed) {
+        String rest = null;
+        if (trimmed.startsWith("خادم ")) {
+            rest = trimmed.substring(5).trim();
+        } else if (trimmed.length() > 7 && trimmed.substring(0, 7).equalsIgnoreCase("server ")) {
+            rest = trimmed.substring(7).trim();
+        }
+        if (rest == null || rest.isEmpty()) {
+            return null;
+        }
+        String normalized = normalizeDigitsToAscii(rest);
+        // Match "<digits>" or "<digits> (<digits>)" from uniqueProfileName deduplication
+        int idx = 0;
+        while (idx < normalized.length() && normalized.charAt(idx) >= '0' && normalized.charAt(idx) <= '9') {
+            idx++;
+        }
+        if (idx == 0) {
+            return null;
+        }
+        if (idx == normalized.length()) {
+            return normalized;
+        }
+        String tail = normalized.substring(idx).trim();
+        if (tail.startsWith("(") && tail.endsWith(")") && tail.length() > 2) {
+            String inner = tail.substring(1, tail.length() - 1).trim();
+            if (!inner.isEmpty() && isAllAsciiDigits(inner)) {
+                return normalized.substring(0, idx) + " (" + inner + ")";
+            }
+        }
+        return null;
+    }
+
+    private static String normalizeDigitsToAscii(String s) {
+        StringBuilder sb = new StringBuilder(s.length());
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c >= '\u0660' && c <= '\u0669') {
+                sb.append((char) ('0' + (c - '\u0660')));
+            } else if (c >= '\u06F0' && c <= '\u06F9') {
+                sb.append((char) ('0' + (c - '\u06F0')));
+            } else {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    private static boolean isAllAsciiDigits(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c < '0' || c > '9') {
+                return false;
+            }
+        }
+        return !s.isEmpty();
+    }
+
     public static String floatingTriggerLabel(boolean ar) {
         return ar ? "نفق وايرجارد" : "WireGuard";
     }
@@ -159,7 +244,7 @@ public final class WgStrings {
 
     public static String statusActiveWithProfile(boolean ar, String profileName, int port) {
         String addr = ltr("127.0.0.1:" + port);
-        String cleanName = profileName == null ? "" : profileName.trim();
+        String cleanName = localizeProfileName(profileName, ar);
         if (cleanName.isEmpty()) {
             return statusActive(ar, port);
         }
@@ -173,7 +258,7 @@ public final class WgStrings {
     }
 
     public static String statusSwitchingTo(boolean ar, String profileName) {
-        String cleanName = profileName == null ? "" : profileName.trim();
+        String cleanName = localizeProfileName(profileName, ar);
         if (cleanName.isEmpty()) {
             return statusConnecting(ar);
         }
@@ -185,7 +270,7 @@ public final class WgStrings {
     }
 
     public static String statusStoppedWithProfile(boolean ar, String profileName) {
-        String cleanName = profileName == null ? "" : profileName.trim();
+        String cleanName = localizeProfileName(profileName, ar);
         if (cleanName.isEmpty()) {
             return statusStopped(ar);
         }
@@ -193,7 +278,7 @@ public final class WgStrings {
     }
 
     public static String statusKillSwitchGuarded(boolean ar, String profileName) {
-        String cleanName = profileName == null ? "" : profileName.trim();
+        String cleanName = localizeProfileName(profileName, ar);
         if (cleanName.isEmpty()) {
             return ar ? "مانع التسريب نشط (الاتصال المباشر محجوب)" : "Kill switch active (direct traffic blocked)";
         }
@@ -204,7 +289,7 @@ public final class WgStrings {
 
     public static String statusKillSwitchSubline(boolean ar) {
         return ar
-                ? "جميع اتصالات ومكالمات تليجرام موقوفة مؤقتاً لمنع كشف عنوانك الحقيقي حتى يتصل النفق."
+                ? "جميع اتصالات ومكالمات تليجرام موقوفة مؤقتًا لمنع كشف عنوانك الحقيقي حتى يتصل النفق."
                 : "All Telegram traffic and calls are held locally so your real IP cannot leak while disconnected.";
     }
 
@@ -408,7 +493,7 @@ public final class WgStrings {
 
     public static String profileTapHint(boolean ar) {
         return ar
-                ? "اضغط على أي خادم للتبديل إليه فوراً، أو قِس السرعة لاختيار الأقل زمناً."
+                ? "اضغط على أي خادم للتبديل إليه فورًا، أو قِس السرعة لاختيار الأقل زمنًا."
                 : "Tap any server to switch immediately, or ping all to pick the lowest latency.";
     }
 
@@ -448,9 +533,9 @@ public final class WgStrings {
     }
 
     public static String confirmDeleteMessage(boolean ar, String profileName) {
-        String cleanName = profileName == null ? "" : profileName.trim();
+        String cleanName = localizeProfileName(profileName, ar);
         if (ar) {
-            return "هل تريد حذف الخادم \"" + cleanName + "\" وإزالة مفاتيحه المشفرة نهائياً؟";
+            return "هل تريد حذف الخادم \"" + cleanName + "\" وإزالة مفاتيحه المشفرة نهائيًا؟";
         }
         return "Delete profile \"" + cleanName + "\" and permanently remove its encrypted keys?";
     }
@@ -510,7 +595,7 @@ public final class WgStrings {
     }
 
     public static String hintPrivateKey(boolean ar) {
-        return ar ? "مفتاح من 44 أو 64 محرفاً" : "44-char Base64 or 64-char hex";
+        return ar ? "مفتاح من 44 أو 64 محرفًا" : "44-char Base64 or 64-char hex";
     }
 
     public static String showSecretBtn(boolean ar, boolean currentlyVisible) {
@@ -572,7 +657,7 @@ public final class WgStrings {
     }
 
     public static String hintPresharedKey(boolean ar) {
-        return ar ? "اتركه فارغاً إن لم يطلبه الخادم" : "Leave empty if unused";
+        return ar ? "اتركه فارغًا إن لم يطلبه الخادم" : "Leave empty if unused";
     }
 
     public static String labelMtu(boolean ar) {
@@ -587,7 +672,7 @@ public final class WgStrings {
         if (running) {
             return ar ? "جارٍ فحص أنسب حجم رزمة..." : "Probing optimal MTU...";
         }
-        return ar ? "ضبط حجم الرزمة تلقائياً للشبكة" : "Auto-detect optimal MTU";
+        return ar ? "ضبط حجم الرزمة تلقائيًا للشبكة" : "Auto-detect optimal MTU";
     }
 
     public static String awgSectionHeading(boolean ar) {
@@ -598,7 +683,7 @@ public final class WgStrings {
 
     public static String awgSectionHint(boolean ar) {
         return ar
-                ? "نبضات التمويه العشوائية تعمل حتى مع خوادم وايرجارد العادية، بينما تُقرأ قيم الحشو والترويسات تلقائياً عند استيراد ملف أمنيزيا."
+                ? "نبضات التمويه العشوائية تعمل حتى مع خوادم وايرجارد العادية، بينما تُقرأ قيم الحشو والترويسات تلقائيًا عند استيراد ملف أمنيزيا."
                 : "Decoy junk bursts work even on standard WireGuard servers; padding and header values load automatically from AmneziaWG configs.";
     }
 
@@ -663,7 +748,7 @@ public final class WgStrings {
     }
 
     public static String qrModalTitle(boolean ar, String profileName) {
-        String clean = profileName == null ? "" : profileName.trim();
+        String clean = localizeProfileName(profileName, ar);
         if (clean.isEmpty()) {
             return ar ? "الرمز المربع لإعدادات الخادم" : "Server configuration QR code";
         }
@@ -697,7 +782,7 @@ public final class WgStrings {
     }
 
     public static String toastImportedNamedProfile(boolean ar, String profileName) {
-        String cleanName = profileName == null ? "" : profileName.trim();
+        String cleanName = localizeProfileName(profileName, ar);
         if (cleanName.isEmpty()) {
             return toastImportedConf(ar);
         }
@@ -705,30 +790,35 @@ public final class WgStrings {
     }
 
     public static String toastCreatedNewProfile(boolean ar, String profileName) {
-        return ar ? ("تم إنشاء " + profileName) : ("Created " + profileName);
+        String cleanName = localizeProfileName(profileName, ar);
+        return ar ? ("تم إنشاء " + cleanName) : ("Created " + cleanName);
     }
 
     public static String toastSelectedProfile(boolean ar, String profileName) {
-        return ar ? ("تم اختيار الخادم: " + profileName) : ("Selected profile: " + profileName);
+        String cleanName = localizeProfileName(profileName, ar);
+        return ar ? ("تم اختيار الخادم: " + cleanName) : ("Selected profile: " + cleanName);
     }
 
     public static String toastSwitchedProfile(boolean ar, String profileName, int port) {
+        String cleanName = localizeProfileName(profileName, ar);
         String addr = ltr("127.0.0.1:" + port);
         return ar
-                ? ("تم التحويل إلى " + profileName + " (" + addr + ")")
-                : ("Switched to " + profileName + " (" + addr + ")");
+                ? ("تم التحويل إلى " + cleanName + " (" + addr + ")")
+                : ("Switched to " + cleanName + " (" + addr + ")");
     }
 
     public static String toastFailoverSwitched(boolean ar, String profileName) {
+        String cleanName = localizeProfileName(profileName, ar);
         return ar
-                ? ("انقطع الخادم السابق فتم التحويل تلقائياً إلى " + profileName)
-                : ("Primary tunnel dropped; failed over to " + profileName);
+                ? ("انقطع الخادم السابق فتم التحويل تلقائيًا إلى " + cleanName)
+                : ("Primary tunnel dropped; failed over to " + cleanName);
     }
 
     public static String toastPingWinner(boolean ar, String profileName, int ms) {
+        String cleanName = localizeProfileName(profileName, ar);
         return ar
-                ? ("الأسرع: " + profileName + " (" + ms + " مللي ثانية)")
-                : ("Fastest: " + profileName + " (" + ms + " ms)");
+                ? ("الأسرع: " + cleanName + " (" + ms + " مللي ثانية)")
+                : ("Fastest: " + cleanName + " (" + ms + " ms)");
     }
 
     public static String toastOptimalMtuFound(boolean ar, int mtu) {
@@ -787,7 +877,7 @@ public final class WgStrings {
     public static String[] launcherSteps(boolean ar) {
         if (ar) {
             return new String[]{
-                    "١. فعّل هذه الإضافة على تليجرام بلس أو تليجرام الرسمي من أداة الدمج جنباً إلى جنب مع إضافاتك الحالية.",
+                    "١. فعّل هذه الإضافة على تليجرام بلس أو تليجرام الرسمي من أداة الدمج جنبًا إلى جنب مع إضافاتك الحالية.",
                     "٢. افتح تليجرام ثم ادخل إلى الإعدادات ثم البيانات والتخزين ثم إعدادات البروكسي.",
                     "٣. اضغط زر نفق وايرجارد أسفل الشاشة لاستيراد ملف أو صورة رمز مربع وتفعيل تمويه الحزم والمكالمات.",
                     "٤. اضغط فحص المسار والمكالمات للتأكد من تغيّر العنوان الخارجي وجاهزية المكالمات."
@@ -848,7 +938,7 @@ public final class WgStrings {
         } else if (snap.builtinAdbPaired) {
             stabilityPart = ar ? "التفعيل محفوظ: قيد التشغيل التلقائي" : "Setup saved: activating automatically";
         } else {
-            stabilityPart = ar ? "الإعداد السريع: يحتاج تفعيلاً لمرة واحدة" : "Quick setup: one-time activation needed";
+            stabilityPart = ar ? "الإعداد السريع: يحتاج تفعيلًا لمرة واحدة" : "Quick setup: one-time activation needed";
         }
         String autoStartPart;
         if (snap.listenerConnected) {
@@ -887,7 +977,7 @@ public final class WgStrings {
 
     public static String hybridHelperNote(boolean ar) {
         return ar
-                ? "يُفعّل لمرة واحدة فقط برمز من ٦ أرقام، وبعدها يستمر الاتصال تلقائياً عند إعادة التشغيل وعلى الوايفاي وبيانات الهاتف بدون أي إشعارات دائمة."
+                ? "يُفعّل لمرة واحدة فقط برمز من ٦ أرقام، وبعدها يستمر الاتصال تلقائيًا عند إعادة التشغيل وعلى الوايفاي وبيانات الهاتف بدون أي إشعارات دائمة."
                 : "Set up once with a 6-digit code so your connection stays protected across reboots, Wi-Fi, and Mobile Data with zero ongoing notifications.";
     }
 
@@ -990,7 +1080,7 @@ public final class WgStrings {
         }
         if (lower.contains("preshared key")) {
             return ar
-                    ? "المفتاح المشترك المسبق غير صالح. تأكد من إدخاله كاملاً أو اتركه فارغاً."
+                    ? "المفتاح المشترك المسبق غير صالح. تأكد من إدخاله كاملًا أو اتركه فارغًا."
                     : "Preshared key is invalid. Enter a valid 32-byte key or leave it empty.";
         }
         if (lower.contains("private key")) {
@@ -998,7 +1088,7 @@ public final class WgStrings {
         }
         if (lower.contains("public key")) {
             return ar
-                    ? "المفتاح العام للخادم غير صالح. تأكد من نسخ المفتاح كاملاً."
+                    ? "المفتاح العام للخادم غير صالح. تأكد من نسخ المفتاح كاملًا."
                     : "Peer public key is invalid. Enter a complete 44-char Base64 or 64-char hex key.";
         }
         if (lower.contains("address")) {
@@ -1008,7 +1098,7 @@ public final class WgStrings {
         }
         if (lower.contains("dns")) {
             return ar
-                    ? "عنوان خادم النطاقات غير صالح. استخدم عنواناً رقمياً مثل " + ltr("1.1.1.1") + "."
+                    ? "عنوان خادم النطاقات غير صالح. استخدم عنوانًا رقميًا مثل " + ltr("1.1.1.1") + "."
                     : "DNS server address is invalid. Enter an IP address such as 1.1.1.1.";
         }
         if (lower.contains("resolve endpoint") || lower.contains("unknownhost")) {
@@ -1036,7 +1126,7 @@ public final class WgStrings {
         switch (code) {
             case EMPTY_CLIPBOARD:
                 return ar
-                        ? "الحافظة فارغة. انسخ محتوى الإعدادات أولاً ثم أعد المحاولة."
+                        ? "الحافظة فارغة. انسخ محتوى الإعدادات أولًا ثم أعد المحاولة."
                         : "Clipboard is empty. Copy a WireGuard config or backup first, then try again.";
             case INVALID_CONF:
                 return ar
@@ -1064,15 +1154,15 @@ public final class WgStrings {
                         : "Enter the tunnel IP address (for example, 10.0.0.2/32).";
             case INVALID_KEY_FORMAT:
                 return ar
-                        ? "صيغة المفتاح غير صحيحة. يجب أن يتكون من 44 محرفاً أو 64 محرفاً ست عشرياً."
+                        ? "صيغة المفتاح غير صحيحة. يجب أن يتكون من 44 محرفًا أو 64 محرفًا ست عشريًا."
                         : "Invalid key encoding. Provide a 44-char Base64 or 64-char hex key.";
             case INVALID_KEY_LENGTH:
                 return ar
-                        ? "طول المفتاح غير مكتمل (32 بايت مطلوب). تأكد من نسخ المفتاح كاملاً."
+                        ? "طول المفتاح غير مكتمل (32 بايت مطلوب). تأكد من نسخ المفتاح كاملًا."
                         : "Key length is incomplete (expected 32 bytes). Check that no characters are missing.";
             case TUNNEL_STOPPED:
                 return ar
-                        ? "النفق غير متصل حالياً. اضغط اتصال أولاً ثم أعد الفحص."
+                        ? "النفق غير متصل حاليًا. اضغط اتصال أولًا ثم أعد الفحص."
                         : "Tunnel is disconnected. Tap Connect first, then verify.";
             case NO_ACTIVE_PORT:
                 return ar
@@ -1088,7 +1178,7 @@ public final class WgStrings {
                         : "No readable QR code was found in the selected image.";
             case QR_ENCODE_FAILED:
                 return ar
-                        ? "تعذّر إنشاء الرمز المربع. أكمل بيانات الخادم الأساسية أولاً."
+                        ? "تعذّر إنشاء الرمز المربع. أكمل بيانات الخادم الأساسية أولًا."
                         : "Could not generate QR code. Fill in the required server fields first.";
             case BACKUP_INVALID:
                 return ar
@@ -1105,7 +1195,7 @@ public final class WgStrings {
             case NATIVE_BRIDGE_FAILED:
             default:
                 return ar
-                        ? "تعذّر تشغيل المحرك الأصلي داخل التطبيق. أعد فتح تليجرام وحاول مجدداً."
+                        ? "تعذّر تشغيل المحرك الأصلي داخل التطبيق. أعد فتح تليجرام وحاول مجددًا."
                         : ("Native tunnel engine failed to initialize" + (detail.isEmpty() ? "." : (": " + detail)));
         }
     }

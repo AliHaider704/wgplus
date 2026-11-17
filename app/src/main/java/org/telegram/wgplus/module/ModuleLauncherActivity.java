@@ -5,6 +5,7 @@ import android.app.ActivityManager;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.res.ColorStateList;
 import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
@@ -198,7 +199,9 @@ public class ModuleLauncherActivity extends Activity {
         WireGuardManager.TunnelConfig shownProfile = active
                 ? WireGuardManager.getConnectedProfile(this, sourceApk)
                 : WireGuardManager.loadConfig(this);
-        String profileName = (shownProfile != null && shownProfile.name != null) ? shownProfile.name : "";
+        String profileName = (shownProfile != null && shownProfile.name != null)
+                ? WgStrings.localizeProfileName(shownProfile.name, isAr)
+                : "";
 
         LinearLayout stateRow = new LinearLayout(this);
         stateRow.setOrientation(LinearLayout.HORIZONTAL);
@@ -247,7 +250,11 @@ public class ModuleLauncherActivity extends Activity {
         openConfigBtn.setText(WgStrings.launcherOpenConfigBtn(isAr));
         openConfigBtn.setTextColor(theme.onAccent);
         openConfigBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
-        openConfigBtn.setTypeface(Typeface.SANS_SERIF, Typeface.BOLD);
+        openConfigBtn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        openConfigBtn.setLineSpacing(WgTheme.dp(this, 2), 1.05f);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            openConfigBtn.setLetterSpacing(0f);
+        }
         int ctaMinH = WgTheme.dp(this, 46);
         openConfigBtn.setMinHeight(ctaMinH);
         openConfigBtn.setMinimumHeight(ctaMinH);
@@ -391,6 +398,7 @@ public class ModuleLauncherActivity extends Activity {
         Switch stealthSwitch = new Switch(this);
         stealthSwitch.setChecked(snap.stealthHybridEnabled);
         stealthSwitch.setMinHeight(WgTheme.dp(this, 44));
+        styleSwitchColors(stealthSwitch, theme);
         stealthSwitch.setOnCheckedChangeListener((btn, isChecked) -> {
             ContinuityBridgeManager.setStealthHybridEnabled(this, isChecked);
             renderScreen();
@@ -417,6 +425,7 @@ public class ModuleLauncherActivity extends Activity {
         Switch tcpSwitch = new Switch(this);
         tcpSwitch.setChecked(BuiltinAdbKeyManager.isMobileTcpHealEnabled(this));
         tcpSwitch.setMinHeight(WgTheme.dp(this, 44));
+        styleSwitchColors(tcpSwitch, theme);
         tcpSwitch.setOnCheckedChangeListener((btn, isChecked) -> {
             BuiltinAdbKeyManager.setMobileTcpHealEnabled(this, isChecked);
             renderScreen();
@@ -559,12 +568,16 @@ public class ModuleLauncherActivity extends Activity {
         btn.setText(text);
         btn.setTextColor(secondary ? theme.textPrimary : theme.onAccent);
         btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
-        btn.setTypeface(Typeface.SANS_SERIF, Typeface.BOLD);
-        int minH = WgTheme.dp(this, 44);
+        btn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        btn.setLineSpacing(WgTheme.dp(this, 2), 1.06f);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            btn.setLetterSpacing(0f);
+        }
+        int minH = WgTheme.dp(this, 46);
         btn.setMinHeight(minH);
         btn.setMinimumHeight(minH);
         btn.setFocusable(true);
-        btn.setPadding(WgTheme.dp(this, 14), WgTheme.dp(this, 9), WgTheme.dp(this, 14), WgTheme.dp(this, 9));
+        btn.setPadding(WgTheme.dp(this, 14), WgTheme.dp(this, 10), WgTheme.dp(this, 14), WgTheme.dp(this, 10));
         btn.setBackground(WgTheme.interactiveBackground(
                 this,
                 secondary ? theme.surfaceSecondaryBtn : theme.accentPrimary,
@@ -591,14 +604,17 @@ public class ModuleLauncherActivity extends Activity {
         btn.setText(text);
         btn.setTextColor(theme.textPrimary);
         btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f);
-        btn.setTypeface(Typeface.SANS_SERIF, Typeface.BOLD);
+        btn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            btn.setLetterSpacing(0f);
+        }
         int minSize = WgTheme.dp(this, 44);
         btn.setMinHeight(minSize);
         btn.setMinimumHeight(minSize);
         btn.setMinWidth(minSize);
         btn.setMinimumWidth(minSize);
         btn.setFocusable(true);
-        btn.setPadding(WgTheme.dp(this, 10), WgTheme.dp(this, 6), WgTheme.dp(this, 10), WgTheme.dp(this, 6));
+        btn.setPadding(WgTheme.dp(this, 12), WgTheme.dp(this, 7), WgTheme.dp(this, 12), WgTheme.dp(this, 7));
         btn.setBackground(WgTheme.interactiveBackground(
                 this,
                 theme.surfaceSecondaryBtn,
@@ -608,6 +624,21 @@ public class ModuleLauncherActivity extends Activity {
                 8f
         ));
         return btn;
+    }
+
+    private static void styleSwitchColors(Switch sw, WgTheme theme) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            int[][] states = new int[][]{
+                    new int[]{android.R.attr.state_checked},
+                    new int[]{}
+            };
+            int thumbOn = theme.isDark ? theme.activeDot : theme.accentPrimary;
+            int thumbOff = theme.isDark ? theme.textSecondary : theme.surfaceCard;
+            int trackOn = theme.isDark ? theme.activeBorder : theme.pendingBorder;
+            int trackOff = theme.borderSubtle;
+            sw.setThumbTintList(new ColorStateList(states, new int[]{thumbOn, thumbOff}));
+            sw.setTrackTintList(new ColorStateList(states, new int[]{trackOn, trackOff}));
+        }
     }
 
     private void applySystemBars(WgTheme theme) {
@@ -633,8 +664,12 @@ public class ModuleLauncherActivity extends Activity {
     private static void styleText(TextView tv, boolean isAr, int color, float sizeSp, boolean bold) {
         tv.setTextColor(color);
         tv.setTextSize(TypedValue.COMPLEX_UNIT_SP, sizeSp);
-        tv.setTypeface(Typeface.SANS_SERIF, bold ? Typeface.BOLD : Typeface.NORMAL);
+        tv.setTypeface(Typeface.DEFAULT, bold ? Typeface.BOLD : Typeface.NORMAL);
         tv.setGravity(isAr ? Gravity.RIGHT : Gravity.LEFT);
+        tv.setLineSpacing(WgTheme.dp(tv.getContext(), isAr ? 4f : 2f), isAr ? 1.12f : 1.06f);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            tv.setLetterSpacing(0f);
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
             tv.setTextDirection(isAr ? View.TEXT_DIRECTION_RTL : View.TEXT_DIRECTION_LTR);
         }

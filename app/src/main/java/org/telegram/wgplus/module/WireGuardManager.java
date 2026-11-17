@@ -1400,7 +1400,7 @@ public final class WireGuardManager {
 
         if (!safeTrim(cfg.endpoint).isEmpty()) {
             String currentName = safeTrim(cfg.name);
-            if (currentName.isEmpty() || currentName.startsWith("خادم ") || currentName.startsWith("Server ")) {
+            if (currentName.isEmpty() || WgStrings.isDefaultProfileName(currentName)) {
                 cfg.name = deriveProfileName(cfg.endpoint, false, 1);
             }
         }

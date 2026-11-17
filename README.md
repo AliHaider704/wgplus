@@ -1,110 +1,170 @@
-# WireGuard Plus
+<div align="center">
 
-[العربية](README.ar.md)
+<img src="docs/assets/banner.png" alt="WireGuard Plus — WireGuard & AmneziaWG Inside Telegram" width="100%" />
 
-WireGuard Plus is an Android module that puts a WireGuard tunnel inside Telegram. Only Telegram's traffic goes through it, including voice and video calls. It does not use Android's VPN slot and does not require root, so you can keep another VPN or an ad blocker running at the same time.
+<br />
 
-It works with **Telegram Plus** (`org.telegram.plus`) and the official **Telegram** (`org.telegram.messenger`), and it is built to live next to other modules such as TeleVip without clashing with them.
+[![Latest Release](https://img.shields.io/github/v/release/AliHaider704/wgplus?style=flat-square&color=1A6BB8)](https://github.com/AliHaider704/wgplus/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/AliHaider704/wgplus/total?style=flat-square&color=1F6F54)](https://github.com/AliHaider704/wgplus/releases)
+[![CI](https://img.shields.io/github/actions/workflow/status/AliHaider704/wgplus/ci.yml?branch=main&style=flat-square&label=Go%20CI)](https://github.com/AliHaider704/wgplus/actions)
+[![License: MIT](https://img.shields.io/badge/License-MIT-334155?style=flat-square)](LICENSE)
+[![Android 5.0+](https://img.shields.io/badge/Android-5.0%2B-3DDC84?style=flat-square&logo=android&logoColor=white)](https://github.com/AliHaider704/wgplus/releases)
 
-> This is an unofficial community project. It is not affiliated with Telegram, WireGuard or Amnezia.
+**WireGuard & AmneziaWG inside Telegram only — built to bypass Telegram blocks and DPI throttling without root, without occupying Android's VPN slot, and with encrypted voice & video calls.**
 
-## What it does
+[العربية (Arabic)](README.ar.md) · [Download APK](https://github.com/AliHaider704/wgplus/releases/latest) · [Compare vs Proxies & VPNs](docs/COMPARISON.md) · [User Guide](docs/USER_GUIDE.md)
 
-- **Tunnel inside Telegram only.** WireGuard runs in userspace inside the Telegram process (wireguard-go and gVisor netstack). Chats, media and calls are routed through a local SOCKS5 proxy.
-- **Voice and video calls.** The proxy supports UDP, and the module hooks Telegram's call code so media does not fall back to a direct connection.
-- **AmneziaWG obfuscation.** Junk packets, packet padding and custom headers help against networks that block plain WireGuard. There is also a one tap client preset that works with ordinary WireGuard servers.
-- **Kill switch.** While enabled, Telegram has nowhere to connect except the tunnel. If the tunnel drops, nothing leaks over your normal connection.
-- **Encrypted DNS for the server name.** The endpoint hostname is looked up over DNS-over-HTTPS, so your ISP does not see or poison the lookup.
-- **Ping and auto-failover.** Test all your servers at once, jump to the fastest, and optionally switch to a backup if the current one stops responding.
-- **Auto MTU.** Finds a packet size that works on your mobile network.
-- **24/7 Silent Sovereign Continuity (v1.5.0, Zero Helper Apps).** Built-in self-contained Wireless Debugging pairing (one-time 6-digit notification code on Android 11+, no third-party helper apps), detached background helper process, automatic Doze/Data-Saver/Samsung MARs exemptions, dynamic loopback TCP continuity on Mobile Data, automatic `uid=0` kernel boost on rooted phones, and a zero-capture Boot Guard (`KeepaliveBridgeListenerService`). Telegram stays alive across Wi-Fi, Mobile Data, Deep Doze, and device reboots with **zero persistent notification** and **zero Samsung "1 active app" banner**, falling back cleanly to standard foreground service protection if not configured.
-- **Battery saver.** Pauses keepalives when Telegram has been in the background for a while.
-- **Many profiles.** Import `.conf` files, paste from the clipboard, read a QR code from a screenshot in your gallery (no camera permission), show a QR code for sharing, and back up or restore everything as JSON.
-- **Arabic and English**, right to left and left to right, dark and light themes.
-- **Private keys and pairing credentials are encrypted** with the Android Keystore (`AES-256-GCM`). The core tunnel uses only `INTERNET` and `ACCESS_NETWORK_STATE`; optional silent background continuity uses one-time Wireless Debugging pairing, `SET_PROCESS_LIMIT`, `WRITE_SECURE_SETTINGS`, and zero-capture `BIND_NOTIFICATION_LISTENER_SERVICE`.
+</div>
 
-## What it does not do
+---
 
-- It does not tunnel other apps. Links opened in your browser are outside Telegram and are not protected.
-- It is not a system VPN.
+## Why WireGuard Plus?
 
-## Install from zero
+In countries where Telegram is blocked or subjected to Deep Packet Inspection (such as **Iran, Iraq, Jordan**, and similar restricted networks), users usually settle for two flawed options:
 
-You need an Android phone (Android 5.0 or newer; one-time silent Wireless Debugging activation requires Android 11 or newer) and a WireGuard config file (`.conf`) from a provider or your own server.
+- **Public MTProto / SOCKS5 proxies** get blocked quickly, inject sponsored channels, fail under DPI, and break or leak your real IP on voice/video calls.
+- **System-wide VPN apps** hijack Android's only VPN slot (kicking off AdGuard or work VPNs), slow down local banking/domestic apps, and drain battery tunneling your entire phone.
 
-### A. Rootless setup via LSPatch + Silent Sovereign Continuity (Recommended)
+**WireGuard Plus** solves both by embedding a userspace **WireGuard + AmneziaWG** engine (`wireguard-go` + `gVisor` netstack) directly inside the Telegram process:
 
-No third-party privilege manager app is needed. Pick **Portable** mode (simplest, self-contained Telegram APK) or **Local** mode (easy future `WireGuardPlus` upgrades without re-patching Telegram):
+| Feature | WireGuard Plus | System VPN App | MTProto / SOCKS5 Proxy |
+|---------|:--------------:|:--------------:|:----------------------:|
+| **Tunnels only Telegram (local apps untouched)** | Yes | Workarounds only | Yes (chats only) |
+| **Keeps Android VPN slot free (AdGuard / 2nd VPN)** | **Yes** | No | Yes |
+| **Rootless support (LSPatch)** | **Yes** | Yes | Yes |
+| **Encrypted voice & video calls (UDP + no P2P IP leak)** | **Yes** | Yes | Unreliable / breaks |
+| **AmneziaWG DPI obfuscation & DoH endpoint lookup** | **Yes** | Rare | No |
+| **Strict in-process kill switch & multi-server failover** | **Yes** | System-wide | No |
+| **Zero channel spam / zero proxy ads** | **Yes** | Yes | Often ad-injected |
 
-1. Download and install the latest `WireGuardPlus-<version>.apk` from [Releases](https://github.com/AliHaider704/wgplus/releases). Allow installs from your browser or file manager if Android asks.
-2. Install [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch) and open **Manage -> +**, then choose your **Telegram Plus** or **Telegram** APK (uninstall the original Telegram first if its signature differs; back up secret chats first, as cloud chats return on login).
-3. Choose **Portable** mode (tick **Embed modules -> WireGuard Plus**, plus any other module such as **TeleVip**) **or Local** mode (then enable **WireGuard Plus** in **LSPatch -> Modules** and tick Telegram Plus / Telegram in its scope).
-4. Tap **Start Patch** and install the patched Telegram APK, then log in to Telegram.
-5. Open **WireGuard Plus** (`نفق وايرجارد بلس`), tap **Activate protection & battery exemptions now**, and allow the notification permission when prompted. Android **Developer Options -> Wireless Debugging** opens automatically.
-6. In **Wireless Debugging**, enable the toggle (select *Always allow on this network* if shown), tap **Pair device with pairing code**, pull down the notification shade, type the **6-digit code** into the WireGuard Plus notification reply box, and send.
-7. Done once: background continuity stays active across **Wi-Fi**, **Mobile Data**, and **reboots** with zero persistent notifications and zero external helper apps.
+See the full technical breakdown in [WireGuard Plus vs Proxies & System VPNs](docs/COMPARISON.md).
 
-### B. Rooted phone, with LSPosed
+---
+
+## Screenshots & Walkthrough
+
+<div align="center">
+  <img src="docs/assets/screenshots-showcase.png" alt="WireGuard Plus Screenshots — Silent Continuity, Tunnel Controls, and AmneziaWG DPI Obfuscation" width="100%" />
+</div>
+
+<details>
+<summary><strong>Animated UI walkthrough (Dark & Light themes, Encrypted DNS, AmneziaWG)</strong></summary>
+
+<div align="center">
+  <br />
+  <img src="docs/assets/demo.gif" alt="WireGuard Plus Interactive Walkthrough" width="380" />
+</div>
+
+</details>
+
+---
+
+## How It Works
+
+```mermaid
+flowchart LR
+    TG["Telegram / Telegram Plus<br/>(Chats, Media & tgcalls)"] -->|"Localhost SOCKS5<br/>(TCP + UDP Associate)"| GS["gVisor Netstack<br/>(In-Process Userspace)"]
+    GS -->|"WireGuard + AmneziaWG<br/>(DPI Junk + Padding)"| EP["Your WireGuard Peer<br/>(Resolved via DoH)"]
+    OTHER["Banking, Browser &<br/>Local Android Apps"] -->|"Direct Connection /<br/>AdGuard / System VPN"| NET["Normal Internet<br/>(VPN Slot Free)"]
+```
+
+- Works with **Telegram Plus** (`org.telegram.plus`) and official **Telegram** (`org.telegram.messenger`).
+- Designed with non-destructive hooks (`XC_MethodHook`) so it coexists cleanly with other modules such as **TeleVip**.
+
+> Unofficial community project; not affiliated with Telegram, WireGuard, or Amnezia.
+
+---
+
+## Core Capabilities
+
+- **In-Process Tunnel (Zero Root Required):** Runs `wireguard-go` and `gVisor` inside Telegram without using Android's `VpnService` slot.
+- **Voice & Video Calls Protected:** Hooks Telegram's call engine (`tgcalls`) over SOCKS5 UDP (`UDP ASSOCIATE` + TCP fallback) and disables direct P2P IP exposure while active.
+- **AmneziaWG DPI Obfuscation:** Supports full `Jc`/`Jmin`/`Jmax`, `S1`–`S4`, and `H1`–`H4` parameters, plus a one-tap universal junk preset that works even with standard WireGuard servers.
+- **Strict Kill Switch & Encrypted DoH:** Drops all Telegram traffic if the tunnel goes down, and resolves server hostnames over DNS-over-HTTPS so ISPs cannot poison or log lookups.
+- **Multi-Server Management & Auto-Failover:** Import `.conf` files, paste from clipboard, scan QR screenshots from gallery (no camera permission), ping all servers to jump to the fastest, auto-failover on drops, and auto-detect optimal mobile MTU.
+- **24/7 Silent Continuity (`v1.5.0`, Zero Helper Apps):** Built-in Wireless Debugging one-time 6-digit pairing (Android 11+), automatic Doze/Data-Saver/Samsung MARs exemptions, automatic root kernel boost when rooted, and a zero-capture Boot Guard — keeping Telegram connected across Wi-Fi, Mobile Data, and reboots with **zero ongoing notification**.
+- **Privacy & Bilingual UI:** Private keys and pairing credentials are encrypted with Android Keystore (`AES-256-GCM`). Full English (LTR) and Arabic (RTL) support in Dark and Light themes.
+
+---
+
+## Install in 3 Minutes
+
+You need Android **5.0+** (Android **11+** for one-time silent Wireless Debugging activation) and a WireGuard/AmneziaWG `.conf` file from your server or VPN provider.
+
+### Option A: Rootless via LSPatch (Recommended)
+
+No third-party privilege helper app is required. Choose **Portable** mode (simplest self-contained APK) or **Local** mode (easy future WireGuard Plus updates without re-patching Telegram):
+
+1. Download and install the latest `WireGuardPlus-<version>.apk` from [Releases](https://github.com/AliHaider704/wgplus/releases).
+2. Install [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch), open **Manage -> +**, and select your **Telegram Plus** or **Telegram** APK (back up secret chats first if replacing an existing install with a different signature).
+3. Select **Portable** mode (tick **Embed modules -> WireGuard Plus**, plus any other module such as **TeleVip**) **or Local** mode (enable **WireGuard Plus** under **LSPatch -> Modules** and add Telegram to its scope).
+4. Tap **Start Patch**, install the patched Telegram APK, and log in.
+5. Open **WireGuard Plus** from your app drawer, tap **Activate protection & battery exemptions**, allow notifications, and follow the one-time **Wireless Debugging** 6-digit notification reply prompt.
+
+### Option B: Rooted Phone via LSPosed
 
 1. Install `WireGuardPlus-<version>.apk` from [Releases](https://github.com/AliHaider704/wgplus/releases).
-2. Open **LSPosed**, go to **Modules**, open **WireGuard Plus** and enable it.
-3. Tick Telegram Plus and/or Telegram in its scope.
-4. Force stop Telegram and open it again.
-5. Open **WireGuard Plus** and grant root if prompted; maximum background priority (`oom_score_adj`, cgroup boost, Doze/background exemptions, and silent Boot Guard) activates automatically with zero notifications.
+2. Open **LSPosed -> Modules -> WireGuard Plus**, enable it, and tick **Telegram Plus** and/or **Telegram** in its scope.
+3. Force-stop and reopen Telegram.
+4. Open **WireGuard Plus** and grant Root if prompted to activate silent kernel/battery continuity with zero notifications.
 
-## First connection
+---
 
-1. In Telegram go to **Settings, Data and Storage, Proxy Settings**.
-2. Tap the **WireGuard** button at the bottom corner. If you do not see it, long press the title bar of that screen.
-3. Add a server in whichever way is easiest:
-   - **Import .conf** to pick the file,
-   - **QR image** to read a QR code from a screenshot,
-   - **Paste** if you copied the config text.
-4. Leave **Route voice and video calls through tunnel** on if you want calls protected.
-5. Tap **Connect**. The module then runs a check and shows your exit IP and country, whether Telegram's servers are reachable, and whether UDP for calls works.
+## First Connection
 
-You can also open the WireGuard Plus app from your launcher. It shows the same information and is handy for testing a config before patching Telegram.
+1. Open Telegram and go to **Settings -> Data and Storage -> Proxy Settings**.
+2. Tap the **WireGuard** button at the bottom corner (or long-press the Proxy Settings title bar).
+3. Add a server via **Import file** (`.conf`), **QR image** (from gallery), or **Paste** (clipboard).
+4. Keep **Route voice and video calls through tunnel** enabled.
+5. Tap **Connect**, then tap **Verify route & calls** to confirm your exit IP, country, Telegram datacenter latency, and UDP call readiness.
 
-If something goes wrong, see the [user guide](docs/USER_GUIDE.md) for troubleshooting.
+See [User Guide](docs/USER_GUIDE.md) for troubleshooting (handshake timeouts, ISP port blocking, Samsung battery restrictions, and more).
 
-## Building from source
+---
 
-Short version, on Windows:
+## Building from Source
+
+On Windows (requires Go, Android NDK, `gomobile`, JDK 21, and Android SDK):
 
 ```powershell
-# 1. Build the Go engine and run its tests (needs Go, Android NDK, gomobile)
+# 1. Build the Go native engine and run Go engine tests
 powershell -ExecutionPolicy Bypass -File .\scripts\build-wgbridge.ps1
 
-# 2. Build the APK and run unit tests (needs JDK 21 and the Android SDK)
+# 2. Run Android unit tests and assemble the APK (outputs to dist/)
 .\gradlew.bat testReleaseUnitTest assembleRelease
 ```
 
-The APK lands in `dist/`. Full prerequisites and details are in the [build guide](docs/BUILD_GUIDE.md).
+See [Build Guide](docs/BUILD_GUIDE.md) for full prerequisites and release signing (`keystore.properties`).
 
-Without a `keystore.properties` file the APK is signed with the Android debug key. To sign releases with your own key, copy `keystore.properties.example` and fill it in. Use the same key for every release, otherwise Android will refuse to update over the old install.
+---
 
-## Project layout
+## Project Layout
 
+```text
+app/            Android module (Java): Xposed/LSPatch hooks, UI, Keystore crypto, QR, continuity
+wgbridge-go/    Go engine: wireguard-go, AmneziaWG obfuscation, gVisor netstack, SOCKS5, DoH, kill switch
+scripts/        Reproducible build script for wgbridge.aar
+docs/           User guide, comparison, architecture, build, security model, and visual assets
 ```
-app/            Android module (Java): hooks, UI, profile storage, QR codec, built-in continuity
-wgbridge-go/    Go engine: WireGuard, AmneziaWG, SOCKS5, DoH, kill switch
-scripts/        Reproducible build of the native bridge
-docs/           Architecture, build, user and security notes
-```
+
+---
 
 ## Documentation
 
-- [User guide](docs/USER_GUIDE.md)
-- [Build guide](docs/BUILD_GUIDE.md)
+- [WireGuard Plus vs Proxies & System VPNs](docs/COMPARISON.md)
+- [End-User Installation & Troubleshooting Guide](docs/USER_GUIDE.md)
+- [Build Guide](docs/BUILD_GUIDE.md)
 - [Architecture](docs/ARCHITECTURE.md)
-- [Security and privacy model](docs/SECURITY.md)
+- [Security & Privacy Model](docs/SECURITY.md)
 - [Changelog](CHANGELOG.md)
-- [Contributing](CONTRIBUTING.md)
-- [Reporting vulnerabilities](SECURITY.md)
+- [Contributing & Open Tasks](CONTRIBUTING.md)
+- [Reporting Vulnerabilities](SECURITY.md)
+
+---
 
 ## Credits
 
-Built on [wireguard-go](https://git.zx2c4.com/wireguard-go), [gVisor](https://gvisor.dev), [gomobile](https://pkg.go.dev/golang.org/x/mobile), [ZXing](https://github.com/zxing/zxing), [libadb-android](https://github.com/MuntashirAkon/libadb-android), [Conscrypt](https://conscrypt.org/), and the packet obfuscation ideas from [AmneziaWG](https://github.com/amnezia-vpn/amneziawg-go). Each keeps its own license.
+Built on [wireguard-go](https://git.zx2c4.com/wireguard-go), [gVisor](https://gvisor.dev), [gomobile](https://pkg.go.dev/golang.org/x/mobile), [ZXing](https://github.com/zxing/zxing), [libadb-android](https://github.com/MuntashirAkon/libadb-android), [Conscrypt](https://conscrypt.org/), and packet obfuscation concepts from [AmneziaWG](https://github.com/amnezia-vpn/amneziawg-go). Each component retains its respective license.
 
 ## License
 

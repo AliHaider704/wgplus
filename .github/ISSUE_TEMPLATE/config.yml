@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Installation & Troubleshooting Guide
+    url: https://github.com/AliHaider704/wgplus/blob/main/docs/USER_GUIDE.md
+    about: Check setup steps for LSPatch, LSPosed, Silent Continuity, and DPI obfuscation before opening a bug report.
+  - name: Compare WireGuard Plus vs Proxies & System VPNs
+    url: https://github.com/AliHaider704/wgplus/blob/main/docs/COMPARISON.md
+    about: See how WireGuard Plus differs from MTProto proxies and system-wide VPN apps.
