@@ -2,7 +2,7 @@
 
 <img src="docs/assets/banner.png" alt="WireGuard Plus — WireGuard & AmneziaWG Inside Telegram" width="100%" />
 
-<br />
+<h1>WireGuard Plus — WireGuard &amp; AmneziaWG Inside Telegram</h1>
 
 [![Latest Release](https://img.shields.io/github/v/release/AliHaider704/wgplus?style=flat-square&color=1A6BB8)](https://github.com/AliHaider704/wgplus/releases/latest)
 [![Downloads](https://img.shields.io/github/downloads/AliHaider704/wgplus/total?style=flat-square&color=1F6F54)](https://github.com/AliHaider704/wgplus/releases)
@@ -12,7 +12,12 @@
 
 **WireGuard & AmneziaWG inside Telegram only — built to bypass Telegram blocks and DPI throttling without root, without occupying Android's VPN slot, and with encrypted voice & video calls.**
 
-[العربية (Arabic)](README.ar.md) · [Download APK](https://github.com/AliHaider704/wgplus/releases/latest) · [Compare vs Proxies & VPNs](docs/COMPARISON.md) · [User Guide](docs/USER_GUIDE.md)
+<p dir="ltr">
+  <a href="README.ar.md">العربية (Arabic)</a> ·
+  <a href="https://github.com/AliHaider704/wgplus/releases/latest">Download APK</a> ·
+  <a href="docs/COMPARISON.md">Compare vs Proxies &amp; VPNs</a> ·
+  <a href="docs/USER_GUIDE.md">User Guide</a>
+</p>
 
 </div>
 
