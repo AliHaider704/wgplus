@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://alihaider704.github.io/wgplus/sitemap.xml
