@@ -2,6 +2,7 @@ package wgbridge
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
@@ -21,42 +22,57 @@ import (
 )
 
 const (
-	defaultMTU        = 1280
-	minMTU            = 1280
-	maxMTU            = 1420
-	maxUdpSessionsCap = 64
-	tcpCopyBufSize    = 64 * 1024
-	udpSocketBufSize  = 1024 * 1024
+	defaultMTU               = 1280
+	minMTU                   = 1280
+	maxMTU                   = 1420
+	maxUdpSessionsCap        = 64
+	desktopMaxUdpSessionsCap = 256
+	tcpCopyBufSize           = 64 * 1024
+	desktopTcpCopyBufSize    = 256 * 1024
+	udpSocketBufSize         = 1024 * 1024
+	desktopUdpSocketBufSize  = 4 * 1024 * 1024
 )
 
 var (
-	mu                sync.Mutex
-	rebindMu          sync.Mutex
-	activeDev         *device.Device
-	activeCtx         context.Context
-	activeCancel      context.CancelFunc
-	activeTnet        *fastNet
-	activePort        int
-	activePeerPubHex  string
-	activePskHex      string
-	activeResolvedEp  string
-	activeRawEp       string
-	activeUseDoH      bool
-	activeKeepAlive   int
-	activeStartTime   time.Time
-	baseRxBytes       uint64
-	baseTxBytes       uint64
-	running           bool
-	muxListener       net.Listener
-	muxPort           int
-	muxKillSwitch     bool
-	muxStartupPend    bool
-	muxNotifyCh       chan struct{}
-	preferredMuxPorts = []int{48729, 48730, 48731, 48732, 0}
+	mu                       sync.Mutex
+	rebindMu                 sync.Mutex
+	activeDev                *device.Device
+	activeCtx                context.Context
+	activeCancel             context.CancelFunc
+	activeTnet               *fastNet
+	activePort               int
+	activePeerPubHex         string
+	activePskHex             string
+	activeResolvedEp         string
+	activeRawEp              string
+	activeUseDoH             bool
+	activeKeepAlive          int
+	activeStartTime          time.Time
+	baseRxBytes              uint64
+	baseTxBytes              uint64
+	running                  bool
+	muxListener              net.Listener
+	muxPort                  int
+	muxKillSwitch            bool
+	muxStartupPend           bool
+	muxNotifyCh              chan struct{}
+	preferredMuxPorts        = []int{48729, 48730, 48731, 48732, 0}
+	preferredMuxPortOverride int
+
+	socksAuthMu   sync.RWMutex
+	socksAuthUser string
+	socksAuthPass string
 
 	tcpCopyBufPool = sync.Pool{
 		New: func() any {
 			b := make([]byte, tcpCopyBufSize)
+			return &b
+		},
+	}
+
+	desktopTcpCopyBufPool = sync.Pool{
+		New: func() any {
+			b := make([]byte, desktopTcpCopyBufSize)
 			return &b
 		},
 	}
@@ -68,6 +84,63 @@ var (
 		},
 	}
 )
+
+// SetDesktopMode enables or disables PC-tuned netstack queue depth, batch size, and socket buffers.
+func SetDesktopMode(enabled bool) {
+	desktopModeFlag.Store(enabled)
+}
+
+// SetBlockIPv6 enables or disables IPv6/AAAA blocking inside the userspace tunnel netstack.
+func SetBlockIPv6(enabled bool) {
+	blockIPv6Flag.Store(enabled)
+	mu.Lock()
+	if activeTnet != nil {
+		activeTnet.blockIPv6.Store(enabled)
+	}
+	mu.Unlock()
+}
+
+// SetSocksAuth configures optional RFC 1929 SOCKS5 username/password authentication
+// (and HTTP CONNECT Basic auth). Passing empty strings disables authentication (mobile default).
+func SetSocksAuth(username, password string) {
+	socksAuthMu.Lock()
+	socksAuthUser = username
+	socksAuthPass = password
+	socksAuthMu.Unlock()
+}
+
+func getSocksAuth() (string, string) {
+	socksAuthMu.RLock()
+	u := socksAuthUser
+	p := socksAuthPass
+	socksAuthMu.RUnlock()
+	return u, p
+}
+
+// SetPreferredMuxPort overrides the primary local SOCKS5 port tried first when binding 127.0.0.1.
+func SetPreferredMuxPort(port int) {
+	mu.Lock()
+	if port > 0 && port <= 65535 {
+		preferredMuxPortOverride = port
+	} else {
+		preferredMuxPortOverride = 0
+	}
+	mu.Unlock()
+}
+
+func activeUdpSocketBufSize() int {
+	if desktopModeFlag.Load() {
+		return desktopUdpSocketBufSize
+	}
+	return udpSocketBufSize
+}
+
+func activeMaxUdpSessionsCap() int {
+	if desktopModeFlag.Load() {
+		return desktopMaxUdpSessionsCap
+	}
+	return maxUdpSessionsCap
+}
 
 func normalizeHexKey(raw string) (string, error) {
 	k := strings.TrimSpace(raw)
@@ -313,9 +386,18 @@ func ensureMuxListenerLocked() (int, error) {
 	if muxListener != nil && muxPort > 0 {
 		return muxPort, nil
 	}
+	var candidates []int
+	if preferredMuxPortOverride > 0 {
+		candidates = append(candidates, preferredMuxPortOverride)
+	}
+	for _, p := range preferredMuxPorts {
+		if p != preferredMuxPortOverride {
+			candidates = append(candidates, p)
+		}
+	}
 	var ln net.Listener
 	var err error
-	for _, p := range preferredMuxPorts {
+	for _, p := range candidates {
 		ln, err = net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", p))
 		if err == nil {
 			break
@@ -490,6 +572,7 @@ func StartTunnelAdvanced(
 	waitForHandshakeQuick(dev, 160*time.Millisecond)
 
 	go tunnelWatchdogLoop(ctx, dev, pubHex)
+	go tunnelBandwidthSamplerLoop(ctx, dev)
 
 	return port, nil
 }
@@ -937,15 +1020,69 @@ func readSocks5HandshakeAndReq(client net.Conn) (cmd byte, host string, dstPort 
 		return 0, "", 0, false
 	}
 	nMethods := int(hdr[1])
+	var methods []byte
 	if nMethods > 0 {
-		methods := make([]byte, nMethods)
+		methods = make([]byte, nMethods)
 		if _, err := io.ReadFull(client, methods); err != nil {
 			return 0, "", 0, false
 		}
 	}
-	// Reply: SOCKS5, NO AUTHENTICATION REQUIRED (0x00)
-	if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
-		return 0, "", 0, false
+
+	expectedUser, expectedPass := getSocksAuth()
+	if expectedUser == "" && expectedPass == "" {
+		// Reply: SOCKS5, NO AUTHENTICATION REQUIRED (0x00)
+		if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
+			return 0, "", 0, false
+		}
+	} else {
+		hasUserPass := false
+		for _, m := range methods {
+			if m == 0x02 {
+				hasUserPass = true
+				break
+			}
+		}
+		if !hasUserPass {
+			_, _ = client.Write([]byte{0x05, 0xFF})
+			return 0, "", 0, false
+		}
+		if _, err := client.Write([]byte{0x05, 0x02}); err != nil {
+			return 0, "", 0, false
+		}
+		// RFC 1929 subnegotiation: VER(1) | ULEN(1) | UNAME | PLEN(1) | PASSWD
+		var subHdr [2]byte
+		if _, err := io.ReadFull(client, subHdr[:]); err != nil || subHdr[0] != 0x01 {
+			_, _ = client.Write([]byte{0x01, 0x01})
+			return 0, "", 0, false
+		}
+		uBuf := make([]byte, int(subHdr[1]))
+		if len(uBuf) > 0 {
+			if _, err := io.ReadFull(client, uBuf); err != nil {
+				_, _ = client.Write([]byte{0x01, 0x01})
+				return 0, "", 0, false
+			}
+		}
+		var pLen [1]byte
+		if _, err := io.ReadFull(client, pLen[:]); err != nil {
+			_, _ = client.Write([]byte{0x01, 0x01})
+			return 0, "", 0, false
+		}
+		pBuf := make([]byte, int(pLen[0]))
+		if len(pBuf) > 0 {
+			if _, err := io.ReadFull(client, pBuf); err != nil {
+				_, _ = client.Write([]byte{0x01, 0x01})
+				return 0, "", 0, false
+			}
+		}
+		uOk := subtle.ConstantTimeCompare(uBuf, []byte(expectedUser))
+		pOk := subtle.ConstantTimeCompare(pBuf, []byte(expectedPass))
+		if (uOk & pOk) != 1 {
+			_, _ = client.Write([]byte{0x01, 0x01})
+			return 0, "", 0, false
+		}
+		if _, err := client.Write([]byte{0x01, 0x00}); err != nil {
+			return 0, "", 0, false
+		}
 	}
 
 	// 2. Request: VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT
@@ -967,11 +1104,15 @@ func readSocks5HandshakeAndReq(client net.Conn) (cmd byte, host string, dstPort 
 }
 
 func dispatchSocks5Cmd(ctx context.Context, client net.Conn, dialer udpDialer, cmd byte, host string, dstPort uint16) {
+	dispatchSocks5CmdWithLabel(ctx, client, dialer, cmd, host, dstPort, "local-client")
+}
+
+func dispatchSocks5CmdWithLabel(ctx context.Context, client net.Conn, dialer udpDialer, cmd byte, host string, dstPort uint16, clientLabel string) {
 	switch cmd {
 	case 0x01: // TCP CONNECT (MTProto signaling, channels, media, VoIP TCP fallback)
-		handleTcpConnect(ctx, client, dialer, host, dstPort)
+		handleTcpConnectTracked(ctx, client, dialer, host, dstPort, clientLabel)
 	case 0x03: // UDP ASSOCIATE (Telegram VoIP / tgcalls voice & video RTP/STUN media)
-		handleUdpAssociate(ctx, client, dialer)
+		handleUdpAssociateTracked(ctx, client, dialer, clientLabel)
 	default:
 		_, _ = client.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 	}
@@ -990,6 +1131,13 @@ func handleSocks5Client(ctx context.Context, client net.Conn, dialer udpDialer) 
 
 func handleMuxConn(client net.Conn) {
 	defer client.Close()
+
+	clientLabel, clientAllowed := invokeClientGuard(client.RemoteAddr())
+	if !clientAllowed {
+		blockedLocalAttempts.Add(1)
+		return
+	}
+
 	_ = client.SetDeadline(time.Now().Add(20 * time.Second))
 
 	cmd, host, dstPort, ok := readSocks5HandshakeAndReq(client)
@@ -1003,7 +1151,7 @@ func handleMuxConn(client net.Conn) {
 		_, _ = client.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
-	dispatchSocks5Cmd(devCtx, client, dialer, cmd, host, dstPort)
+	dispatchSocks5CmdWithLabel(devCtx, client, dialer, cmd, host, dstPort, clientLabel)
 }
 
 type writeCloserConn interface {
@@ -1018,13 +1166,50 @@ func closeWriteOrConn(c net.Conn) {
 	}
 }
 
-func copyWithPooledBuf(dst io.Writer, src io.Reader) {
-	bufPtr := tcpCopyBufPool.Get().(*[]byte)
-	defer tcpCopyBufPool.Put(bufPtr)
-	_, _ = io.CopyBuffer(dst, src, *bufPtr)
+func copyWithPooledBufTracked(dst io.Writer, src io.Reader, statEnt *clientStatEntry, isTx bool) {
+	pool := &tcpCopyBufPool
+	if desktopModeFlag.Load() {
+		pool = &desktopTcpCopyBufPool
+	}
+	bufPtr := pool.Get().(*[]byte)
+	defer pool.Put(bufPtr)
+	buf := *bufPtr
+
+	for {
+		nr, rErr := src.Read(buf)
+		if nr > 0 {
+			written := 0
+			for written < nr {
+				nw, wErr := dst.Write(buf[written:nr])
+				if nw > 0 {
+					written += nw
+					if statEnt != nil {
+						if isTx {
+							recordClientTx(statEnt, nw)
+						} else {
+							recordClientRx(statEnt, nw)
+						}
+					}
+				}
+				if wErr != nil {
+					return
+				}
+				if nw == 0 {
+					return
+				}
+			}
+		}
+		if rErr != nil {
+			return
+		}
+	}
 }
 
 func handleTcpConnect(ctx context.Context, client net.Conn, dialer udpDialer, host string, dstPort uint16) {
+	handleTcpConnectTracked(ctx, client, dialer, host, dstPort, "local-client")
+}
+
+func handleTcpConnectTracked(ctx context.Context, client net.Conn, dialer udpDialer, host string, dstPort uint16, clientLabel string) {
 	awaitInitialHandshakeBeforeDial(ctx)
 
 	targetAddr := net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
@@ -1045,6 +1230,11 @@ func handleTcpConnect(ctx context.Context, client net.Conn, dialer udpDialer, ho
 		return
 	}
 
+	activeTcpConns.Add(1)
+	defer activeTcpConns.Add(-1)
+	statEnt := trackClientConnStart(clientLabel)
+	defer trackClientConnEnd(statEnt)
+
 	stopDone := make(chan struct{})
 	defer close(stopDone)
 	go func() {
@@ -1058,12 +1248,12 @@ func handleTcpConnect(ctx context.Context, client net.Conn, dialer udpDialer, ho
 
 	done := make(chan struct{}, 2)
 	go func() {
-		copyWithPooledBuf(remote, client)
+		copyWithPooledBufTracked(remote, client, statEnt, true)
 		closeWriteOrConn(remote)
 		done <- struct{}{}
 	}()
 	go func() {
-		copyWithPooledBuf(client, remote)
+		copyWithPooledBufTracked(client, remote, statEnt, false)
 		closeWriteOrConn(client)
 		done <- struct{}{}
 	}()
@@ -1126,6 +1316,10 @@ func parseSocks5UdpDatagram(pkt []byte) (targetAddr string, replyHdr []byte, pay
 }
 
 func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDialer) {
+	handleUdpAssociateTracked(ctx, tcpControl, dialer, "local-client")
+}
+
+func handleUdpAssociateTracked(ctx context.Context, tcpControl net.Conn, dialer udpDialer, clientLabel string) {
 	awaitInitialHandshakeBeforeDial(ctx)
 
 	udpLn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
@@ -1133,8 +1327,9 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 		_, _ = tcpControl.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
-	_ = udpLn.SetReadBuffer(udpSocketBufSize)
-	_ = udpLn.SetWriteBuffer(udpSocketBufSize)
+	sockBufSz := activeUdpSocketBufSize()
+	_ = udpLn.SetReadBuffer(sockBufSz)
+	_ = udpLn.SetWriteBuffer(sockBufSz)
 
 	relayPort := udpLn.LocalAddr().(*net.UDPAddr).Port
 
@@ -1151,6 +1346,12 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 		return
 	}
 
+	activeUdpAssocs.Add(1)
+	defer activeUdpAssocs.Add(-1)
+	statEnt := trackClientConnStart(clientLabel)
+	defer trackClientConnEnd(statEnt)
+
+	sessionsCap := activeMaxUdpSessionsCap()
 	assocCtx, assocCancel := context.WithCancel(ctx)
 	var sessMu sync.RWMutex
 	sessions := make(map[string]*udpRemoteSession)
@@ -1189,6 +1390,10 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 			if srcAddr == nil || !srcAddr.IP.IsLoopback() {
 				continue
 			}
+			if !invokeUdpPeerGuard(srcAddr, clientLabel) {
+				blockedLocalAttempts.Add(1)
+				continue
+			}
 
 			targetAddr, replyHdr, payload, pErr := parseSocks5UdpDatagram(buf[:n])
 			if pErr != nil || len(payload) == 0 {
@@ -1202,7 +1407,9 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 
 			if exists {
 				sess.clientAddr.Store(srcAddr)
-				_, _ = sess.remoteConn.Write(payload)
+				if nw, wErr := sess.remoteConn.Write(payload); wErr == nil {
+					recordClientTx(statEnt, nw)
+				}
 				continue
 			}
 
@@ -1210,7 +1417,7 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 			sessMu.Lock()
 			sess, exists = sessions[targetAddr]
 			if !exists {
-				if len(sessions) >= maxUdpSessionsCap {
+				if len(sessions) >= sessionsCap {
 					sessMu.Unlock()
 					continue
 				}
@@ -1254,7 +1461,9 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 						cAddrAny := s.clientAddr.Load()
 						if cAddr, ok := cAddrAny.(*net.UDPAddr); ok && cAddr != nil && hdrLen+rn <= len(outPkt) {
 							copy(outPkt[hdrLen:hdrLen+rn], respBuf[:rn])
-							_, _ = udpLn.WriteToUDP(outPkt[:hdrLen+rn], cAddr)
+							if _, wErr := udpLn.WriteToUDP(outPkt[:hdrLen+rn], cAddr); wErr == nil {
+								recordClientRx(statEnt, rn)
+							}
 						}
 					}
 				}(targetAddr, sess)
@@ -1263,7 +1472,9 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 				sessMu.Unlock()
 			}
 
-			_, _ = sess.remoteConn.Write(payload)
+			if nw, wErr := sess.remoteConn.Write(payload); wErr == nil {
+				recordClientTx(statEnt, nw)
+			}
 		}
 	}()
 

@@ -4,23 +4,23 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <meta name="google-site-verification" content="Qk5F-VjXIiN1s5CW5J2zwNPzfk2xSi3a1W97-wXXnFE" />
-  <title>WireGuard Plus (wgplus) — WireGuard &amp; AmneziaWG Inside Telegram</title>
-  <meta name="description" content="WireGuard &amp; AmneziaWG tunnel inside Telegram only — bypass Telegram blocks and DPI throttling on Android without root, without occupying Android's VPN slot, and with encrypted voice &amp; video calls." />
-  <meta name="keywords" content="WireGuard Plus, wgplus, Telegram WireGuard, AmneziaWG Telegram, Telegram DPI evasion, Telegram proxy Android, LSPatch, LSPosed, Xposed, per-app VPN Telegram, bypass Telegram block" />
+  <title>WireGuard Plus (wgplus) - WireGuard &amp; AmneziaWG Inside Telegram for Windows &amp; Android</title>
+  <meta name="description" content="WireGuard &amp; AmneziaWG 1.5 tunnel inside Telegram only on Windows (zero Admin, Portable, zero Wintun/Tailscale conflict) and Android (zero root, keeps VPN slot free) with encrypted voice &amp; video calls." />
+  <meta name="keywords" content="WireGuard Plus, wgplus, Telegram WireGuard, AmneziaWG 1.5, Telegram Desktop VPN, AyuGram proxy, Windows portable WireGuard, Telegram DPI evasion, LSPatch, LSPosed, per-app VPN Telegram" />
   <meta name="robots" content="index, follow" />
   <link rel="canonical" href="https://alihaider704.github.io/wgplus/" />
 
   <!-- Open Graph -->
   <meta property="og:type" content="website" />
   <meta property="og:url" content="https://alihaider704.github.io/wgplus/" />
-  <meta property="og:title" content="WireGuard Plus — WireGuard &amp; AmneziaWG Inside Telegram" />
-  <meta property="og:description" content="WireGuard &amp; AmneziaWG tunnel inside Telegram only (no root, no VPN slot, encrypted voice &amp; video calls, DPI evasion)." />
+  <meta property="og:title" content="WireGuard Plus - WireGuard &amp; AmneziaWG Inside Telegram (Windows &amp; Android)" />
+  <meta property="og:description" content="Encrypted WireGuard &amp; AmneziaWG 1.5 tunnel for Telegram only on Windows (Zero Admin, Portable, zero Wintun conflict) and Android (zero root, keeps VPN slot free)." />
   <meta property="og:image" content="https://alihaider704.github.io/wgplus/assets/banner.png" />
 
   <!-- Twitter -->
   <meta name="twitter:card" content="summary_large_image" />
-  <meta name="twitter:title" content="WireGuard Plus — WireGuard &amp; AmneziaWG Inside Telegram" />
-  <meta name="twitter:description" content="WireGuard &amp; AmneziaWG tunnel inside Telegram only (no root, no VPN slot, calls &amp; DPI evasion)." />
+  <meta name="twitter:title" content="WireGuard Plus - WireGuard &amp; AmneziaWG Inside Telegram (Windows &amp; Android)" />
+  <meta name="twitter:description" content="Encrypted WireGuard &amp; AmneziaWG 1.5 tunnel inside Telegram only for Windows &amp; Android (Zero Admin/Root, Portable, DPI stealth, calls)." />
   <meta name="twitter:image" content="https://alihaider704.github.io/wgplus/assets/banner.png" />
 
   <!-- Structured Data -->
@@ -30,12 +30,13 @@
     "@type": "SoftwareApplication",
     "name": "WireGuard Plus",
     "alternateName": "wgplus",
-    "operatingSystem": "Android 5.0+",
+    "softwareVersion": "1.6.0",
+    "operatingSystem": ["Windows 10", "Windows 11", "Android 5.0+"],
     "applicationCategory": "CommunicationApplication",
     "license": "https://opensource.org/licenses/MIT",
     "url": "https://github.com/AliHaider704/wgplus",
     "downloadUrl": "https://github.com/AliHaider704/wgplus/releases/latest",
-    "description": "WireGuard & AmneziaWG tunnel inside Telegram only — built to bypass Telegram blocks and DPI throttling without root, without occupying Android's VPN slot, and with encrypted voice & video calls.",
+    "description": "WireGuard & AmneziaWG 1.5 tunnel inside Telegram only for Windows (zero Admin, zero Wintun/Tailscale conflict, Portable) and Android (zero root, keeps Android VPN slot free) with encrypted voice & video calls.",
     "author": {
       "@type": "Person",
       "name": "Ali Hayder",
@@ -70,7 +71,7 @@
       line-height: 1.65;
     }
     .container {
-      max-width: 920px;
+      max-width: 960px;
       margin: 0 auto;
       padding: 2rem 1.25rem 4rem;
     }
@@ -92,7 +93,7 @@
     .lead {
       color: var(--muted);
       font-size: 1.05rem;
-      max-width: 740px;
+      max-width: 780px;
       margin: 0 auto 1.5rem;
     }
     .actions {
@@ -136,9 +137,14 @@
       padding-bottom: 0.5rem;
       margin-bottom: 1rem;
     }
+    h3.subhead {
+      font-size: 1.05rem;
+      color: var(--muted);
+      margin: 1.5rem 0 0.5rem;
+    }
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
       gap: 1rem;
     }
     .card {
@@ -178,15 +184,16 @@
 <body>
   <main class="container">
     <header>
-      <img class="banner" src="assets/banner.png" alt="WireGuard Plus — WireGuard &amp; AmneziaWG Inside Telegram" />
-      <h1>WireGuard Plus — WireGuard &amp; AmneziaWG Inside Telegram</h1>
+      <img class="banner" src="assets/banner.png" alt="WireGuard Plus - WireGuard &amp; AmneziaWG Inside Telegram for Windows and Android" />
+      <h1>WireGuard Plus - WireGuard &amp; AmneziaWG Inside Telegram</h1>
       <p class="lead">
-        WireGuard &amp; AmneziaWG inside Telegram only — built to bypass Telegram blocks and DPI throttling
-        without root, without occupying Android's VPN slot, and with encrypted voice &amp; video calls.
+        Encrypted WireGuard &amp; AmneziaWG 1.5 tunnel strictly for Telegram on Windows (zero Admin, zero Wintun/Tailscale conflict, Portable USB mode) and Android (zero root, keeps Android's VPN slot free) with encrypted voice &amp; video calls.
       </p>
       <div class="actions">
-        <a class="btn btn-primary" href="https://github.com/AliHaider704/wgplus/releases/latest">Download Latest APK</a>
-        <a class="btn btn-accent" href="https://github.com/AliHaider704/wgplus">View on GitHub</a>
+        <a class="btn btn-primary" href="https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64.exe">Download for Windows</a>
+        <a class="btn btn-primary" href="https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64-Portable.zip">Windows Portable (.zip)</a>
+        <a class="btn btn-accent" href="https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.5.0.apk">Download Android APK</a>
+        <a class="btn" href="https://github.com/AliHaider704/wgplus">View on GitHub</a>
         <a class="btn" href="https://github.com/AliHaider704/wgplus/blob/main/docs/USER_GUIDE.md">User Guide</a>
         <a class="btn" href="https://github.com/AliHaider704/wgplus/blob/main/docs/COMPARISON.md">Compare vs Proxies &amp; VPNs</a>
         <a class="btn" href="https://github.com/AliHaider704/wgplus/blob/main/README.ar.md">العربية (Arabic)</a>
@@ -197,35 +204,44 @@
       <h2>Why WireGuard Plus?</h2>
       <div class="grid">
         <div class="card">
-          <h3>Telegram-Only Tunnel</h3>
-          <p>Embeds <code>wireguard-go</code> + <code>gVisor</code> netstack directly inside the Telegram process. Local and banking apps remain untouched.</p>
+          <h3>Zero Admin &amp; Zero VPN Slot Conflict</h3>
+          <p>Runs purely in userspace via <code>wireguard-go</code> + <code>gVisor</code> netstack. Installs zero Wintun drivers on Windows and leaves Android's <code>VpnService</code> slot free so Tailscale, AdGuard, games, and work VPNs run untouched.</p>
         </div>
         <div class="card">
-          <h3>Keeps Android VPN Slot Free</h3>
-          <p>Does not occupy Android's system-wide <code>VpnService</code> slot, so AdGuard or your work VPN can keep running alongside Telegram.</p>
+          <h3>Multi-Client Windows + Portable USB Mode</h3>
+          <p>Detects Telegram Desktop, Telegram Portable, AyuGramDesktop, 64Gram, Forkgram, and Unigram automatically. Portable ZIP stores everything inside <code>./wgplus-data/</code> with zero AppData writes.</p>
         </div>
         <div class="card">
-          <h3>Rootless &amp; Rooted Support</h3>
-          <p>Works rootless via <strong>LSPatch</strong> on Android 5.0+ as well as rooted devices via <strong>LSPosed</strong>.</p>
+          <h3>Armored Loopback Security</h3>
+          <p>Windows enforces a zero-admin <code>iphlpapi</code> Process Firewall, RFC 1929 per-install authentication, Windows DPAPI vault encryption, and Argon2id + AES-256-GCM <code>.wgplus</code> portable backups.</p>
+        </div>
+        <div class="card">
+          <h3>AmneziaWG 1.5 &amp; 1-Click Free WARP</h3>
+          <p>Supports <code>Jc</code>/<code>Jmin</code>/<code>Jmax</code>, <code>S1</code>-<code>S4</code>, <code>H1</code>-<code>H4</code>, AWG 1.5 QUIC mimicry (<code>I1</code>-<code>I5</code>), Cloudflare WARP <code>Reserved</code> header bytes, and direct-IP Encrypted DoH lookup.</p>
         </div>
         <div class="card">
           <h3>Encrypted Voice &amp; Video Calls</h3>
-          <p>Routes UDP calls cleanly inside the tunnel with no P2P IP leak and no sponsored proxy channels.</p>
+          <p>Routes messaging TCP and real-time UDP media over SOCKS5 <code>UDP ASSOCIATE</code> with TCP fallback, fail-closed Kill Switch, and multi-server auto-failover.</p>
         </div>
         <div class="card">
-          <h3>AmneziaWG DPI Obfuscation</h3>
-          <p>Supports AmneziaWG obfuscation parameters and DNS-over-HTTPS (DoH) endpoint lookup for restricted networks.</p>
-        </div>
-        <div class="card">
-          <h3>In-Process Kill Switch &amp; Failover</h3>
-          <p>Includes a strict in-process kill switch and multi-server failover to keep Telegram connected reliably.</p>
+          <h3>Bilingual Dark &amp; Light Experience</h3>
+          <p>Full English (LTR) and Arabic (RTL) interfaces across both Windows Desktop (Wails + WebView2 + System Tray) and Android (LSPatch rootless / LSPosed rooted).</p>
         </div>
       </div>
     </section>
 
     <section>
-      <h2>Screenshots</h2>
-      <img class="showcase" src="assets/screenshots-showcase.png" alt="WireGuard Plus Screenshots — Silent Continuity, Tunnel Controls, and AmneziaWG DPI Obfuscation" />
+      <h2>Windows Desktop Showcase &amp; Walkthrough</h2>
+      <img class="showcase" src="assets/windows-showcase.png" alt="WireGuard Plus Windows Desktop Screenshots - Tunnel & Calls, Light Mode & Process Guard, AmneziaWG 1.5 & WARP, and Arabic RTL" />
+      <h3 class="subhead">Video Walkthrough (720p H.264)</h3>
+      <video controls playsinline preload="metadata" poster="assets/windows-showcase.png" style="width:100%;border-radius:12px;border:1px solid var(--border);margin-top:0.5rem;">
+        <source src="https://github.com/AliHaider704/wgplus/releases/download/v1.6.0/WireGuardPlus-Windows-Walkthrough.mp4" type="video/mp4" />
+      </video>
+    </section>
+
+    <section>
+      <h2>Android In-App Showcase</h2>
+      <img class="showcase" src="assets/screenshots-showcase.png" alt="WireGuard Plus Android Screenshots - Silent Continuity, Tunnel Controls, and AmneziaWG DPI Obfuscation" />
     </section>
 
     <footer>

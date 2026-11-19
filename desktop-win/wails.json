@@ -1,0 +1,20 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "WireGuardPlus",
+  "outputfilename": "WireGuardPlus-Windows-x64",
+  "frontend:dir": "frontend/dist",
+  "frontend:install": "",
+  "frontend:build": "",
+  "frontend:dev:watcher": "",
+  "frontend:dev:serverUrl": "",
+  "author": {
+    "name": "AliHaider704"
+  },
+  "info": {
+    "companyName": "WireGuard Plus Community",
+    "productName": "WireGuard Plus",
+    "productVersion": "1.6.0",
+    "copyright": "MIT License",
+    "comments": "Userspace WireGuard & AmneziaWG inside Telegram for Windows"
+  }
+}

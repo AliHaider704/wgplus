@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -72,7 +73,68 @@ var (
 	dohMu         sync.Mutex
 	dohCache      = make(map[string]dohCacheEntry)
 	dohStaleCache = make(map[string]string) // Last-Known-Good IP fallback across network blackouts
+	customDohUp   *dohUpstream
 )
+
+// SetCustomDoH configures an optional user-specified DoH endpoint (e.g., self-hosted or AdGuard DoH)
+// that joins the parallel Happy-Eyeballs DoH race ahead of built-in upstreams. Pass empty url to clear.
+func SetCustomDoH(dialAddr, serverName, rawURL string) error {
+	uStr := strings.TrimSpace(rawURL)
+	dStr := strings.TrimSpace(dialAddr)
+	sStr := strings.TrimSpace(serverName)
+
+	if uStr == "" {
+		dohMu.Lock()
+		customDohUp = nil
+		dohCache = make(map[string]dohCacheEntry)
+		dohMu.Unlock()
+		return nil
+	}
+
+	parsed, err := url.Parse(uStr)
+	if err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Hostname() == "" {
+		return fmt.Errorf("invalid custom DoH URL %q: expected https://...", rawURL)
+	}
+	hostName := parsed.Hostname()
+	if sStr == "" {
+		sStr = hostName
+	}
+	if dStr == "" {
+		port := parsed.Port()
+		if port == "" {
+			port = "443"
+		}
+		dStr = net.JoinHostPort(hostName, port)
+	} else if _, _, sErr := net.SplitHostPort(dStr); sErr != nil {
+		dStr = net.JoinHostPort(dStr, "443")
+	}
+
+	dohMu.Lock()
+	customDohUp = &dohUpstream{
+		dialAddr:   dStr,
+		serverName: sStr,
+		url:        uStr,
+	}
+	dohCache = make(map[string]dohCacheEntry)
+	dohMu.Unlock()
+	return nil
+}
+
+func activeDohUpstreams() []dohUpstream {
+	dohMu.Lock()
+	custom := customDohUp
+	dohMu.Unlock()
+
+	if custom == nil {
+		out := make([]dohUpstream, len(dohUpstreams))
+		copy(out, dohUpstreams)
+		return out
+	}
+	out := make([]dohUpstream, 0, len(dohUpstreams)+1)
+	out = append(out, *custom)
+	out = append(out, dohUpstreams...)
+	return out
+}
 
 // ClearDnsCache flushes TTL-cached DoH endpoint resolutions (used on network handoff / roaming)
 // while preserving last-known-good emergency fallback IPs in dohStaleCache.
@@ -328,10 +390,15 @@ func resolveHostViaParallelDoH(host string, timeout time.Duration) (netip.Addr, 
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	resCh := make(chan netip.Addr, len(dohUpstreams))
-	for _, up := range dohUpstreams {
+	upstreams := activeDohUpstreams()
+	resCh := make(chan netip.Addr, len(upstreams))
+	doneCh := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, up := range upstreams {
 		upstream := up
+		wg.Add(1)
 		go func() {
+			defer wg.Done()
 			client := newDirectDoHClient(upstream)
 			addr, err := resolveHostViaDoHEndpoint(ctx, client, upstream.url, host, false)
 			if err == nil && addr.IsValid() {
@@ -342,17 +409,24 @@ func resolveHostViaParallelDoH(host string, timeout time.Duration) (netip.Addr, 
 			}
 		}()
 	}
+	go func() {
+		wg.Wait()
+		close(doneCh)
+	}()
 
-	var got int
-	for got < len(dohUpstreams) {
+	select {
+	case winner := <-resCh:
+		return winner, nil
+	case <-doneCh:
 		select {
 		case winner := <-resCh:
 			return winner, nil
-		case <-ctx.Done():
-			return netip.Addr{}, errors.New("parallel DoH resolution timed out")
+		default:
+			return netip.Addr{}, errors.New("all DoH upstreams failed")
 		}
+	case <-ctx.Done():
+		return netip.Addr{}, errors.New("parallel DoH resolution timed out")
 	}
-	return netip.Addr{}, errors.New("all DoH upstreams failed")
 }
 
 func resolveHostViaDirectUdpDns(ctx context.Context, dnsServerAddr string, host string) (netip.Addr, error) {

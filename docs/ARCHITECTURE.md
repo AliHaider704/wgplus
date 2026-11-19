@@ -2,17 +2,72 @@
 
 ## 1. System Design Goals
 
-**WireGuard Plus (`v1.5.0`)** solves six engineering challenges simultaneously:
-1. **Per-App Tunneling Without `VpnService`**: Runs a complete WireGuard / AmneziaWG cryptographic and TCP/UDP/IP stack inside Telegram's userspace process so no system-wide VPN slot or root privilege is required.
-2. **DPI Censorship Resistance & Zero Leak Resilience**: Supports AmneziaWG packet obfuscation (`Jc`, `Jmin`, `Jmax`, `S1..S4`, `H1..H4`), direct-IP Encrypted DoH (`RFC 8484`) endpoint resolution, and a fail-closed loopback SOCKS5 Kill Switch.
-3. **Full Messaging + VoIP Call Coverage**: Routes both Telegram's C++ `tgnet` MTProto sockets (TCP) and `tgcalls` WebRTC voice/video media streams (UDP/TCP) through the encrypted tunnel without P2P IP leaks.
-4. **24/7 Self-Contained Sovereign Silent Continuity (`v1.5.0`)**: Eliminates external helper dependencies, ongoing foreground service notifications (`49107`), and Samsung `"1 active app"` indicators by combining a built-in Wireless Debugging client (`WgAdbConnectionManager` + `AdbPairingService`, one-time 6-digit pairing), dual-mode `PrivilegeBridge` + detached `wgplus_daemon` (`uid=2000` / Root `uid=0`), direct `SET_PROCESS_LIMIT` Binder `IActivityManager.setProcessImportant`, and a zero-capture `NotificationListenerService` Boot Guard (`KeepaliveBridgeListenerService` holding `BIND_AUTO_CREATE | BIND_IMPORTANT | BIND_INCLUDE_CAPABILITIES`), coordinated synchronously over `KeepaliveStatusProvider` with transparent FGS fallback.
-5. **Rootless LSPatch & Android 14-17 Compatibility**: Loads native Go shared libraries cleanly inside LSPatch's `InMemoryDexClassLoader` under strict HiddenAPI and read-only Dynamic Code Loading (`0500`) enforcement.
-6. **Zero-Conflict TeleVip Coexistence**: Uses additive `XC_MethodHook` callbacks and isolated preferences so other Telegram Xposed modules operate undisturbed.
+**WireGuard Plus (`v1.6.0`)** shares a single userspace Go networking core (`wgbridge-go/`) across **Windows Desktop** (`desktop-win/`) and **Android** (`app/`) to solve six engineering challenges without requiring Administrator elevation, Wintun kernel drivers, or Android Root:
+
+1. **Zero-Driver, Zero-Slot Per-App Tunneling:** Runs a complete WireGuard / AmneziaWG 1.5 cryptographic and TCP/UDP/IP stack (`wireguard-go` + `gVisor` netstack) in userspace exclusively for Telegram traffic, leaving OS routing tables, Tailscale, AdGuard, corporate VPNs, gaming routes, and Android's single `VpnService` slot completely untouched.
+2. **DPI Censorship Resistance & Zero-Leak Fail-Closed Design:** Supports AmneziaWG 1.0/1.5 (`Jc`/`Jmin`/`Jmax`, `S1`-`S4`, `H1`-`H4`, and CPS signature packets `I1`-`I5` for QUIC mimicry), Cloudflare WARP 3-byte `Reserved` header stamping with BLAKE2s `MAC1` recomputation, direct-IP Encrypted DoH (`RFC 8484`) with optional custom DoH resolver, and a fail-closed loopback Kill Switch.
+3. **Armored Windows Loopback Security (`desktop-win/`, Zero Admin):** Combines a non-privileged `iphlpapi.dll` Process Guard (`GetExtendedTcpTable` / `GetExtendedUdpTable` PID-to-EXE verification), per-install random RFC 1929 SOCKS5 authentication, Windows DPAPI (`CryptProtectData`) secret encryption, optional Portable Mode (`portable.flag`), and Argon2id + AES-256-GCM `.wgplus` encrypted backups.
+4. **Windows Multi-Client & Power Continuity:** Auto-detects and dispatches `tg://socks` URIs across Telegram Desktop, Telegram Portable, AyuGramDesktop, 64Gram, Forkgram, and Microsoft Store Unigram; handles `WM_POWERBROADCAST` sleep/wake events and `NotifyIpInterfaceChange` IP transitions; runs natively in the Windows System Tray with zero UAC elevation (`asInvoker`).
+5. **Android Sovereign Silent Continuity (`v1.5.0+`):** Eliminates external helper dependencies and persistent FGS notifications via built-in SPAKE2 + TLS 1.3 Wireless Debugging pairing, detached `wgplus_daemon` / Root `PrivilegeBridge`, and zero-capture `KeepaliveBridgeListenerService`.
+6. **Clean Coexistence:** Android hooks strictly use non-destructive `XC_MethodHook` listeners so companion modules like **TeleVip** operate undisturbed; Windows binds strictly to `127.0.0.1` (`48729` primary) with no driver or adapter changes.
 
 ---
 
-## 2. Three-Layer Runtime Architecture
+## 2. Shared Go Userspace Core (`wgbridge-go/`)
+
+The shared `wgbridge-go` module powers both platforms (compiled directly on Windows Desktop via `replace wgbridge => ../wgbridge-go`, and cross-compiled via `gomobile` for Android):
+
+1. **`fast_netstack.go`**: Wraps `gVisor` (`tcpip/stack` + `channel.Endpoint`) with automatic platform tuning (`SetDesktopMode`): mobile uses `2048` queue / `64` batch / `4 MB` TCP max windows, while Windows Desktop scales to `8192` queue / `128` batch / `16 MB` TX/RX windows, parallel cached tunnel DNS (`15s` to `300s` TTL), and dynamic `atomic.Bool` `SetBlockIPv6`.
+2. **`awg_bind.go`**: Wraps `conn.Bind` to inject pre-handshake random junk datagrams (`Jc`/`Jmin`/`Jmax`), `I1`-`I5` AmneziaWG 1.5 CPS signature packets (`<b>`, `<r>`, `<rc>`, `<rd>`, `<t>`, `<c>`), header obfuscation (`H1`-`H4`), payload padding (`S1`-`S4`), and optional Cloudflare WARP 3-byte `Reserved` header stamping with BLAKE2s-128 `MAC1` derivation/verification.
+3. **`doh.go`**: Resolves endpoint hostnames directly over HTTPS (`1.1.1.1`, `1.0.0.1`, `8.8.8.8`, `9.9.9.9`) using RFC 8484 wireformat `A` queries plus optional user-configured `SetCustomDoH`, rejecting ISP sinkhole IPs (`0.0.0.0`, `127.0.0.0/8`) without plaintext port-53 leakage.
+4. **`bridge.go` & `http_proxy.go`**: Binds `netstack.CreateNetTUN` and serves fail-closed loopback SOCKS5 (`CMD = 0x01` TCP + `CMD = 0x03` VoIP `UDP ASSOCIATE`, optional RFC 1929 `SetSocksAuth`, `desktopTcpCopyBufSize = 256 KB`, up to `256` desktop UDP relay sessions) alongside an optional `127.0.0.1` `HTTP CONNECT` listener (`StartHttpProxy`, default port `48739`).
+5. **`desktop_api.go` / `desktop_api_android.go` & `telemetry.go` / `diagnostics_calls.go`**: Build-tag-isolated (`//go:build !android`) `ClientGuardFunc` / `UdpPeerGuardFunc` process firewall hooks (excluded cleanly from `gomobile`), per-client byte/connection counters (`GetDetailedStatsJSON`), `ProbeEndpointHandshakeMs`, `DiscoverOptimalMTU`, and `VerifyRouteAndCallsJSON` (Exit IP + Country + `DC1`/`DC2`/`DC4`/`DC5` RTT + live UDP relay verification).
+
+---
+
+## 3. Windows Desktop Armored Runtime (`desktop-win/`)
+
+```mermaid
+flowchart TB
+    subgraph WINUI["Desktop UI & Tray (Wails v2 + pure Win32)"]
+        WEB["WebView2 Bilingual UI\n(EN LTR / AR RTL, Dark/Light)"]
+        TRAY["Win32 System Tray & Power Host\n(WM_POWERBROADCAST + NotifyIpInterfaceChange)"]
+    end
+
+    subgraph WINCORE["Go Runtime Services (Zero Admin asInvoker)"]
+        APP["App Controller & Auto-Failover Watchdog"]
+        CLI["Telegram Client Detector & Dispatcher\n(Desktop / Portable / AyuGram / 64Gram / Unigram)"]
+        GRD["iphlpapi Process Guard\n(GetExtendedTcpTable / GetExtendedUdpTable)"]
+        VLT["DPAPI Vault + Portable Store\n(CryptProtectData + Argon2id .wgplus)"]
+        WARP["WARP Generator & gozxing QR Codec"]
+    end
+
+    subgraph ENGINE["Shared Userspace Tunnel Core (wgbridge-go)"]
+        MUX["Loopback SOCKS5 + HTTP CONNECT + Kill Switch\n(RFC 1929 Auth + desktopMode 8192/128)"]
+        AWG["wireguard-go + awgBind (AWG 1.5 I1-I5 + WARP Reserved)"]
+        DOH["RFC 8484 Encrypted DoH + Custom DoH"]
+    end
+
+    WEB <--> APP
+    TRAY <--> APP
+    APP --> CLI
+    APP --> VLT
+    APP --> WARP
+    CLI -->|"tg://socks URI"| MUX
+    GRD -->|"ClientGuardFunc / UdpPeerGuardFunc"| MUX
+    APP --> MUX
+    MUX --> AWG
+    DOH --> AWG
+```
+
+- **`internal/guard/process_guard_windows.go`**: Implements non-privileged local firewall verification via `iphlpapi.dll` (`GetExtendedTcpTable` / `GetExtendedUdpTable`) and `QueryFullProcessImageName` (`PROCESS_QUERY_LIMITED_INFORMATION`). Unrecognized local processes hitting the SOCKS5 or HTTP CONNECT loopback listener or UDP relay socket are blocked and logged in `Strict` mode.
+- **`internal/clients/telegram_clients_windows.go`**: Discovers running processes (`CreateToolhelp32Snapshot`), installed registries/shortcuts, MSIX Unigram packages, and portable `tdata` folders, and dispatches `tg://socks?...` URLs cleanly while tracking per-client connections and bytes.
+- **`internal/vault/dpapi_windows.go`**: Detects `portable.flag` or sibling `wgplus-data/` directory (`ResolveDataDir`) to keep all encrypted state and WebView2 cache local; encrypts secrets using Windows DPAPI (`CryptProtectData` with `CRYPTPROTECT_UI_FORBIDDEN`) and supports portable password-derived Argon2id + AES-256-GCM `.wgplus` backups.
+- **`internal/syswin/`**: Manages single-instance locking, hidden top-level Win32 message loop for pure-Go tray menus and `WM_POWERBROADCAST` suspend/resume callbacks, `NotifyIpInterfaceChange` network debouncing, `CF_DIB` clipboard QR scanning (`internal/qr/`), and optional `HKCU` non-admin autostart (`--minimized`).
+
+---
+
+## 4. Android Three-Layer Runtime Architecture (`app/`)
 
 ```mermaid
 flowchart LR
@@ -74,10 +129,3 @@ flowchart LR
 
 ### Layer 2: LSPatch Native Extraction & `go.Seq` Initialization
 `NativeBridgeLoader` extracts `lib/<abi>/libgojni.so` across direct module paths, `outer.apk!/inner`, `cache`/`code_cache`, or `assets/lspatch/*` (`.apk` and `.bin`), enforces `Os.chmod(path, 0500)`, and invokes `System.load` + `Seq.touch()`. Because `scripts/build-wgbridge.ps1` wraps `System.loadLibrary("gojni")` inside `go/Seq.java` with `try { ... } catch (UnsatisfiedLinkError ignored) {}`, initialization succeeds deterministically inside LSPatch's `InMemoryDexClassLoader`.
-
-### Layer 3: Go `wireguard-go` + `awgBind` + `DoH` + `gVisor netstack` + `SOCKS5`
-Inside `wgbridge-go/`:
-1. **`doh.go`**: Resolves endpoint domains directly over HTTPS (`1.1.1.1`, `1.0.0.1`, `8.8.8.8`) using RFC 8484 wireformat `A` queries and rejects ISP sinkhole IPs (`0.0.0.0`, `127.0.0.0/8`).
-2. **`awg_bind.go`**: Wraps `conn.Bind` to emit `Jc` random junk datagrams (`[Jmin..Jmax]` bytes) before handshakes, prepend `S1..S4` random padding, remap message headers (`H1..H4` single or range), and recalculate BLAKE2s-128 `MAC1` digests so WireGuard handshakes become indistinguishable from random UDP noise on censored networks.
-3. **`diagnostics.go`**: Provides `StartKillSwitchGuard` (fail-closed loopback SOCKS5 port), `ProbeEndpointHandshakeMs` (isolated concurrent handshake ping), and `DiscoverOptimalMTU` (`1420 -> 1280` path MTU prober).
-4. **`bridge.go`**: Binds `netstack.CreateNetTUN` and serves RFC 1928 SOCKS5 (`CMD = 0x01` TCP + `CMD = 0x03` VoIP `UDP ASSOCIATE`) on `127.0.0.1:0`.

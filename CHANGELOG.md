@@ -1,6 +1,24 @@
 # Changelog
 
-All notable changes to **WireGuard Plus** (`org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
+All notable changes to **WireGuard Plus** (`Windows Desktop` & `Android org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
+
+## [1.6.0] - 2026-11-19
+
+### Added
+- **WireGuard Plus for Windows Desktop (`desktop-win/`)**:
+  - **Zero-Admin, Zero-Wintun Architecture (`asInvoker`)**: Runs completely in userspace with zero kernel drivers, zero UAC prompts, and zero routing conflicts with Tailscale, AdGuard, corporate VPNs, or gaming traffic.
+  - **Multi-Client Detection & Dispatch (`internal/clients/`)**: Automatically detects installed and portable Windows Telegram clients (**Telegram Desktop**, **Telegram Desktop Portable**, **AyuGramDesktop Portable**, **64Gram**, **Forkgram**, **Unigram Microsoft Store**), tracks per-client TCP/UDP telemetry, supports **+ Add Portable `.exe`**, and dispatches authenticated `tg://socks` links in one click.
+  - **Zero-Admin `iphlpapi` Loopback Process Firewall (`internal/guard/`)**: Verifies owning PIDs and executable image paths (`GetExtendedTcpTable` / `GetExtendedUdpTable` + `QueryFullProcessImageName`) before relaying traffic on `127.0.0.1`, blocking unauthorized local probes in `Strict` mode alongside per-install RFC 1929 SOCKS5 authentication and a fail-closed Kill Switch.
+  - **DPAPI Vault, Portable Mode & Argon2id Backups (`internal/vault/`)**: Encrypts secrets via Windows `CryptProtectData`, keeps all vault/WebView2 state inside `./wgplus-data/` whenever `portable.flag` sits beside `WireGuardPlus.exe`, and supports passphrase-protected Argon2id + AES-256-GCM `.wgplus` exports for moving setups between PCs.
+  - **1-Click Free WARP (`AWG 1.5`), QR Clipboard DIB Decoder & Auto-Failover**: Registers anonymous Cloudflare WARP profiles preconfigured with AmneziaWG 1.5 QUIC mimicry (`internal/warp/`), decodes standard and inverted QR screenshots straight from Win32 `CF_DIB` clipboard or files (`internal/qr/`), and fails over to the lowest-latency backup server when handshakes stall (`internal/watchdog/`).
+  - **Sleep/Wake Continuity & Pure-Go Win32 Tray (`internal/syswin/`)**: Handles `WM_POWERBROADCAST` resume and `NotifyIpInterfaceChange` IP change recovery, pure-Go System Tray controls, and optional `HKCU` `--minimized` startup in full Dark/Light + English (LTR) / Arabic (RTL) WebView2 UI (`Wails v2`).
+- **Upgraded Shared Go Engine (`wgbridge-go/`)**:
+  - Added desktop netstack tuning (`SetDesktopMode`: `8192` queue / `128` batch / `16 MB` TX/RX windows, parallel cached tunnel DNS, dynamic `SetBlockIPv6`).
+  - Added AmneziaWG 1.5 CPS signature packet support (`I1`-`I5` QUIC mimicry), Cloudflare WARP 3-byte `Reserved` header stamping with BLAKE2s `MAC1` recomputation (`awg_bind.go`), `SetCustomDoH`, optional local `HTTP CONNECT` proxy (`http_proxy.go`), build-tag-isolated `!android` guard hooks (`desktop_api.go`), 1-second live throughput & per-client telemetry (`telemetry.go`), and Telegram `DC1`/`DC2`/`DC4`/`DC5` + UDP call diagnostics (`diagnostics_calls.go`).
+- **Windows Release CI & Build Provenance (`.github/workflows/release-windows.yml`, `scripts/build-windows.ps1`)**:
+  - Builds & `--self-check` verifies `WireGuardPlus-Windows-x64.exe` and `WireGuardPlus-Windows-x64-Portable.zip` with SLSA build provenance (`actions/attest-build-provenance@v2`).
+- **Dual-Platform Documentation & Media**:
+  - Updated `README.md`, `README.ar.md`, `docs/*`, GitHub Pages (`docs/index.html`), Windows screenshots showcase, animated `windows-demo.gif`, and 720p `WireGuardPlus-Windows-Walkthrough.mp4`.
 
 ## [1.5.0] - 2026-11-16
 

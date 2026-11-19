@@ -17,9 +17,14 @@ local.properties
 /app/libs/*.aar
 /app/libs/*.jar
 
-# Go
+# Go & Desktop Windows build artifacts
 /wgbridge-go/*.test
 /wgbridge-go/*.out
+/desktop-win/*.test
+/desktop-win/*.out
+/desktop-win/build/bin/
+/desktop-win/frontend/dist/wailsjs/
+wgplus-data/
 
 # IDE and OS
 .idea/
@@ -28,3 +33,4 @@ local.properties
 .DS_Store
 Thumbs.db
 *.log
+.tmp.driveupload/

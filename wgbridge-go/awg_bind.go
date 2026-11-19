@@ -3,12 +3,15 @@ package wgbridge
 import (
 	"crypto/hmac"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/crypto/blake2s"
@@ -63,25 +66,94 @@ func (hr HeaderRange) Matches(val uint32, defaultType uint32) bool {
 	return val >= hr.Min && val <= hr.Max
 }
 
-// AwgConfig holds AmneziaWG DPI-evasion parameters.
+const (
+	awgPresetUniversalJunk = "Jc=4;Jmin=40;Jmax=120"
+	awgPresetQuicMimicry15 = "Jc=4;Jmin=40;Jmax=120;I1=<b 0xc70000000108><r 8><b 0x0000449e><r 1200>"
+)
+
+// GetAwgPreset returns a built-in AmneziaWG obfuscation preset string compatible with
+// standard WireGuard servers and Cloudflare WARP endpoints.
+func GetAwgPreset(name string) string {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "universal_junk":
+		return awgPresetUniversalJunk
+	case "quic_mimicry_15", "awg15_quic":
+		return awgPresetQuicMimicry15
+	default:
+		return ""
+	}
+}
+
+// AwgConfig holds AmneziaWG 1.0 / 1.5 / 2.0 DPI-evasion parameters and optional WARP reserved bytes.
 type AwgConfig struct {
-	Jc   int
-	Jmin int
-	Jmax int
-	S1   int
-	S2   int
-	S3   int
-	S4   int
-	H1   HeaderRange
-	H2   HeaderRange
-	H3   HeaderRange
-	H4   HeaderRange
+	Jc          int
+	Jmin        int
+	Jmax        int
+	S1          int
+	S2          int
+	S3          int
+	S4          int
+	H1          HeaderRange
+	H2          HeaderRange
+	H3          HeaderRange
+	H4          HeaderRange
+	I1          string
+	I2          string
+	I3          string
+	I4          string
+	I5          string
+	Reserved    [3]byte
+	HasReserved bool
 }
 
 func (c AwgConfig) IsActive() bool {
 	return c.Jc > 0 ||
 		c.S1 > 0 || c.S2 > 0 || c.S3 > 0 || c.S4 > 0 ||
-		c.H1.Configured || c.H2.Configured || c.H3.Configured || c.H4.Configured
+		c.H1.Configured || c.H2.Configured || c.H3.Configured || c.H4.Configured ||
+		c.I1 != "" || c.I2 != "" || c.I3 != "" || c.I4 != "" || c.I5 != "" ||
+		c.HasReserved
+}
+
+func (c AwgConfig) SignatureSpecs() []string {
+	var specs []string
+	for _, s := range []string{c.I1, c.I2, c.I3, c.I4, c.I5} {
+		if strings.TrimSpace(s) != "" {
+			specs = append(specs, s)
+		}
+	}
+	return specs
+}
+
+func parseReservedBytes(raw string) ([3]byte, error) {
+	var out [3]byte
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return out, fmt.Errorf("empty reserved value")
+	}
+	// Format 1: comma- or whitespace-separated decimal bytes (e.g. "12,34,56")
+	parts := strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	})
+	if len(parts) == 3 {
+		for i, p := range parts {
+			v, err := strconv.ParseUint(strings.TrimSpace(p), 10, 8)
+			if err != nil {
+				return out, fmt.Errorf("invalid reserved byte %q", p)
+			}
+			out[i] = byte(v)
+		}
+		return out, nil
+	}
+	// Format 2: base64-encoded 3-byte client_id (e.g. Cloudflare WARP API client_id)
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		decoded, err = base64.RawStdEncoding.DecodeString(strings.TrimRight(s, "="))
+	}
+	if err == nil && len(decoded) == 3 {
+		copy(out[:], decoded)
+		return out, nil
+	}
+	return out, fmt.Errorf("invalid Reserved %q: expected 3 bytes or base64", raw)
 }
 
 func parseHeaderRange(raw string) (HeaderRange, error) {
@@ -204,6 +276,38 @@ func parseAwgConfig(raw string) (AwgConfig, error) {
 				return cfg, err
 			}
 			cfg.H4 = hr
+		case "i1":
+			if _, err := renderCpsPacket(v, nil); err != nil {
+				return cfg, fmt.Errorf("invalid I1: %w", err)
+			}
+			cfg.I1 = v
+		case "i2":
+			if _, err := renderCpsPacket(v, nil); err != nil {
+				return cfg, fmt.Errorf("invalid I2: %w", err)
+			}
+			cfg.I2 = v
+		case "i3":
+			if _, err := renderCpsPacket(v, nil); err != nil {
+				return cfg, fmt.Errorf("invalid I3: %w", err)
+			}
+			cfg.I3 = v
+		case "i4":
+			if _, err := renderCpsPacket(v, nil); err != nil {
+				return cfg, fmt.Errorf("invalid I4: %w", err)
+			}
+			cfg.I4 = v
+		case "i5":
+			if _, err := renderCpsPacket(v, nil); err != nil {
+				return cfg, fmt.Errorf("invalid I5: %w", err)
+			}
+			cfg.I5 = v
+		case "reserved":
+			rb, err := parseReservedBytes(v)
+			if err != nil {
+				return cfg, err
+			}
+			cfg.Reserved = rb
+			cfg.HasReserved = true
 		}
 	}
 
@@ -219,6 +323,121 @@ func parseAwgConfig(raw string) (AwgConfig, error) {
 		}
 	}
 	return cfg, nil
+}
+
+const (
+	cpsLetters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+	cpsDigits  = "0123456789"
+)
+
+// renderCpsPacket compiles and renders an AmneziaWG 1.5 CPS signature packet specification
+// supporting <b 0xHEX>, <r N>, <rc N>, <rd N>, <t>, and <c> tags.
+func renderCpsPacket(spec string, counter *atomic.Uint32) ([]byte, error) {
+	s := strings.TrimSpace(spec)
+	if s == "" {
+		return nil, nil
+	}
+	var out []byte
+	i := 0
+	for i < len(s) {
+		if s[i] == ' ' || s[i] == '\t' {
+			i++
+			continue
+		}
+		if s[i] != '<' {
+			out = append(out, s[i])
+			i++
+			continue
+		}
+		closeIdx := strings.IndexByte(s[i:], '>')
+		if closeIdx <= 1 {
+			return nil, fmt.Errorf("unclosed or empty CPS tag near %q", s[i:])
+		}
+		tagBody := strings.TrimSpace(s[i+1 : i+closeIdx])
+		i += closeIdx + 1
+
+		fields := strings.Fields(tagBody)
+		if len(fields) == 0 {
+			return nil, errors.New("empty CPS tag")
+		}
+		op := strings.ToLower(fields[0])
+		switch op {
+		case "b":
+			if len(fields) < 2 {
+				return nil, errors.New("CPS <b> tag missing hex payload")
+			}
+			hexArg := strings.Join(fields[1:], "")
+			hexArg = strings.TrimPrefix(strings.TrimPrefix(hexArg, "0x"), "0X")
+			if hexArg == "" || len(hexArg)%2 != 0 {
+				return nil, fmt.Errorf("CPS <b> tag invalid hex length %q", hexArg)
+			}
+			raw, err := hex.DecodeString(hexArg)
+			if err != nil {
+				return nil, fmt.Errorf("CPS <b> tag invalid hex: %w", err)
+			}
+			out = append(out, raw...)
+		case "r":
+			n, err := parseCpsLength(fields)
+			if err != nil {
+				return nil, fmt.Errorf("CPS <r>: %w", err)
+			}
+			buf := make([]byte, n)
+			_, _ = rand.Read(buf)
+			out = append(out, buf...)
+		case "rc":
+			n, err := parseCpsLength(fields)
+			if err != nil {
+				return nil, fmt.Errorf("CPS <rc>: %w", err)
+			}
+			buf := make([]byte, n)
+			_, _ = rand.Read(buf)
+			for idx := range buf {
+				buf[idx] = cpsLetters[int(buf[idx])%len(cpsLetters)]
+			}
+			out = append(out, buf...)
+		case "rd":
+			n, err := parseCpsLength(fields)
+			if err != nil {
+				return nil, fmt.Errorf("CPS <rd>: %w", err)
+			}
+			buf := make([]byte, n)
+			_, _ = rand.Read(buf)
+			for idx := range buf {
+				buf[idx] = cpsDigits[int(buf[idx])%len(cpsDigits)]
+			}
+			out = append(out, buf...)
+		case "t":
+			var ts [4]byte
+			binary.BigEndian.PutUint32(ts[:], uint32(time.Now().Unix()))
+			out = append(out, ts[:]...)
+		case "c":
+			var seq uint32 = 1
+			if counter != nil {
+				seq = counter.Add(1)
+			}
+			var cb [4]byte
+			binary.BigEndian.PutUint32(cb[:], seq)
+			out = append(out, cb[:]...)
+		default:
+			return nil, fmt.Errorf("unsupported CPS tag <%s>", op)
+		}
+		if len(out) > 1472 {
+			out = out[:1472]
+			break
+		}
+	}
+	return out, nil
+}
+
+func parseCpsLength(fields []string) (int, error) {
+	if len(fields) != 2 {
+		return 0, errors.New("expected length argument")
+	}
+	n, err := strconv.Atoi(fields[1])
+	if err != nil || n < 1 {
+		return 0, fmt.Errorf("invalid length %q", fields[1])
+	}
+	return clampInt(n, 1, maxAwgJunk), nil
 }
 
 func clampInt(v, lo, hi int) int {
@@ -279,12 +498,14 @@ func verifyMac1(msg []byte, mac1Offset int, mac1Key [32]byte) bool {
 }
 
 // awgBind wraps a conn.Bind to apply AmneziaWG packet padding (S1..S4), magic header replacement (H1..H4),
-// BLAKE2s-128 MAC1 recalculation/verification, and pre-handshake decoy junk bursts (Jc, Jmin, Jmax).
+// AWG 1.5 CPS signature packets (I1..I5), WARP Reserved bytes, BLAKE2s-128 MAC1 recalculation/verification,
+// and pre-handshake decoy junk bursts (Jc, Jmin, Jmax).
 type awgBind struct {
 	inner       conn.Bind
 	cfg         AwgConfig
 	localMacKey [32]byte
 	peerMacKey  [32]byte
+	cpsCounter  atomic.Uint32
 }
 
 func newAwgBind(inner conn.Bind, cfg AwgConfig, privHex string, peerPubHex string) (conn.Bind, error) {
@@ -357,28 +578,44 @@ func (b *awgBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		}
 		msgType := binary.LittleEndian.Uint32(pkt[0:4])
 
-		// Inject paced decoy junk burst before Handshake Initiation so cellular RRC radio wakes up
-		// and CGNAT state tables open without tail-dropping the trailing Initiation datagram.
-		if msgType == wgMsgInitiationType && len(pkt) == wgMsgInitiationSize && b.cfg.Jc > 0 {
-			for j := 0; j < b.cfg.Jc; j++ {
-				jLen := b.cfg.Jmin
-				if b.cfg.Jmax > b.cfg.Jmin {
-					span := uint64(b.cfg.Jmax-b.cfg.Jmin) + 1
-					if rBig, rErr := rand.Int(rand.Reader, new(big.Int).SetUint64(span)); rErr == nil {
-						jLen += int(rBig.Uint64())
+		// Inject AmneziaWG 1.5 CPS signature packets (I1..I5) and paced random junk bursts (Jc)
+		// before Handshake Initiation so DPI sees realistic QUIC/HTTP3/decoy traffic first.
+		if msgType == wgMsgInitiationType && len(pkt) == wgMsgInitiationSize {
+			specs := b.cfg.SignatureSpecs()
+			emittedPreBurst := false
+			for sIdx, spec := range specs {
+				if sigPkt, sErr := renderCpsPacket(spec, &b.cpsCounter); sErr == nil && len(sigPkt) > 0 {
+					_ = b.inner.Send([][]byte{sigPkt}, ep)
+					emittedPreBurst = true
+					if sIdx+1 < len(specs) || b.cfg.Jc > 0 {
+						time.Sleep(2 * time.Millisecond)
 					}
 				}
-				if jLen < 1 {
-					jLen = 40
-				}
-				junk := make([]byte, jLen)
-				_, _ = rand.Read(junk)
-				_ = b.inner.Send([][]byte{junk}, ep)
-				if j+1 < b.cfg.Jc {
-					time.Sleep(2 * time.Millisecond)
+			}
+			if b.cfg.Jc > 0 {
+				emittedPreBurst = true
+				for j := 0; j < b.cfg.Jc; j++ {
+					jLen := b.cfg.Jmin
+					if b.cfg.Jmax > b.cfg.Jmin {
+						span := uint64(b.cfg.Jmax-b.cfg.Jmin) + 1
+						if rBig, rErr := rand.Int(rand.Reader, new(big.Int).SetUint64(span)); rErr == nil {
+							jLen += int(rBig.Uint64())
+						}
+					}
+					if jLen < 1 {
+						jLen = 40
+					}
+					junk := make([]byte, jLen)
+					_, _ = rand.Read(junk)
+					_ = b.inner.Send([][]byte{junk}, ep)
+					if j+1 < b.cfg.Jc {
+						time.Sleep(2 * time.Millisecond)
+					}
 				}
 			}
-			time.Sleep(2 * time.Millisecond)
+			if emittedPreBurst {
+				time.Sleep(2 * time.Millisecond)
+			}
 		}
 
 		obf := b.obfuscateOutbound(pkt)
@@ -401,6 +638,24 @@ func (b *awgBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 	return nil
 }
 
+func matchesHeaderWithReserved(hr HeaderRange, cand []byte, defaultType uint32, hasReserved bool, reserved [3]byte) bool {
+	if len(cand) < 4 {
+		return false
+	}
+	if hr.Configured {
+		return hr.Matches(binary.LittleEndian.Uint32(cand[0:4]), defaultType)
+	}
+	if hasReserved {
+		if cand[0] != byte(defaultType) {
+			return false
+		}
+		isZero := cand[1] == 0 && cand[2] == 0 && cand[3] == 0
+		isRes := cand[1] == reserved[0] && cand[2] == reserved[1] && cand[3] == reserved[2]
+		return isZero || isRes
+	}
+	return binary.LittleEndian.Uint32(cand[0:4]) == defaultType
+}
+
 func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 	if len(pkt) < 4 {
 		return pkt
@@ -411,7 +666,8 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 	case msgType == wgMsgInitiationType && len(pkt) == wgMsgInitiationSize:
 		pad := b.cfg.S1
 		hVal := b.cfg.H1.Pick(wgMsgInitiationType)
-		if pad == 0 && hVal == wgMsgInitiationType {
+		stampReserved := b.cfg.HasReserved && !b.cfg.H1.Configured
+		if pad == 0 && hVal == wgMsgInitiationType && !stampReserved {
 			return pkt
 		}
 		res := make([]byte, pad+wgMsgInitiationSize)
@@ -422,6 +678,11 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 		copy(inner, pkt)
 		if hVal != wgMsgInitiationType {
 			binary.LittleEndian.PutUint32(inner[0:4], hVal)
+		}
+		if stampReserved {
+			copy(inner[1:4], b.cfg.Reserved[:])
+		}
+		if hVal != wgMsgInitiationType || stampReserved {
 			recomputeMac1(inner, 116, b.peerMacKey)
 			// Clear MAC2 if header changed (cookie is recomputed if server requests one)
 			for i := 132; i < 148; i++ {
@@ -433,7 +694,8 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 	case msgType == wgMsgResponseType && len(pkt) == wgMsgResponseSize:
 		pad := b.cfg.S2
 		hVal := b.cfg.H2.Pick(wgMsgResponseType)
-		if pad == 0 && hVal == wgMsgResponseType {
+		stampReserved := b.cfg.HasReserved && !b.cfg.H2.Configured
+		if pad == 0 && hVal == wgMsgResponseType && !stampReserved {
 			return pkt
 		}
 		res := make([]byte, pad+wgMsgResponseSize)
@@ -444,6 +706,11 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 		copy(inner, pkt)
 		if hVal != wgMsgResponseType {
 			binary.LittleEndian.PutUint32(inner[0:4], hVal)
+		}
+		if stampReserved {
+			copy(inner[1:4], b.cfg.Reserved[:])
+		}
+		if hVal != wgMsgResponseType || stampReserved {
 			recomputeMac1(inner, 60, b.peerMacKey)
 			for i := 76; i < 92; i++ {
 				inner[i] = 0
@@ -454,7 +721,8 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 	case msgType == wgMsgCookieReplyType && len(pkt) == wgMsgCookieReplySize:
 		pad := b.cfg.S3
 		hVal := b.cfg.H3.Pick(wgMsgCookieReplyType)
-		if pad == 0 && hVal == wgMsgCookieReplyType {
+		stampReserved := b.cfg.HasReserved && !b.cfg.H3.Configured
+		if pad == 0 && hVal == wgMsgCookieReplyType && !stampReserved {
 			return pkt
 		}
 		res := make([]byte, pad+wgMsgCookieReplySize)
@@ -464,12 +732,16 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 		inner := res[pad:]
 		copy(inner, pkt)
 		binary.LittleEndian.PutUint32(inner[0:4], hVal)
+		if stampReserved {
+			copy(inner[1:4], b.cfg.Reserved[:])
+		}
 		return res
 
 	case msgType == wgMsgTransportType && len(pkt) >= wgMsgTransportMin:
 		pad := b.cfg.S4
 		hVal := b.cfg.H4.Pick(wgMsgTransportType)
-		if pad == 0 && hVal == wgMsgTransportType {
+		stampReserved := b.cfg.HasReserved && !b.cfg.H4.Configured
+		if pad == 0 && hVal == wgMsgTransportType && !stampReserved {
 			return pkt
 		}
 		res := make([]byte, pad+len(pkt))
@@ -479,6 +751,9 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 		inner := res[pad:]
 		copy(inner, pkt)
 		binary.LittleEndian.PutUint32(inner[0:4], hVal)
+		if stampReserved {
+			copy(inner[1:4], b.cfg.Reserved[:])
+		}
 		return res
 
 	default:
@@ -493,7 +768,8 @@ func (b *awgBind) deobfuscateInbound(buf []byte, sz int) int {
 	if sz == b.cfg.S2+wgMsgResponseSize {
 		cand := raw[b.cfg.S2:]
 		hdr := binary.LittleEndian.Uint32(cand[0:4])
-		if b.cfg.H2.Matches(hdr, wgMsgResponseType) && verifyMac1(cand, 60, b.localMacKey) {
+		if matchesHeaderWithReserved(b.cfg.H2, cand, wgMsgResponseType, b.cfg.HasReserved, b.cfg.Reserved) &&
+			verifyMac1(cand, 60, b.localMacKey) {
 			if b.cfg.S2 > 0 {
 				copy(buf[:wgMsgResponseSize], cand)
 			}
@@ -509,7 +785,8 @@ func (b *awgBind) deobfuscateInbound(buf []byte, sz int) int {
 	if sz == b.cfg.S1+wgMsgInitiationSize {
 		cand := raw[b.cfg.S1:]
 		hdr := binary.LittleEndian.Uint32(cand[0:4])
-		if b.cfg.H1.Matches(hdr, wgMsgInitiationType) && verifyMac1(cand, 116, b.localMacKey) {
+		if matchesHeaderWithReserved(b.cfg.H1, cand, wgMsgInitiationType, b.cfg.HasReserved, b.cfg.Reserved) &&
+			verifyMac1(cand, 116, b.localMacKey) {
 			if b.cfg.S1 > 0 {
 				copy(buf[:wgMsgInitiationSize], cand)
 			}
@@ -524,8 +801,7 @@ func (b *awgBind) deobfuscateInbound(buf []byte, sz int) int {
 	// 3. Check Cookie Reply (S3 + 64)
 	if sz == b.cfg.S3+wgMsgCookieReplySize {
 		cand := raw[b.cfg.S3:]
-		hdr := binary.LittleEndian.Uint32(cand[0:4])
-		if b.cfg.H3.Matches(hdr, wgMsgCookieReplyType) {
+		if matchesHeaderWithReserved(b.cfg.H3, cand, wgMsgCookieReplyType, b.cfg.HasReserved, b.cfg.Reserved) {
 			if b.cfg.S3 > 0 {
 				copy(buf[:wgMsgCookieReplySize], cand)
 			}
@@ -537,8 +813,7 @@ func (b *awgBind) deobfuscateInbound(buf []byte, sz int) int {
 	// 4. Check Transport Data (>= S4 + 32)
 	if sz >= b.cfg.S4+wgMsgTransportMin {
 		cand := raw[b.cfg.S4:]
-		hdr := binary.LittleEndian.Uint32(cand[0:4])
-		if b.cfg.H4.Matches(hdr, wgMsgTransportType) {
+		if matchesHeaderWithReserved(b.cfg.H4, cand, wgMsgTransportType, b.cfg.HasReserved, b.cfg.Reserved) {
 			innerLen := sz - b.cfg.S4
 			if b.cfg.S4 > 0 {
 				copy(buf[:innerLen], cand)

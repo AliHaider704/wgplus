@@ -1,0 +1,129 @@
+name: Release Windows Desktop
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Optional existing or new release tag (e.g. v1.6.0)"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  build-windows:
+    name: Build & Attest Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: desktop-win/go.mod
+
+      - name: Install Wails v2 CLI
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.17.1
+          $goBin = Join-Path (go env GOPATH) "bin"
+          Add-Content -Path $env:GITHUB_PATH -Value $goBin
+
+      - name: Test, Build & Self-Check Windows Artifacts
+        shell: pwsh
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-windows.ps1
+
+      - name: Generate Windows SHA-256 Checksums
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $files = @(
+            "dist\WireGuardPlus-Windows-x64.exe",
+            "dist\WireGuardPlus-Windows-x64-Portable.zip"
+          )
+          $lines = foreach ($f in $files) {
+            $item = Get-Item $f
+            $hash = (Get-FileHash -Path $item.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "{0}  {1}" -f $hash, $item.Name
+          }
+          [System.IO.File]::WriteAllText(
+            (Join-Path (Resolve-Path "dist").Path "SHA256SUMS-windows.txt"),
+            (($lines -join "`n") + "`n"),
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          Get-Content "dist\SHA256SUMS-windows.txt"
+
+      - name: Attest Build Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            dist/WireGuardPlus-Windows-x64.exe
+            dist/WireGuardPlus-Windows-x64-Portable.zip
+
+      - name: Upload Windows Workflow Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: wireguard-plus-windows-x64
+          path: |
+            dist/WireGuardPlus-Windows-x64.exe
+            dist/WireGuardPlus-Windows-x64-Portable.zip
+            dist/SHA256SUMS-windows.txt
+
+      - name: Upload Windows Assets to GitHub Release (if tagged or dispatched)
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $tag = ""
+          if ("${{ github.ref }}" -like "refs/tags/v*") {
+            $tag = "${{ github.ref_name }}"
+          } elseif (-not [string]::IsNullOrWhiteSpace("${{ inputs.tag }}")) {
+            $tag = "${{ inputs.tag }}".Trim()
+          }
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+            Write-Host "No release tag specified; skipping GitHub Release upload."
+            exit 0
+          }
+
+          $prevPref = $ErrorActionPreference
+          $ErrorActionPreference = "Continue"
+          $releaseJson = & gh release view $tag --json assets 2>$null
+          $viewExit = $LASTEXITCODE
+          $ErrorActionPreference = $prevPref
+
+          if ($viewExit -ne 0 -or [string]::IsNullOrWhiteSpace($releaseJson)) {
+            Write-Host "Creating GitHub release $tag with Windows assets..."
+            & gh release create $tag `
+              "dist\WireGuardPlus-Windows-x64.exe" `
+              "dist\WireGuardPlus-Windows-x64-Portable.zip" `
+              "dist\SHA256SUMS-windows.txt" `
+              --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
+            exit 0
+          }
+
+          $parsed = $releaseJson | ConvertFrom-Json
+          $hasExe = @($parsed.assets | Where-Object { $_.name -eq "WireGuardPlus-Windows-x64.exe" }).Count -gt 0
+          if ($hasExe) {
+            Write-Host "Release $tag already contains WireGuardPlus-Windows-x64.exe; skipping asset overwrite to preserve unified SHA256SUMS.txt."
+            exit 0
+          }
+
+          Write-Host "Uploading Windows assets to existing release $tag..."
+          & gh release upload $tag `
+            "dist\WireGuardPlus-Windows-x64.exe" `
+            "dist\WireGuardPlus-Windows-x64-Portable.zip" `
+            "dist\SHA256SUMS-windows.txt"
+          if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }

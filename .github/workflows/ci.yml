@@ -20,3 +20,17 @@ jobs:
       - run: go vet ./...
       # The DoH test also queries Cloudflare live, so it needs outbound HTTPS.
       - run: go test -v ./...
+
+  windows-tests:
+    name: Windows desktop runtime tests
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop-win
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: desktop-win/go.mod
+      - run: go vet ./...
+      - run: go test -v ./...
