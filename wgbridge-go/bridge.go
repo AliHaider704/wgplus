@@ -17,7 +17,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 )
 
@@ -36,6 +35,7 @@ const (
 var (
 	mu                       sync.Mutex
 	rebindMu                 sync.Mutex
+	lastForceHopAt           time.Time
 	activeDev                *device.Device
 	activeCtx                context.Context
 	activeCancel             context.CancelFunc
@@ -318,6 +318,12 @@ func hopActivePeer(hopPort bool, forcePeerReset bool) bool {
 	rebindMu.Lock()
 	defer rebindMu.Unlock()
 
+	if forcePeerReset && !lastForceHopAt.IsZero() {
+		if elapsed := time.Since(lastForceHopAt); elapsed < 30*time.Millisecond {
+			time.Sleep(30*time.Millisecond - elapsed)
+		}
+	}
+
 	mu.Lock()
 	if !running || activeDev == nil || activePeerPubHex == "" {
 		mu.Unlock()
@@ -333,7 +339,12 @@ func hopActivePeer(hopPort bool, forcePeerReset bool) bool {
 	mu.Unlock()
 
 	if hopPort {
-		_ = dev.IpcSet("listen_port=0\n")
+		for attempt := 0; attempt < 3; attempt++ {
+			if err := dev.IpcSet("listen_port=0\n"); err == nil {
+				break
+			}
+			time.Sleep(15 * time.Millisecond)
+		}
 	}
 
 	if forcePeerReset && params.resolvedEp != "" {
@@ -356,6 +367,7 @@ func hopActivePeer(hopPort bool, forcePeerReset bool) bool {
 			dev.DisableSomeRoamingForBrokenMobileSemantics()
 		}
 		mu.Unlock()
+		lastForceHopAt = time.Now()
 	}
 
 	triggerPeerHandshakeDirect(dev, params.pubHex, !forcePeerReset)
@@ -505,7 +517,7 @@ func StartTunnelAdvanced(
 		return 0, fmt.Errorf("failed to create fast netstack TUN: %w", err)
 	}
 
-	bindImpl, err := newAwgBind(conn.NewDefaultBind(), awgCfg, privHex, pubHex)
+	bindImpl, err := newAwgBind(newPlatformBind(), awgCfg, privHex, pubHex)
 	if err != nil {
 		_ = tunDev.Close()
 		stopMuxIfIdleLocked()
@@ -744,14 +756,14 @@ func ForceRebindAndHandshake() bool {
 	if !hopActivePeer(true, true) {
 		return false
 	}
-	if waitForHandshakeQuick(dev, 600*time.Millisecond) {
+	if waitForHandshakeQuick(dev, 800*time.Millisecond) {
 		return true
 	}
 	// Second port hop if first packet was dropped during cellular radio state transition
 	if !hopActivePeer(true, true) {
 		return false
 	}
-	return waitForHandshakeQuick(dev, 750*time.Millisecond)
+	return waitForHandshakeQuick(dev, 1000*time.Millisecond)
 }
 
 // EnsureTunnelAlive checks if the active tunnel has a fresh verified handshake;

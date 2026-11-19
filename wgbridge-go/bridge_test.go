@@ -18,7 +18,6 @@ import (
 	"testing"
 	"time"
 
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 	"golang.zx2c4.com/wireguard/tun/netstack"
 )
@@ -80,7 +79,7 @@ func startLocalWgServer(
 		t.Fatalf("server CreateNetTUN failed: %v", err)
 	}
 
-	bindImpl, err := newAwgBind(conn.NewDefaultBind(), awgCfg, srvPriv, clientPubHex)
+	bindImpl, err := newAwgBind(newPlatformBind(), awgCfg, srvPriv, clientPubHex)
 	if err != nil {
 		t.Fatalf("server newAwgBind failed: %v", err)
 	}

@@ -13,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"golang.zx2c4.com/wireguard/conn"
 	"golang.zx2c4.com/wireguard/device"
 )
 
@@ -104,7 +103,7 @@ func ProbeEndpointHandshakeMs(
 		return 0, fmt.Errorf("probe netstack error: %w", err)
 	}
 
-	bindImpl, err := newAwgBind(conn.NewDefaultBind(), awgCfg, privHex, pubHex)
+	bindImpl, err := newAwgBind(newPlatformBind(), awgCfg, privHex, pubHex)
 	if err != nil {
 		_ = tunDev.Close()
 		return 0, err
@@ -291,7 +290,7 @@ func testSingleCandidateMTU(
 	if err != nil {
 		return err
 	}
-	bindImpl, err := newAwgBind(conn.NewDefaultBind(), awgCfg, privHex, pubHex)
+	bindImpl, err := newAwgBind(newPlatformBind(), awgCfg, privHex, pubHex)
 	if err != nil {
 		_ = tunDev.Close()
 		return err
