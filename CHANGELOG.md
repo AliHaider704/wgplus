@@ -2,6 +2,11 @@
 
 All notable changes to **WireGuard Plus** (`Windows Desktop` & `Android org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [1.7.1] - 2026-11-20
+
+### Fixed
+- **Windows always-on after reboot/sleep**: Start with Windows, Auto-Connect when Telegram opens, and the new Auto-Connect When App Starts are now enabled by default (existing installs are migrated once, schema v2). The app now connects the active profile automatically at launch with retries while the network comes up, re-connects after sleep/resume, and re-syncs the HKCU Run entry on every start.
+
 ## [1.7.0] - 2026-11-20
 
 ### Added

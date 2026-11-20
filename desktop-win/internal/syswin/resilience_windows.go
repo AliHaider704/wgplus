@@ -10,9 +10,9 @@ import (
 )
 
 var (
-	modIphlpapi                = windows.NewLazySystemDLL("iphlpapi.dll")
+	modIphlpapi                 = windows.NewLazySystemDLL("iphlpapi.dll")
 	procNotifyIpInterfaceChange = modIphlpapi.NewProc("NotifyIpInterfaceChange")
-	procCancelMibChangeNotify2 = modIphlpapi.NewProc("CancelMibChangeNotify2")
+	procCancelMibChangeNotify2  = modIphlpapi.NewProc("CancelMibChangeNotify2")
 )
 
 var (

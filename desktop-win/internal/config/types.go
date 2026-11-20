@@ -47,6 +47,7 @@ type AppSettings struct {
 	ProcessGuardMode         string `json:"processGuardMode"`
 	KillSwitch               bool   `json:"killSwitch"`
 	AutoConnectOnTelegram    bool   `json:"autoConnectOnTelegram"`
+	AutoConnectOnLaunch      bool   `json:"autoConnectOnLaunch"`
 	DisconnectWhenNoTelegram bool   `json:"disconnectWhenNoTelegram"`
 	AutoFailover             bool   `json:"autoFailover"`
 	BlockIPv6                bool   `json:"blockIpv6"`
@@ -73,17 +74,20 @@ type PersistedState struct {
 // DefaultSettings returns armored, Reddit-informed Windows defaults.
 func DefaultSettings() AppSettings {
 	return AppSettings{
-		Language:         "en",
-		Theme:            "dark",
-		SocksPort:        48729,
-		SocksAuthEnabled: true,
-		ProcessGuardMode: "strict",
-		KillSwitch:       true,
-		AutoFailover:     true,
-		BlockIPv6:        true,
-		HttpProxyEnabled: false,
-		HttpProxyPort:    48739,
-		UseDoH:           true,
-		MinimizeToTray:   true,
+		Language:              "en",
+		Theme:                 "dark",
+		SocksPort:             48729,
+		SocksAuthEnabled:      true,
+		ProcessGuardMode:      "strict",
+		KillSwitch:            true,
+		AutoFailover:          true,
+		BlockIPv6:             true,
+		HttpProxyEnabled:      false,
+		HttpProxyPort:         48739,
+		UseDoH:                true,
+		MinimizeToTray:        true,
+		StartWithWindows:      true,
+		AutoConnectOnLaunch:   true,
+		AutoConnectOnTelegram: true,
 	}
 }

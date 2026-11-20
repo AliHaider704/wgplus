@@ -24,7 +24,7 @@
 
 ---
 
-## Downloads (`v1.7.0`)
+## Downloads (`v1.7.1`)
 
 | Platform | Download | Requirements | Notes |
 |----------|----------|--------------|-------|

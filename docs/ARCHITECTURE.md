@@ -2,7 +2,7 @@
 
 ## 1. System Design Goals
 
-**WireGuard Plus (`v1.7.0`)** shares a single userspace Go networking core (`wgbridge-go/`) across **Windows Desktop** (`desktop-win/`) and **Android** (`app/`) to solve six engineering challenges without requiring Administrator elevation, Wintun kernel drivers, or Android Root:
+**WireGuard Plus (`v1.7.1`)** shares a single userspace Go networking core (`wgbridge-go/`) across **Windows Desktop** (`desktop-win/`) and **Android** (`app/`) to solve six engineering challenges without requiring Administrator elevation, Wintun kernel drivers, or Android Root:
 
 1. **Zero-Driver, Zero-Slot Per-App Tunneling:** Runs a complete WireGuard / AmneziaWG 1.5 cryptographic and TCP/UDP/IP stack (`wireguard-go` + `gVisor` netstack) in userspace exclusively for Telegram traffic, leaving OS routing tables, Tailscale, AdGuard, corporate VPNs, gaming routes, and Android's single `VpnService` slot completely untouched.
 2. **DPI Censorship Resistance & Zero-Leak Fail-Closed Design:** Supports AmneziaWG 1.0/1.5 (`Jc`/`Jmin`/`Jmax`, `S1`-`S4`, `H1`-`H4` with `MAC1` recomputation, and CPS signature packets `I1`-`I5` for QUIC mimicry), Cloudflare WARP 3-byte `Reserved` header stamping in `[1..3]` after standard WireGuard `MAC1`/`MAC2` calculation (stripped prior to inbound `MAC1` verification), direct-IP Encrypted DoH (`RFC 8484`) with optional custom DoH resolver, and a fail-closed loopback Kill Switch.

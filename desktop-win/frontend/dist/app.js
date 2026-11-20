@@ -118,6 +118,8 @@ function applyStaticLabels() {
   el("desc-doh").textContent = tr.dohDesc;
   el("lbl-http-proxy").textContent = tr.httpProxyLbl;
   el("desc-http-proxy").textContent = tr.httpProxyDesc;
+  el("lbl-autoconnect-launch").textContent = tr.autoConnectLaunchLbl;
+  el("desc-autoconnect-launch").textContent = tr.autoConnectLaunchDesc;
   el("lbl-autostart").textContent = tr.autostartLbl;
   el("desc-autostart").textContent = tr.autostartDesc;
   el("lbl-min-tray").textContent = tr.minTrayLbl;
@@ -466,6 +468,7 @@ function renderSettingsAndLogs() {
   el("set-http-proxy").checked = !!s.httpProxyEnabled;
   el("set-http-port").value = s.httpProxyPort || 48739;
   el("set-autostart").checked = !!s.startWithWindows;
+  el("set-autoconnect-launch").checked = !!s.autoConnectOnLaunch;
   el("set-min-tray").checked = !!s.minimizeToTray;
   el("chk-call-ack").checked = !!s.callChecklistAck;
 
@@ -791,6 +794,9 @@ function wireEvents() {
   );
   el("set-http-port").addEventListener("change", () =>
     persistCurrentSettings((s) => { s.httpProxyPort = parseInt(el("set-http-port").value, 10) || 48739; })
+  );
+  el("set-autoconnect-launch").addEventListener("change", () =>
+    persistCurrentSettings((s) => { s.autoConnectOnLaunch = el("set-autoconnect-launch").checked; })
   );
   el("set-autostart").addEventListener("change", () =>
     persistCurrentSettings((s) => { s.startWithWindows = el("set-autostart").checked; })

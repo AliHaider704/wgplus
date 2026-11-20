@@ -12,19 +12,19 @@ import (
 )
 
 const (
-	wmDestroy         = 0x0002
-	wmNull            = 0x0000
-	wmUser            = 0x0400
-	wmTrayCallback    = wmUser + 101
-	wmTrayUpdate      = wmUser + 102
-	wmTrayShutdown    = wmUser + 103
-	wmPowerBroadcast  = 0x0218
-	pbtApmSuspend     = 0x0004
-	pbtApmResumeAuto  = 0x0012
-	pbtApmResumeSusp  = 0x0007
-	wmLButtonUp       = 0x0202
-	wmLButtonDblClk   = 0x0203
-	wmRButtonUp       = 0x0205
+	wmDestroy        = 0x0002
+	wmNull           = 0x0000
+	wmUser           = 0x0400
+	wmTrayCallback   = wmUser + 101
+	wmTrayUpdate     = wmUser + 102
+	wmTrayShutdown   = wmUser + 103
+	wmPowerBroadcast = 0x0218
+	pbtApmSuspend    = 0x0004
+	pbtApmResumeAuto = 0x0012
+	pbtApmResumeSusp = 0x0007
+	wmLButtonUp      = 0x0202
+	wmLButtonDblClk  = 0x0203
+	wmRButtonUp      = 0x0205
 
 	nimAdd    = 0x00000000
 	nimModify = 0x00000001
@@ -42,12 +42,12 @@ const (
 	tpmRightButton = 0x0002
 	tpmNoNotify    = 0x0080
 
-	menuCmdOpen      = 1001
-	menuCmdToggle    = 1002
-	menuCmdCopyLink  = 1003
-	menuCmdQuit      = 1004
-	menuCmdSrvBase   = 2000
-	menuCmdCliBase   = 3000
+	menuCmdOpen     = 1001
+	menuCmdToggle   = 1002
+	menuCmdCopyLink = 1003
+	menuCmdQuit     = 1004
+	menuCmdSrvBase  = 2000
+	menuCmdCliBase  = 3000
 )
 
 type TrayVisualState int
@@ -85,10 +85,10 @@ type TrayCallbacks struct {
 }
 
 var (
-	modUser32          = windows.NewLazySystemDLL("user32.dll")
-	modShell32         = windows.NewLazySystemDLL("shell32.dll")
-	modGdi32           = windows.NewLazySystemDLL("gdi32.dll")
-	modKernel32        = windows.NewLazySystemDLL("kernel32.dll")
+	modUser32   = windows.NewLazySystemDLL("user32.dll")
+	modShell32  = windows.NewLazySystemDLL("shell32.dll")
+	modGdi32    = windows.NewLazySystemDLL("gdi32.dll")
+	modKernel32 = windows.NewLazySystemDLL("kernel32.dll")
 
 	procGetModuleHandleW      = modKernel32.NewProc("GetModuleHandleW")
 	procRegisterClassExW      = modUser32.NewProc("RegisterClassExW")

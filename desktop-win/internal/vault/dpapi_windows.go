@@ -166,7 +166,7 @@ func (s *Store) Load() (config.PersistedState, error) {
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			st := config.PersistedState{
-				SchemaVersion: 1,
+				SchemaVersion: 2,
 				Settings:      config.DefaultSettings(),
 				Profiles:      []config.ServerProfile{},
 				CustomClients: []config.TelegramClientEntry{},
@@ -184,6 +184,14 @@ func (s *Store) Load() (config.PersistedState, error) {
 	var st config.PersistedState
 	if err := json.Unmarshal(raw, &st); err != nil {
 		return config.PersistedState{}, fmt.Errorf("corrupt state.json: %w", err)
+	}
+	if st.SchemaVersion < 2 {
+		// v1.7.1 migration: always-on defaults so the tunnel survives reboot/sleep without manual clicks.
+		st.Settings.StartWithWindows = true
+		st.Settings.AutoConnectOnLaunch = true
+		st.Settings.AutoConnectOnTelegram = true
+		st.Settings.MinimizeToTray = true
+		st.SchemaVersion = 2
 	}
 	if st.Settings.SocksPort <= 0 {
 		st.Settings.SocksPort = 48729
@@ -243,7 +251,7 @@ func (s *Store) Save(st config.PersistedState) error {
 
 func (s *Store) saveLocked(st config.PersistedState) error {
 	sealed := st
-	sealed.SchemaVersion = 1
+	sealed.SchemaVersion = 2
 	sealed.Profiles = make([]config.ServerProfile, len(st.Profiles))
 	copy(sealed.Profiles, st.Profiles)
 

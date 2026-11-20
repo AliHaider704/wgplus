@@ -33,11 +33,11 @@ type runningProc struct {
 
 // ApplyResult describes what happened when dispatching tg://socks to a specific client.
 type ApplyResult struct {
-	Dispatched            bool   `json:"dispatched"`
-	UsedRegistryProtocol  bool   `json:"usedRegistryProtocol"`
-	ClipboardCopied       bool   `json:"clipboardCopied"`
-	NeedsManualPasteNote  bool   `json:"needsManualPasteNote"`
-	Message               string `json:"message,omitempty"`
+	Dispatched           bool   `json:"dispatched"`
+	UsedRegistryProtocol bool   `json:"usedRegistryProtocol"`
+	ClipboardCopied      bool   `json:"clipboardCopied"`
+	NeedsManualPasteNote bool   `json:"needsManualPasteNote"`
+	Message              string `json:"message,omitempty"`
 }
 
 func stableClientID(kind, key string) string {

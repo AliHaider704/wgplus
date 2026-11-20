@@ -112,6 +112,7 @@ type App struct {
 	quitting      atomic.Bool
 	startHidden   bool
 	pendingConf   string
+	manualStop    atomic.Bool
 }
 
 // NewApp initializes the DPAPI vault and Windows Process Guard prior to Wails startup.
@@ -305,10 +306,66 @@ func (a *App) startup(ctx context.Context) {
 		return cp
 	}, a.onClientsWatcherEvent)
 
+	a.syncAutostartRegistry()
+	go a.autoConnectOnLaunch()
+
 	if pending != "" {
 		if raw, rErr := os.ReadFile(pending); rErr == nil {
 			_, _ = a.ImportConfText(string(raw), strings.TrimSuffix(filepath.Base(pending), filepath.Ext(pending)))
 			a.ShowWindow()
+		}
+	}
+}
+
+// syncAutostartRegistry keeps the HKCU Run entry aligned with the setting and the current exe path.
+func (a *App) syncAutostartRegistry() {
+	a.mu.Lock()
+	on := a.state.Settings.StartWithWindows
+	a.mu.Unlock()
+	if exePath, err := os.Executable(); err == nil {
+		_ = syswin.SetStartWithWindows(on, exePath)
+	}
+}
+
+func (a *App) activeConnectTarget() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	id := a.state.Settings.ActiveProfileID
+	if id == "" && len(a.state.Profiles) > 0 {
+		id = a.state.Profiles[0].ID
+	}
+	return id
+}
+
+// autoConnectOnLaunch connects the active profile at app start, retrying while the network is still coming up after boot.
+func (a *App) autoConnectOnLaunch() {
+	a.mu.Lock()
+	on := a.state.Settings.AutoConnectOnLaunch
+	a.mu.Unlock()
+	if !on {
+		return
+	}
+	for i := 0; i < 20; i++ {
+		if a.bgCtx.Err() != nil || a.manualStop.Load() {
+			return
+		}
+		id := a.activeConnectTarget()
+		if id == "" {
+			return
+		}
+		a.mu.Lock()
+		up := a.connected
+		a.mu.Unlock()
+		if up {
+			return
+		}
+		if err := a.Connect(id); err == nil {
+			return
+		}
+		select {
+		case <-a.bgCtx.Done():
+			return
+		case <-time.After(6 * time.Second):
 		}
 	}
 }
@@ -476,6 +533,13 @@ func (a *App) handleWakeRecovery() {
 	isUp := a.connected
 	a.mu.Unlock()
 	if !isUp {
+		a.mu.Lock()
+		on := a.state.Settings.AutoConnectOnLaunch
+		busy := a.connecting
+		a.mu.Unlock()
+		if on && !busy && !a.manualStop.Load() {
+			go a.autoConnectOnLaunch()
+		}
 		return
 	}
 	if !wgbridge.ForceRebindAndHandshake() && a.failover != nil && a.bgCtx != nil {
@@ -667,6 +731,7 @@ func (a *App) CopyProxyLink() (string, error) {
 func (a *App) Connect(profileID string) error {
 	a.connectMu.Lock()
 	defer a.connectMu.Unlock()
+	a.manualStop.Store(false)
 
 	a.mu.Lock()
 	var prof *config.ServerProfile
@@ -741,6 +806,7 @@ func (a *App) Connect(profileID string) error {
 func (a *App) Disconnect() error {
 	a.connectMu.Lock()
 	defer a.connectMu.Unlock()
+	a.manualStop.Store(true)
 
 	wgbridge.StopTunnel()
 	a.mu.Lock()
