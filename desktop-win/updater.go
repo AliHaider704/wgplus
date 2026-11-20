@@ -12,7 +12,7 @@ import (
 )
 
 // AppVersion must match the release tag (without "v") of this build.
-const AppVersion = "1.7.1"
+const AppVersion = "1.7.2"
 
 const (
 	releasesAPI    = "https://api.github.com/repos/AliHaider704/wgplus/releases/"
