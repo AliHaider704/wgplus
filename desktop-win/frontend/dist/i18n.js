@@ -4,6 +4,13 @@ export function lri(value) {
 
 export const STRINGS = {
   en: {
+    updTitleForce: "Update required",
+    updSubForce: "A new version is available. Update to keep using WireGuard Plus.",
+    updNow: "Download update",
+    updQuit: "Quit",
+    updTitleNew: "What's new",
+    updSubNew: "WireGuard Plus was updated. Here is what changed.",
+    updContinue: "Continue",
     appTitle: "WireGuard Plus",
     modePortable: "Portable Mode (Zero Admin, Local Vault)",
     modeStandard: "Standard Mode (Zero Admin, DPAPI Vault)",
@@ -161,6 +168,13 @@ export const STRINGS = {
     unitsSec: "s",
   },
   ar: {
+    updTitleForce: "تحديث مطلوب",
+    updSubForce: "يتوفر إصدار جديد. حدّث للاستمرار باستخدام WireGuard Plus.",
+    updNow: "تنزيل التحديث",
+    updQuit: "إغلاق",
+    updTitleNew: "ما الجديد",
+    updSubNew: "تم تحديث WireGuard Plus. هذه أبرز التغييرات.",
+    updContinue: "متابعة",
     appTitle: "WireGuard Plus",
     modePortable: "الوضع المحمول (بدون صلاحيات مسؤول، حفظ محلي)",
     modeStandard: "الوضع القياسي (بدون صلاحيات مسؤول، تشفير DPAPI)",

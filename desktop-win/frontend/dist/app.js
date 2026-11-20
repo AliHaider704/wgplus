@@ -1003,4 +1003,59 @@ window.addEventListener("DOMContentLoaded", async () => {
   wireEvents();
   subscribeRuntimeEvents();
   await refreshBootstrap();
+  runUpdateFlow();
 });
+
+// ---- Updates: forced update gate + one-time "what's new" ----
+function showUpdateOverlay({ badge, title, sub, notes, primaryLabel, onPrimary, secondaryLabel, onSecondary }) {
+  el("upd-badge").textContent = badge;
+  el("upd-title").textContent = title;
+  el("upd-sub").textContent = sub;
+  const ul = el("upd-list");
+  ul.replaceChildren(...(notes || []).map((n) => { const li = document.createElement("li"); li.textContent = n; return li; }));
+  el("upd-primary").textContent = primaryLabel;
+  el("upd-primary").onclick = onPrimary;
+  const sec = el("upd-secondary");
+  sec.classList.toggle("hidden", !secondaryLabel);
+  sec.textContent = secondaryLabel || "";
+  sec.onclick = onSecondary || null;
+  el("upd-overlay").classList.remove("hidden");
+}
+
+function notesFor(info) {
+  return state?.settings?.language === "ar" ? info.notesAr : info.notesEn;
+}
+
+async function runUpdateFlow() {
+  try {
+    const upd = await api().CheckForUpdate();
+    if (upd?.available) {
+      const tr = t();
+      showUpdateOverlay({
+        badge: `v${upd.version}`,
+        title: tr.updTitleForce,
+        sub: tr.updSubForce,
+        notes: notesFor(upd),
+        primaryLabel: tr.updNow,
+        onPrimary: () => wailsRuntime()?.BrowserOpenURL(upd.download),
+        secondaryLabel: tr.updQuit,
+        onSecondary: () => api().QuitApp(),
+      });
+      return; // blocked until the user installs the new version
+    }
+    const info = await api().GetWhatsNew();
+    if (info && (info.notesEn?.length || info.notesAr?.length)) {
+      const tr = t();
+      showUpdateOverlay({
+        badge: `v${info.version}`,
+        title: tr.updTitleNew,
+        sub: tr.updSubNew,
+        notes: notesFor(info),
+        primaryLabel: tr.updContinue,
+        onPrimary: async () => { await api().AckWhatsNew(); el("upd-overlay").classList.add("hidden"); },
+      });
+    } else if (info) {
+      await api().AckWhatsNew();
+    }
+  } catch (_) { /* offline: never block */ }
+}

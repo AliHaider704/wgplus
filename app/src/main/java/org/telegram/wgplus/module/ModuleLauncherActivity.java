@@ -39,6 +39,7 @@ public class ModuleLauncherActivity extends Activity {
         super.onCreate(savedInstanceState);
         ensureLauncherComponentVisible();
         renderScreen();
+        UpdateGate.check(this);
     }
 
     @Override

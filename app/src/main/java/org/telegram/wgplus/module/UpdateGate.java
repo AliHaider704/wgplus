@@ -1,0 +1,224 @@
+package org.telegram.wgplus.module;
+
+import android.app.Activity;
+import android.app.Dialog;
+import android.content.Context;
+import android.content.Intent;
+import android.content.SharedPreferences;
+import android.graphics.Typeface;
+import android.net.Uri;
+import android.view.Gravity;
+import android.view.View;
+import android.view.ViewGroup;
+import android.view.Window;
+import android.widget.Button;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.TextView;
+
+import org.json.JSONArray;
+import org.json.JSONObject;
+
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
+/**
+ * Fetches the latest GitHub release. If a newer APK exists, shows a non-dismissable
+ * "Update required" dialog. After updating, shows the release notes once.
+ * Fails open: offline or API errors never block the app.
+ */
+final class UpdateGate {
+    private static final String API = "https://api.github.com/repos/AliHaider704/wgplus/releases/latest";
+    private static final String PREFS = "wgplus_update";
+    private static final String KEY_SEEN = "last_seen_version";
+    private static final Pattern APK = Pattern.compile("WireGuardPlus-(\\d+(?:\\.\\d+)*)\\.apk");
+
+    private UpdateGate() {}
+
+    private static final class Release {
+        String version;
+        String apkUrl;
+        String pageUrl;
+        List<String> en = new ArrayList<>();
+        List<String> ar = new ArrayList<>();
+    }
+
+    static void check(final Activity act) {
+        new Thread(() -> {
+            try {
+                final Release r = fetch();
+                if (r == null) return;
+                final String cur = act.getPackageManager().getPackageInfo(act.getPackageName(), 0).versionName;
+                final SharedPreferences sp = act.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+                if (newer(r.version, cur)) {
+                    act.runOnUiThread(() -> { if (!act.isFinishing()) showDialog(act, r, true, null); });
+                } else if (r.version.equals(cur) && !cur.equals(sp.getString(KEY_SEEN, null))) {
+                    act.runOnUiThread(() -> {
+                        if (!act.isFinishing()) {
+                            showDialog(act, r, false, () -> sp.edit().putString(KEY_SEEN, cur).apply());
+                        }
+                    });
+                }
+            } catch (Throwable ignored) {
+                // offline or malformed response: never block
+            }
+        }, "wg-update-check").start();
+    }
+
+    private static Release fetch() throws Exception {
+        HttpURLConnection c = (HttpURLConnection) new URL(API).openConnection();
+        c.setConnectTimeout(8000);
+        c.setReadTimeout(8000);
+        c.setRequestProperty("Accept", "application/vnd.github+json");
+        c.setRequestProperty("User-Agent", "WireGuardPlus-Android");
+        if (c.getResponseCode() != 200) return null;
+        StringBuilder sb = new StringBuilder();
+        try (InputStream in = c.getInputStream()) {
+            byte[] buf = new byte[4096];
+            int n;
+            while ((n = in.read(buf)) > 0) sb.append(new String(buf, 0, n, "UTF-8"));
+        }
+        JSONObject j = new JSONObject(sb.toString());
+        Release r = new Release();
+        r.pageUrl = j.optString("html_url");
+        r.apkUrl = r.pageUrl;
+        JSONArray assets = j.optJSONArray("assets");
+        for (int i = 0; assets != null && i < assets.length(); i++) {
+            JSONObject a = assets.getJSONObject(i);
+            Matcher m = APK.matcher(a.optString("name"));
+            if (m.matches()) {
+                r.version = m.group(1);
+                r.apkUrl = a.optString("browser_download_url", r.pageUrl);
+            }
+        }
+        if (r.version == null) return null;
+        boolean inAr = false;
+        for (String line : j.optString("body").split("\n")) {
+            String s = line.trim();
+            if (s.contains("[AR]")) { inAr = true; continue; }
+            if (s.startsWith("- ") || s.startsWith("* ")) {
+                String item = s.substring(2).replace("**", "").trim();
+                (inAr ? r.ar : r.en).add(item);
+            }
+        }
+        if (r.ar.isEmpty()) r.ar = r.en;
+        return r;
+    }
+
+    private static boolean newer(String a, String b) {
+        String[] pa = a.split("\\."), pb = b.split("\\.");
+        for (int i = 0; i < 3; i++) {
+            int x = i < pa.length ? parse(pa[i]) : 0;
+            int y = i < pb.length ? parse(pb[i]) : 0;
+            if (x != y) return x > y;
+        }
+        return false;
+    }
+
+    private static int parse(String s) {
+        try { return Integer.parseInt(s.replaceAll("\\D", "")); } catch (Exception e) { return 0; }
+    }
+
+    private static void showDialog(final Activity act, final Release r, final boolean force, final Runnable onDone) {
+        final boolean ar = WireGuardManager.isArabic(act);
+        final WgTheme th = WgTheme.of(WireGuardManager.isDarkTheme(act));
+        final List<String> notes = ar ? r.ar : r.en;
+        if (!force && notes.isEmpty()) { if (onDone != null) onDone.run(); return; }
+
+        final Dialog d = new Dialog(act);
+        d.requestWindowFeature(Window.FEATURE_NO_TITLE);
+        d.setCancelable(false);
+        d.setCanceledOnTouchOutside(false);
+
+        int p = WgTheme.dp(act, 22);
+        LinearLayout card = new LinearLayout(act);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setPadding(p, p, p, p);
+        card.setBackground(WgTheme.cardBackground(act, th.surfaceCard, th.borderSubtle, 16));
+        card.setLayoutDirection(ar ? View.LAYOUT_DIRECTION_RTL : View.LAYOUT_DIRECTION_LTR);
+
+        TextView badge = text(act, "v" + r.version, 12, th.accentPrimary, true);
+        badge.setPadding(WgTheme.dp(act, 10), WgTheme.dp(act, 3), WgTheme.dp(act, 10), WgTheme.dp(act, 3));
+        badge.setBackground(WgTheme.cardBackground(act, th.surfaceInput, th.borderSubtle, 99));
+        card.addView(badge, new LinearLayout.LayoutParams(-2, -2));
+
+        TextView title = text(act, force ? (ar ? "تحديث مطلوب" : "Update required")
+                : (ar ? "ما الجديد" : "What's new"), 20, th.textPrimary, true);
+        title.setPadding(0, WgTheme.dp(act, 12), 0, WgTheme.dp(act, 4));
+        card.addView(title);
+
+        TextView sub = text(act, force
+                ? (ar ? "يتوفر إصدار جديد. حدّث للاستمرار باستخدام التطبيق."
+                      : "A new version is available. Update to keep using the app.")
+                : (ar ? "تم تحديث التطبيق. هذه أبرز التغييرات."
+                      : "The app was updated. Here is what changed."), 13, th.textSecondary, false);
+        sub.setPadding(0, 0, 0, WgTheme.dp(act, 14));
+        card.addView(sub);
+
+        LinearLayout list = new LinearLayout(act);
+        list.setOrientation(LinearLayout.VERTICAL);
+        for (String n : notes) {
+            TextView t = text(act, "\u2022  " + n, 13, th.textPrimary, false);
+            t.setPadding(WgTheme.dp(act, 12), WgTheme.dp(act, 9), WgTheme.dp(act, 12), WgTheme.dp(act, 9));
+            t.setBackground(WgTheme.cardBackground(act, th.surfaceInput, th.surfaceInput, 8));
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-1, -2);
+            lp.bottomMargin = WgTheme.dp(act, 8);
+            list.addView(t, lp);
+        }
+        ScrollView sv = new ScrollView(act);
+        sv.addView(list);
+        card.addView(sv, new LinearLayout.LayoutParams(-1, 0, 1f));
+
+        Button primary = new Button(act);
+        primary.setAllCaps(false);
+        primary.setTextColor(th.onAccent);
+        primary.setText(force ? (ar ? "تنزيل التحديث" : "Download update") : (ar ? "متابعة" : "Continue"));
+        primary.setBackground(WgTheme.cardBackground(act, th.accentPrimary, th.accentPrimary, 10));
+        primary.setOnClickListener(v -> {
+            if (force) {
+                act.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(r.apkUrl)));
+            } else {
+                if (onDone != null) onDone.run();
+                d.dismiss();
+            }
+        });
+        LinearLayout.LayoutParams blp = new LinearLayout.LayoutParams(-1, WgTheme.dp(act, 48));
+        blp.topMargin = WgTheme.dp(act, 8);
+        card.addView(primary, blp);
+
+        if (force) {
+            Button quit = new Button(act);
+            quit.setAllCaps(false);
+            quit.setTextColor(th.textSecondary);
+            quit.setText(ar ? "إغلاق" : "Quit");
+            quit.setBackground(null);
+            quit.setOnClickListener(v -> { d.dismiss(); act.finishAffinity(); });
+            card.addView(quit, new LinearLayout.LayoutParams(-1, WgTheme.dp(act, 44)));
+        }
+
+        d.setContentView(card);
+        Window w = d.getWindow();
+        if (w != null) {
+            w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0));
+            w.setLayout((int) (act.getResources().getDisplayMetrics().widthPixels * 0.92f),
+                    ViewGroup.LayoutParams.WRAP_CONTENT);
+            w.setGravity(Gravity.CENTER);
+            w.setDimAmount(0.8f);
+        }
+        d.show();
+    }
+
+    private static TextView text(Context c, String s, float sp, int color, boolean bold) {
+        TextView t = new TextView(c);
+        t.setText(s);
+        t.setTextSize(sp);
+        t.setTextColor(color);
+        if (bold) t.setTypeface(Typeface.DEFAULT_BOLD);
+        return t;
+    }
+}
