@@ -2,6 +2,15 @@
 
 All notable changes to **WireGuard Plus** (`Windows Desktop` & `Android org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [1.6.1] - 2026-11-20
+
+### Fixed
+- **Free WARP (AWG 1.5) Handshake Compatibility (`wgbridge-go/awg_bind.go`)**: Fixed Cloudflare WARP 3-byte `Reserved` (`client_id`) header handling so `Reserved` octets `[1..3]` are stamped outside standard WireGuard `MAC1`/`MAC2` calculation (instead of recomputing `MAC1` and clearing `MAC2` as required only for AmneziaWG `H1`-`H4` custom headers), and validated inbound `MAC1` with zeroed `Reserved` bytes prior to stripping `[1..3]`. Previously, Cloudflare's `boringtun` edge silently dropped outbound handshake initiations and `awgBind` rejected inbound server responses.
+- **WARP Fallback Hint (`desktop-win/internal/warp/warp_gen.go`)**: Registered Cloudflare's returned peer IPv4 address via `wgbridge.RegisterEndpointIpHint("engage.cloudflareclient.com", ...)` during anonymous WARP registration as an offline DoH fallback hint.
+
+### Added
+- **Cloudflare `boringtun` Interoperability Test (`wgbridge-go/bridge_desktop_test.go`)**: Added `TestWarpReservedCloudflareBoringtunInteroperability` plus strict `verifyMac1ZeroedReserved` wire checks in `TestAwg15CpsSignaturePacketsAndReservedBytes` verifying full AWG 1.5 `I1` + `Jc` + `Reserved` SOCKS5 TCP and UDP flow against an unmodified WireGuard server.
+
 ## [1.6.0] - 2026-11-19
 
 ### Added

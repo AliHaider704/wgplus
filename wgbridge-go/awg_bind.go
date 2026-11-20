@@ -497,6 +497,20 @@ func verifyMac1(msg []byte, mac1Offset int, mac1Key [32]byte) bool {
 	return hmac.Equal(expected[:], msg[mac1Offset:mac1Offset+16])
 }
 
+func verifyMac1ZeroedReserved(msg []byte, mac1Offset int, mac1Key [32]byte) bool {
+	if len(msg) < mac1Offset+16 || mac1Offset < 4 {
+		return false
+	}
+	var hdr [4]byte
+	hdr[0] = msg[0]
+	var expected [16]byte
+	mac, _ := blake2s.New128(mac1Key[:])
+	mac.Write(hdr[:])
+	mac.Write(msg[4:mac1Offset])
+	mac.Sum(expected[:0])
+	return hmac.Equal(expected[:], msg[mac1Offset:mac1Offset+16])
+}
+
 // awgBind wraps a conn.Bind to apply AmneziaWG packet padding (S1..S4), magic header replacement (H1..H4),
 // AWG 1.5 CPS signature packets (I1..I5), WARP Reserved bytes, BLAKE2s-128 MAC1 recalculation/verification,
 // and pre-handshake decoy junk bursts (Jc, Jmin, Jmax).
@@ -678,16 +692,15 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 		copy(inner, pkt)
 		if hVal != wgMsgInitiationType {
 			binary.LittleEndian.PutUint32(inner[0:4], hVal)
-		}
-		if stampReserved {
-			copy(inner[1:4], b.cfg.Reserved[:])
-		}
-		if hVal != wgMsgInitiationType || stampReserved {
 			recomputeMac1(inner, 116, b.peerMacKey)
-			// Clear MAC2 if header changed (cookie is recomputed if server requests one)
+			// Clear MAC2 if magic header changed (cookie is recomputed if server requests one)
 			for i := 132; i < 148; i++ {
 				inner[i] = 0
 			}
+		} else if stampReserved {
+			// Cloudflare WARP Reserved bytes (bytes 1..3) are stamped outside Noise framing
+			// without modifying MAC1 or MAC2 (edge strips them before MAC1 verification).
+			copy(inner[1:4], b.cfg.Reserved[:])
 		}
 		return res
 
@@ -706,15 +719,12 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 		copy(inner, pkt)
 		if hVal != wgMsgResponseType {
 			binary.LittleEndian.PutUint32(inner[0:4], hVal)
-		}
-		if stampReserved {
-			copy(inner[1:4], b.cfg.Reserved[:])
-		}
-		if hVal != wgMsgResponseType || stampReserved {
 			recomputeMac1(inner, 60, b.peerMacKey)
 			for i := 76; i < 92; i++ {
 				inner[i] = 0
 			}
+		} else if stampReserved {
+			copy(inner[1:4], b.cfg.Reserved[:])
 		}
 		return res
 
@@ -731,8 +741,9 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 		}
 		inner := res[pad:]
 		copy(inner, pkt)
-		binary.LittleEndian.PutUint32(inner[0:4], hVal)
-		if stampReserved {
+		if hVal != wgMsgCookieReplyType {
+			binary.LittleEndian.PutUint32(inner[0:4], hVal)
+		} else if stampReserved {
 			copy(inner[1:4], b.cfg.Reserved[:])
 		}
 		return res
@@ -750,8 +761,9 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 		}
 		inner := res[pad:]
 		copy(inner, pkt)
-		binary.LittleEndian.PutUint32(inner[0:4], hVal)
-		if stampReserved {
+		if hVal != wgMsgTransportType {
+			binary.LittleEndian.PutUint32(inner[0:4], hVal)
+		} else if stampReserved {
 			copy(inner[1:4], b.cfg.Reserved[:])
 		}
 		return res
@@ -761,41 +773,53 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 	}
 }
 
+func (b *awgBind) tryDeobfuscateHandshake(buf, raw []byte, sz, pad int, hr HeaderRange, msgType uint32, msgSize, mac1Offset int) (int, bool) {
+	if sz != pad+msgSize {
+		return 0, false
+	}
+	cand := raw[pad:]
+	if !matchesHeaderWithReserved(hr, cand, msgType, b.cfg.HasReserved, b.cfg.Reserved) {
+		return 0, false
+	}
+	var macValid bool
+	switch {
+	case hr.Configured:
+		macValid = verifyMac1(cand, mac1Offset, b.localMacKey)
+	case b.cfg.HasReserved:
+		macValid = verifyMac1ZeroedReserved(cand, mac1Offset, b.localMacKey)
+	default:
+		macValid = verifyMac1(cand, mac1Offset, b.localMacKey)
+	}
+	if !macValid {
+		return 0, false
+	}
+	if pad > 0 {
+		copy(buf[:msgSize], cand)
+	}
+	if hr.Configured {
+		hdr := binary.LittleEndian.Uint32(buf[0:4])
+		if hdr != msgType {
+			binary.LittleEndian.PutUint32(buf[0:4], msgType)
+			recomputeMac1(buf[:msgSize], mac1Offset, b.localMacKey)
+		}
+	} else if b.cfg.HasReserved {
+		// Strip Cloudflare WARP Reserved octets without altering MAC1/MAC2.
+		buf[1], buf[2], buf[3] = 0, 0, 0
+	}
+	return msgSize, true
+}
+
 func (b *awgBind) deobfuscateInbound(buf []byte, sz int) int {
 	raw := buf[:sz]
 
 	// 1. Check Handshake Response (S2 + 92)
-	if sz == b.cfg.S2+wgMsgResponseSize {
-		cand := raw[b.cfg.S2:]
-		hdr := binary.LittleEndian.Uint32(cand[0:4])
-		if matchesHeaderWithReserved(b.cfg.H2, cand, wgMsgResponseType, b.cfg.HasReserved, b.cfg.Reserved) &&
-			verifyMac1(cand, 60, b.localMacKey) {
-			if b.cfg.S2 > 0 {
-				copy(buf[:wgMsgResponseSize], cand)
-			}
-			if hdr != wgMsgResponseType {
-				binary.LittleEndian.PutUint32(buf[0:4], wgMsgResponseType)
-				recomputeMac1(buf[:wgMsgResponseSize], 60, b.localMacKey)
-			}
-			return wgMsgResponseSize
-		}
+	if n, ok := b.tryDeobfuscateHandshake(buf, raw, sz, b.cfg.S2, b.cfg.H2, wgMsgResponseType, wgMsgResponseSize, 60); ok {
+		return n
 	}
 
 	// 2. Check Handshake Initiation (S1 + 148)
-	if sz == b.cfg.S1+wgMsgInitiationSize {
-		cand := raw[b.cfg.S1:]
-		hdr := binary.LittleEndian.Uint32(cand[0:4])
-		if matchesHeaderWithReserved(b.cfg.H1, cand, wgMsgInitiationType, b.cfg.HasReserved, b.cfg.Reserved) &&
-			verifyMac1(cand, 116, b.localMacKey) {
-			if b.cfg.S1 > 0 {
-				copy(buf[:wgMsgInitiationSize], cand)
-			}
-			if hdr != wgMsgInitiationType {
-				binary.LittleEndian.PutUint32(buf[0:4], wgMsgInitiationType)
-				recomputeMac1(buf[:wgMsgInitiationSize], 116, b.localMacKey)
-			}
-			return wgMsgInitiationSize
-		}
+	if n, ok := b.tryDeobfuscateHandshake(buf, raw, sz, b.cfg.S1, b.cfg.H1, wgMsgInitiationType, wgMsgInitiationSize, 116); ok {
+		return n
 	}
 
 	// 3. Check Cookie Reply (S3 + 64)

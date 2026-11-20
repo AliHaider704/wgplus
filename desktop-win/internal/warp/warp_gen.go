@@ -173,6 +173,15 @@ func generateProfileWithEndpoint(ctx context.Context, regURL string, httpClient 
 	}
 
 	peer := parsed.Config.Peers[0]
+	if v4Trim := strings.TrimSpace(peer.Endpoint.V4); v4Trim != "" {
+		v4Host := strings.TrimSuffix(v4Trim, ":0")
+		if h, _, splitErr := net.SplitHostPort(v4Trim); splitErr == nil && h != "" {
+			v4Host = h
+		}
+		if net.ParseIP(v4Host) != nil {
+			wgbridge.RegisterEndpointIpHint("engage.cloudflareclient.com", v4Host)
+		}
+	}
 	return config.ServerProfile{
 		ID:            config.NewRandomID(),
 		Name:          "Cloudflare WARP (AWG 1.5)",

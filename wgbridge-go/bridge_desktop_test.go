@@ -139,6 +139,12 @@ func TestAwg15CpsSignaturePacketsAndReservedBytes(t *testing.T) {
 	}()
 
 	// Wire inspector ensuring I1 signature packet and Reserved bytes [12,34,56] hit the wire
+	srvPub32, err := decodeHexKey32(srv.pubHex)
+	if err != nil {
+		t.Fatalf("decodeHexKey32 failed: %v", err)
+	}
+	srvMac1Key := computeMac1Key(srvPub32)
+
 	wireLn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
 		t.Fatalf("ListenUDP failed: %v", err)
@@ -152,6 +158,7 @@ func TestAwg15CpsSignaturePacketsAndReservedBytes(t *testing.T) {
 
 	var sawI1 atomic.Bool
 	var sawReservedHdr atomic.Bool
+	var sawValidWarpMac1 atomic.Bool
 	var cAddrVal atomic.Value
 
 	go func() {
@@ -164,6 +171,11 @@ func TestAwg15CpsSignaturePacketsAndReservedBytes(t *testing.T) {
 			cAddrVal.Store(cAddr)
 			if n == 20 && bytes.Equal(buf[:4], []byte{0xc0, 0x00, 0x00, 0x01}) {
 				sawI1.Store(true)
+			}
+			if n == wgMsgInitiationSize && buf[0] == wgMsgInitiationType && buf[1] == 12 && buf[2] == 34 && buf[3] == 56 {
+				if verifyMac1ZeroedReserved(buf[:n], 116, srvMac1Key) && !verifyMac1(buf[:n], 116, srvMac1Key) {
+					sawValidWarpMac1.Store(true)
+				}
 			}
 			if n >= 32 && (buf[0] == 1 || buf[0] == 4) && buf[1] == 12 && buf[2] == 34 && buf[3] == 56 {
 				sawReservedHdr.Store(true)
@@ -206,6 +218,187 @@ func TestAwg15CpsSignaturePacketsAndReservedBytes(t *testing.T) {
 	}
 	if !sawReservedHdr.Load() {
 		t.Fatalf("expected WARP Reserved bytes [12,34,56] stamped in WireGuard packet headers")
+	}
+	if !sawValidWarpMac1.Load() {
+		t.Fatalf("expected WireGuard Initiation MAC1 to validate with zeroed Reserved bytes (Cloudflare WARP spec)")
+	}
+}
+
+func TestWarpReservedCloudflareBoringtunInteroperability(t *testing.T) {
+	defer resetGlobalDesktopBridgeState()
+
+	// Emulate Cloudflare WARP boringtun edge talking to a vanilla wireguard-go server:
+	// - Server has NO awgBind (verifies unmodified WireGuard MAC1 with zeroed bytes [1..3])
+	// - Shim validates outbound [12,34,56], zeros [1..3] WITHOUT recomputing MAC1/MAC2, and forwards
+	// - Shim stamps [12,34,56] onto inbound server responses WITHOUT recomputing MAC1/MAC2
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	awgCfgStr := GetAwgPreset("quic_mimicry_15") + ";Reserved=12,34,56"
+	srv := startLocalWgServer(t, "10.87.0.1", 1280, clientPub, "", "")
+	defer srv.closeAll()
+
+	tcpLn, err := srv.tnet.ListenTCP(&net.TCPAddr{IP: net.IPv4(10, 87, 0, 1), Port: 8093})
+	if err != nil {
+		t.Fatalf("ListenTCP failed: %v", err)
+	}
+	defer tcpLn.Close()
+	go func() {
+		for {
+			c, aErr := tcpLn.Accept()
+			if aErr != nil {
+				return
+			}
+			_, _ = c.Write([]byte("CLOUDFLARE_WARP_TCP_OK"))
+			_ = c.Close()
+		}
+	}()
+
+	udpSrv, err := srv.tnet.ListenUDP(&net.UDPAddr{IP: net.IPv4(10, 87, 0, 1), Port: 5354})
+	if err != nil {
+		t.Fatalf("ListenUDP failed: %v", err)
+	}
+	defer udpSrv.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, rAddr, rErr := udpSrv.ReadFrom(buf)
+			if rErr != nil {
+				return
+			}
+			_, _ = udpSrv.WriteTo(append([]byte("CLOUDFLARE_WARP_UDP_OK:"), buf[:n]...), rAddr)
+		}
+	}()
+
+	wireLn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	if err != nil {
+		t.Fatalf("wire ListenUDP failed: %v", err)
+	}
+	defer wireLn.Close()
+	srvConn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: srv.udpPort})
+	if err != nil {
+		t.Fatalf("wire DialUDP failed: %v", err)
+	}
+	defer srvConn.Close()
+
+	var sawI1 atomic.Bool
+	var sawReservedInit atomic.Bool
+	var sawReservedTransport atomic.Bool
+	var cAddrVal atomic.Value
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, cAddr, rErr := wireLn.ReadFromUDP(buf)
+			if rErr != nil {
+				return
+			}
+			cAddrVal.Store(cAddr)
+			if n >= 6 && bytes.Equal(buf[:6], []byte{0xc7, 0x00, 0x00, 0x00, 0x01, 0x08}) {
+				sawI1.Store(true)
+			}
+			isValidWg := n >= 4 && buf[1] == 12 && buf[2] == 34 && buf[3] == 56 &&
+				((buf[0] == wgMsgInitiationType && n == wgMsgInitiationSize) ||
+					(buf[0] == wgMsgCookieReplyType && n == wgMsgCookieReplySize) ||
+					(buf[0] == wgMsgTransportType && n >= wgMsgTransportMin))
+			if !isValidWg {
+				// Drop decoy junk and CPS I1 packets like Cloudflare edge ignores non-WG datagrams.
+				continue
+			}
+			if buf[0] == wgMsgInitiationType {
+				sawReservedInit.Store(true)
+			} else if buf[0] == wgMsgTransportType {
+				sawReservedTransport.Store(true)
+			}
+			pkt := append([]byte(nil), buf[:n]...)
+			// Zero Reserved [1..3] without altering MAC1/MAC2.
+			pkt[1], pkt[2], pkt[3] = 0, 0, 0
+			_, _ = srvConn.Write(pkt)
+		}
+	}()
+
+	go func() {
+		buf := make([]byte, 4096)
+		for {
+			n, rErr := srvConn.Read(buf)
+			if rErr != nil {
+				return
+			}
+			pkt := append([]byte(nil), buf[:n]...)
+			if len(pkt) >= 4 && pkt[0] >= wgMsgInitiationType && pkt[0] <= wgMsgTransportType {
+				pkt[1], pkt[2], pkt[3] = 12, 34, 56
+			}
+			if ca, ok := cAddrVal.Load().(*net.UDPAddr); ok && ca != nil {
+				_, _ = wireLn.WriteToUDP(pkt, ca)
+			}
+		}
+	}()
+
+	wireAddr := fmt.Sprintf("127.0.0.1:%d", wireLn.LocalAddr().(*net.UDPAddr).Port)
+
+	// 1. Verify handshake probe succeeds with Reserved + I1 + Jc against unmodified WireGuard MAC1
+	probeMs, err := ProbeEndpointHandshakeMs(clientPriv, "", srv.pubHex, wireAddr, awgCfgStr, false, 4000)
+	if err != nil || probeMs <= 0 {
+		t.Fatalf("ProbeEndpointHandshakeMs failed against Cloudflare-style peer: ms=%d err=%v", probeMs, err)
+	}
+
+	// 2. Verify full TCP + UDP data plane over SOCKS5
+	socksPort, err := StartTunnelAdvanced(
+		clientPriv, "", "10.87.0.2/32", "1.1.1.1", srv.pubHex, wireAddr, 25, 1280, awgCfgStr, false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced WARP interop failed: %v", err)
+	}
+
+	c, err := dialSocks5TcpIPv4(socksPort, [4]byte{10, 87, 0, 1}, 8093)
+	if err != nil {
+		t.Fatalf("dialSocks5TcpIPv4 WARP interop failed: %v", err)
+	}
+	tcpResp, _ := io.ReadAll(c)
+	_ = c.Close()
+	if string(tcpResp) != "CLOUDFLARE_WARP_TCP_OK" {
+		t.Fatalf("expected CLOUDFLARE_WARP_TCP_OK, got %q", string(tcpResp))
+	}
+
+	ctrlConn, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", socksPort), 3*time.Second)
+	if err != nil {
+		t.Fatalf("SOCKS5 UDP control dial failed: %v", err)
+	}
+	defer ctrlConn.Close()
+	_ = ctrlConn.SetDeadline(time.Now().Add(5 * time.Second))
+	_, relayPort, err := performSocks5Handshake(ctrlConn, "", "", 0x03, "0.0.0.0", 0)
+	if err != nil || relayPort == 0 {
+		t.Fatalf("SOCKS5 UDP ASSOCIATE failed: relayPort=%d err=%v", relayPort, err)
+	}
+	udpCli, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(relayPort)})
+	if err != nil {
+		t.Fatalf("DialUDP relay failed: %v", err)
+	}
+	defer udpCli.Close()
+	_ = udpCli.SetDeadline(time.Now().Add(4 * time.Second))
+
+	payload := []byte("WARP_UDP_TEST")
+	udpFrame := make([]byte, 10+len(payload))
+	udpFrame[3] = 0x01
+	copy(udpFrame[4:8], []byte{10, 87, 0, 1})
+	binary.BigEndian.PutUint16(udpFrame[8:10], 5354)
+	copy(udpFrame[10:], payload)
+	if _, err := udpCli.Write(udpFrame); err != nil {
+		t.Fatalf("UDP write failed: %v", err)
+	}
+	rxBuf := make([]byte, 1024)
+	rn, err := udpCli.Read(rxBuf)
+	if err != nil {
+		t.Fatalf("UDP read failed: %v", err)
+	}
+	_, _, uPayload, err := parseSocks5UdpDatagram(rxBuf[:rn])
+	if err != nil || string(uPayload) != "CLOUDFLARE_WARP_UDP_OK:WARP_UDP_TEST" {
+		t.Fatalf("unexpected UDP reply=%q err=%v", string(uPayload), err)
+	}
+
+	if !sawI1.Load() {
+		t.Fatalf("expected AWG 1.5 I1 QUIC signature packet")
+	}
+	if !sawReservedInit.Load() || !sawReservedTransport.Load() {
+		t.Fatalf("expected Reserved bytes [12,34,56] on both initiation and transport packets")
 	}
 }
 
