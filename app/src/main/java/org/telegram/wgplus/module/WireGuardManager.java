@@ -193,6 +193,13 @@ public final class WireGuardManager {
         public String h2 = "";
         public String h3 = "";
         public String h4 = "";
+        public String i1 = "";
+        public String i2 = "";
+        public String i3 = "";
+        public String i4 = "";
+        public String i5 = "";
+        public String reserved = "";
+        public boolean isWarp = false;
 
         public TunnelConfig copy() {
             TunnelConfig c = new TunnelConfig();
@@ -219,6 +226,13 @@ public final class WireGuardManager {
             c.h2 = this.h2;
             c.h3 = this.h3;
             c.h4 = this.h4;
+            c.i1 = this.i1;
+            c.i2 = this.i2;
+            c.i3 = this.i3;
+            c.i4 = this.i4;
+            c.i5 = this.i5;
+            c.reserved = this.reserved;
+            c.isWarp = this.isWarp;
             return c;
         }
 
@@ -234,7 +248,13 @@ public final class WireGuardManager {
                     || !safeTrim(h1).isEmpty()
                     || !safeTrim(h2).isEmpty()
                     || !safeTrim(h3).isEmpty()
-                    || !safeTrim(h4).isEmpty();
+                    || !safeTrim(h4).isEmpty()
+                    || !safeTrim(i1).isEmpty()
+                    || !safeTrim(i2).isEmpty()
+                    || !safeTrim(i3).isEmpty()
+                    || !safeTrim(i4).isEmpty()
+                    || !safeTrim(i5).isEmpty()
+                    || !safeTrim(reserved).isEmpty();
         }
 
         public String toAwgParamsString() {
@@ -259,6 +279,12 @@ public final class WireGuardManager {
             if (!safeTrim(h2).isEmpty()) sb.append("H2=").append(safeTrim(h2)).append('\n');
             if (!safeTrim(h3).isEmpty()) sb.append("H3=").append(safeTrim(h3)).append('\n');
             if (!safeTrim(h4).isEmpty()) sb.append("H4=").append(safeTrim(h4)).append('\n');
+            if (!safeTrim(i1).isEmpty()) sb.append("I1=").append(safeTrim(i1)).append('\n');
+            if (!safeTrim(i2).isEmpty()) sb.append("I2=").append(safeTrim(i2)).append('\n');
+            if (!safeTrim(i3).isEmpty()) sb.append("I3=").append(safeTrim(i3)).append('\n');
+            if (!safeTrim(i4).isEmpty()) sb.append("I4=").append(safeTrim(i4)).append('\n');
+            if (!safeTrim(i5).isEmpty()) sb.append("I5=").append(safeTrim(i5)).append('\n');
+            if (!safeTrim(reserved).isEmpty()) sb.append("Reserved=").append(safeTrim(reserved)).append('\n');
             return sb.toString();
         }
 
@@ -311,6 +337,12 @@ public final class WireGuardManager {
         public int bestMs;
         public boolean switchedLive;
         public int livePort;
+    }
+
+    public static final class QuickWarpResult {
+        public TunnelConfig profile;
+        public int localPort;
+        public boolean createdNew;
     }
 
     public static SharedPreferences getPrefs(Context context) {
@@ -851,6 +883,13 @@ public final class WireGuardManager {
         cfg.h2 = safeTrim(obj.optString("h2", ""));
         cfg.h3 = safeTrim(obj.optString("h3", ""));
         cfg.h4 = safeTrim(obj.optString("h4", ""));
+        cfg.i1 = safeTrim(obj.optString("i1", ""));
+        cfg.i2 = safeTrim(obj.optString("i2", ""));
+        cfg.i3 = safeTrim(obj.optString("i3", ""));
+        cfg.i4 = safeTrim(obj.optString("i4", ""));
+        cfg.i5 = safeTrim(obj.optString("i5", ""));
+        cfg.reserved = safeTrim(obj.optString("reserved", ""));
+        cfg.isWarp = obj.optBoolean("isWarp", false);
         return cfg;
     }
 
@@ -879,6 +918,13 @@ public final class WireGuardManager {
         obj.put("h2", safeTrim(cfg.h2));
         obj.put("h3", safeTrim(cfg.h3));
         obj.put("h4", safeTrim(cfg.h4));
+        obj.put("i1", safeTrim(cfg.i1));
+        obj.put("i2", safeTrim(cfg.i2));
+        obj.put("i3", safeTrim(cfg.i3));
+        obj.put("i4", safeTrim(cfg.i4));
+        obj.put("i5", safeTrim(cfg.i5));
+        obj.put("reserved", safeTrim(cfg.reserved));
+        obj.put("isWarp", cfg.isWarp);
         return obj;
     }
 
@@ -1375,6 +1421,30 @@ public final class WireGuardManager {
                     cfg.h4 = value;
                     foundAny = true;
                     break;
+                case "i1":
+                    cfg.i1 = value;
+                    foundAny = true;
+                    break;
+                case "i2":
+                    cfg.i2 = value;
+                    foundAny = true;
+                    break;
+                case "i3":
+                    cfg.i3 = value;
+                    foundAny = true;
+                    break;
+                case "i4":
+                    cfg.i4 = value;
+                    foundAny = true;
+                    break;
+                case "i5":
+                    cfg.i5 = value;
+                    foundAny = true;
+                    break;
+                case "reserved":
+                    cfg.reserved = value;
+                    foundAny = true;
+                    break;
                 case "publickey":
                     if (!"interface".equals(section)) {
                         cfg.publicKey = value;
@@ -1429,6 +1499,12 @@ public final class WireGuardManager {
         if (!safeTrim(cfg.h2).isEmpty()) sb.append("H2 = ").append(safeTrim(cfg.h2)).append('\n');
         if (!safeTrim(cfg.h3).isEmpty()) sb.append("H3 = ").append(safeTrim(cfg.h3)).append('\n');
         if (!safeTrim(cfg.h4).isEmpty()) sb.append("H4 = ").append(safeTrim(cfg.h4)).append('\n');
+        if (!safeTrim(cfg.i1).isEmpty()) sb.append("I1 = ").append(safeTrim(cfg.i1)).append('\n');
+        if (!safeTrim(cfg.i2).isEmpty()) sb.append("I2 = ").append(safeTrim(cfg.i2)).append('\n');
+        if (!safeTrim(cfg.i3).isEmpty()) sb.append("I3 = ").append(safeTrim(cfg.i3)).append('\n');
+        if (!safeTrim(cfg.i4).isEmpty()) sb.append("I4 = ").append(safeTrim(cfg.i4)).append('\n');
+        if (!safeTrim(cfg.i5).isEmpty()) sb.append("I5 = ").append(safeTrim(cfg.i5)).append('\n');
+        if (!safeTrim(cfg.reserved).isEmpty()) sb.append("Reserved = ").append(safeTrim(cfg.reserved)).append('\n');
 
         sb.append("\n[Peer]\n");
         sb.append("PublicKey = ").append(safeTrim(cfg.publicKey)).append('\n');
@@ -1474,6 +1550,111 @@ public final class WireGuardManager {
             Log.w(TAG, "Java DNS pre-resolve fallback to Go resolver for " + host + ": " + t.getMessage());
         }
         return ep;
+    }
+
+    public static TunnelConfig parseWarpGeneratedJson(String rawJson, String[] outEndpointV4) throws Exception {
+        JSONObject obj = new JSONObject(rawJson);
+        TunnelConfig cfg = new TunnelConfig();
+        cfg.id = UUID.randomUUID().toString();
+        cfg.name = safeTrim(obj.optString("name", "Cloudflare WARP (AWG 1.5)"));
+        cfg.privateKey = safeTrim(obj.optString("privateKey", ""));
+        cfg.address = safeTrim(obj.optString("clientIp", "172.16.0.2/32"));
+        cfg.dns = safeTrim(obj.optString("dns", "1.1.1.1"));
+        cfg.publicKey = safeTrim(obj.optString("peerPublicKey", ""));
+        cfg.endpoint = safeTrim(obj.optString("endpoint", "engage.cloudflareclient.com:2408"));
+        cfg.keepAlive = clampKeepAlive(obj.optInt("keepAlive", 25));
+        cfg.mtu = clampMtu(obj.optInt("mtu", 1280));
+        cfg.jc = Math.max(0, Math.min(15, obj.optInt("jc", 4)));
+        cfg.jmin = Math.max(0, Math.min(1200, obj.optInt("jmin", 40)));
+        cfg.jmax = Math.max(0, Math.min(1200, obj.optInt("jmax", 120)));
+        cfg.i1 = safeTrim(obj.optString("i1", ""));
+        cfg.reserved = safeTrim(obj.optString("reserved", ""));
+        cfg.isWarp = true;
+        cfg.enabled = true;
+        cfg.routeCalls = true;
+        if (!cfg.hasPeerConfigured()) {
+            throw new IllegalStateException("Generated WARP payload incomplete");
+        }
+        if (outEndpointV4 != null && outEndpointV4.length > 0) {
+            outEndpointV4[0] = safeTrim(obj.optString("endpointV4", ""));
+        }
+        return cfg;
+    }
+
+    /**
+     * Provisions or reuses a free Cloudflare WARP + AmneziaWG 1.5 profile, activates it,
+     * connects the Go WireGuard tunnel, and binds Telegram's local SOCKS5 + call routing in one tap.
+     */
+    public static QuickWarpResult quickConnectFreeWarp(
+            Context context,
+            String moduleApkPath,
+            ClassLoader telegramClassLoader,
+            boolean forceNewProfile
+    ) throws Exception {
+        NativeBridgeLoader.ensureLoaded(context, moduleApkPath);
+
+        TunnelConfig target = null;
+        boolean createdNew = false;
+
+        synchronized (WireGuardManager.class) {
+            SharedPreferences prefs = getPrefs(context);
+            List<TunnelConfig> profiles = loadProfiles(context);
+
+            if (!forceNewProfile) {
+                for (TunnelConfig p : profiles) {
+                    if ((p.isWarp || !safeTrim(p.reserved).isEmpty()) && p.hasPeerConfigured()) {
+                        target = p.copy();
+                        break;
+                    }
+                }
+            }
+
+            if (target == null) {
+                String rawJson = Wgbridge.generateWarpConfigJSON();
+                String[] epV4 = new String[1];
+                target = parseWarpGeneratedJson(rawJson, epV4);
+                boolean reuseSingleEmptySlot = (profiles.size() == 1 && !profiles.get(0).hasPeerConfigured());
+                if (reuseSingleEmptySlot) {
+                    target.id = profiles.get(0).id;
+                }
+                target.name = uniqueProfileName(
+                        safeTrim(target.name).isEmpty() ? "Cloudflare WARP (AWG 1.5)" : target.name,
+                        profiles,
+                        target.id
+                );
+                if (reuseSingleEmptySlot) {
+                    profiles.set(0, target.copy());
+                } else {
+                    profiles.add(target.copy());
+                }
+                if (epV4[0] != null && !epV4[0].isEmpty()) {
+                    persistEndpointDnsHint(context, "engage.cloudflareclient.com", epV4[0]);
+                    try {
+                        Wgbridge.registerEndpointIpHint("engage.cloudflareclient.com", epV4[0]);
+                    } catch (Throwable ignored) {
+                    }
+                }
+                persistProfilesLocked(prefs, profiles, target.id, true, true);
+                createdNew = true;
+            } else {
+                target.enabled = true;
+                target.routeCalls = true;
+                for (int i = 0; i < profiles.size(); i++) {
+                    if (profiles.get(i).id.equals(target.id)) {
+                        profiles.set(i, target.copy());
+                        break;
+                    }
+                }
+                persistProfilesLocked(prefs, profiles, target.id, true, true);
+            }
+        }
+
+        int port = startAndBindProfile(context, target, moduleApkPath, telegramClassLoader);
+        QuickWarpResult res = new QuickWarpResult();
+        res.profile = target.copy();
+        res.localPort = port;
+        res.createdNew = createdNew;
+        return res;
     }
 
     public static int startAndBind(Context context, String moduleApkPath, ClassLoader telegramClassLoader) throws Exception {

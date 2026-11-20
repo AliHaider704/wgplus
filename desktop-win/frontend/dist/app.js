@@ -89,7 +89,9 @@ function applyStaticLabels() {
   el("btn-import-conf").textContent = tr.importConf;
   el("btn-import-qr").textContent = tr.importQr;
   el("btn-paste-import").textContent = tr.pasteImport;
-  el("btn-gen-warp").textContent = generatingWarp ? tr.generatingWarp : tr.genWarp;
+  el("btn-gen-warp").textContent = generatingWarp ? tr.quickWarpBusy : tr.genWarp;
+  el("btn-quick-warp").textContent = generatingWarp ? tr.quickWarpBusy : tr.quickWarpBtn;
+  el("lbl-quick-warp-hint").textContent = tr.quickWarpHint;
   el("btn-new-profile").textContent = tr.newProfile;
 
   el("lbl-protection-title").textContent = tr.protectionTitle;
@@ -221,7 +223,13 @@ function renderStatusAndTelemetry() {
 
   const btnConn = el("btn-primary-connect");
   btnConn.textContent = state.connected ? tr.disconnect : tr.connect;
-  btnConn.disabled = state.connecting || (!state.connected && (!state.profiles || state.profiles.length === 0));
+  btnConn.disabled = state.connecting || generatingWarp || (!state.connected && (!state.profiles || state.profiles.length === 0));
+
+  const btnQuickWarp = el("btn-quick-warp");
+  if (btnQuickWarp) {
+    btnQuickWarp.textContent = generatingWarp ? tr.quickWarpBusy : tr.quickWarpBtn;
+    btnQuickWarp.disabled = generatingWarp || state.connecting;
+  }
 
   const btnVerify = el("btn-verify-route");
   btnVerify.textContent = verifying ? tr.verifying : tr.verifyRouteCalls;
@@ -579,6 +587,69 @@ async function handleDroppedOrPastedFiles(files) {
   }
 }
 
+async function runVerifyRoute() {
+  if (verifying) return;
+  verifying = true;
+  renderStatusAndTelemetry();
+  try {
+    const raw = await api().VerifyRouteAndCalls();
+    const rep = JSON.parse(raw);
+    const tr = t();
+    const body = el("verify-body");
+    body.innerHTML = "";
+
+    const row1 = document.createElement("div");
+    row1.textContent = `${tr.verifyExit}: ${rep.exitIp ? lri(`${rep.exitIp} (${rep.country || "?"}) - ${rep.exitRttMs} ms`) : tr.verifyFail + (rep.exitError ? ` (${rep.exitError})` : "")}`;
+    body.appendChild(row1);
+
+    const row2 = document.createElement("div");
+    row2.textContent = `${tr.verifyUdpReady}: ${rep.udpOk ? `${tr.verifyPass} (${lri(rep.udpRttMs + " ms")})` : `${tr.verifyFail} (${rep.udpError || ""})`}`;
+    body.appendChild(row2);
+
+    if (Array.isArray(rep.dcLatencies) && rep.dcLatencies.length) {
+      const dcLine = document.createElement("div");
+      dcLine.className = "mono";
+      dcLine.textContent = rep.dcLatencies
+        .map((d) => `${d.dc}: ${d.ok ? d.rttMs + "ms" : "fail"}`)
+        .join(" | ");
+      body.appendChild(dcLine);
+    }
+    el("verify-panel").classList.remove("hidden");
+  } catch (err) {
+    showError(String(err));
+  } finally {
+    verifying = false;
+    renderStatusAndTelemetry();
+  }
+}
+
+async function runQuickWarp(forceNew) {
+  if (generatingWarp) return;
+  generatingWarp = true;
+  showError("");
+  applyStaticLabels();
+  renderStatusAndTelemetry();
+  try {
+    const res = await api().QuickConnectWarp(!!forceNew);
+    await refreshBootstrap();
+    const tr = t();
+    if (Array.isArray(res?.appliedClients) && res.appliedClients.length > 0) {
+      showToast(tr.toastQuickWarpApplied(res.appliedClients.join(", ")));
+    } else if (res?.clipboardCopied) {
+      showToast(tr.toastQuickWarpCopied);
+    } else {
+      showToast(tr.toastWarpReady);
+    }
+    await runVerifyRoute();
+  } catch (err) {
+    showError(String(err));
+  } finally {
+    generatingWarp = false;
+    applyStaticLabels();
+    renderStatusAndTelemetry();
+  }
+}
+
 function wireEvents() {
   el("btn-hide-tray").addEventListener("click", () => api().HideToTray());
   el("btn-lang-toggle").addEventListener("click", () =>
@@ -609,40 +680,8 @@ function wireEvents() {
     }
   });
 
-  el("btn-verify-route").addEventListener("click", async () => {
-    verifying = true;
-    renderStatusAndTelemetry();
-    try {
-      const raw = await api().VerifyRouteAndCalls();
-      const rep = JSON.parse(raw);
-      const tr = t();
-      const body = el("verify-body");
-      body.innerHTML = "";
-
-      const row1 = document.createElement("div");
-      row1.textContent = `${tr.verifyExit}: ${rep.exitIp ? lri(`${rep.exitIp} (${rep.country || "?"}) - ${rep.exitRttMs} ms`) : tr.verifyFail + (rep.exitError ? ` (${rep.exitError})` : "")}`;
-      body.appendChild(row1);
-
-      const row2 = document.createElement("div");
-      row2.textContent = `${tr.verifyUdpReady}: ${rep.udpOk ? `${tr.verifyPass} (${lri(rep.udpRttMs + " ms")})` : `${tr.verifyFail} (${rep.udpError || ""})`}`;
-      body.appendChild(row2);
-
-      if (Array.isArray(rep.dcLatencies) && rep.dcLatencies.length) {
-        const dcLine = document.createElement("div");
-        dcLine.className = "mono";
-        dcLine.textContent = rep.dcLatencies
-          .map((d) => `${d.dc}: ${d.ok ? d.rttMs + "ms" : "fail"}`)
-          .join(" | ");
-        body.appendChild(dcLine);
-      }
-      el("verify-panel").classList.remove("hidden");
-    } catch (err) {
-      showError(String(err));
-    } finally {
-      verifying = false;
-      renderStatusAndTelemetry();
-    }
-  });
+  el("btn-verify-route").addEventListener("click", () => runVerifyRoute());
+  el("btn-quick-warp").addEventListener("click", () => runQuickWarp(false));
   el("btn-close-verify").addEventListener("click", () => el("verify-panel").classList.add("hidden"));
 
   el("btn-scan-clients").addEventListener("click", async () => {
@@ -709,21 +748,7 @@ function wireEvents() {
     el("paste-conf").value = "";
     el("modal-paste").classList.remove("hidden");
   });
-  el("btn-gen-warp").addEventListener("click", async () => {
-    if (generatingWarp) return;
-    generatingWarp = true;
-    applyStaticLabels();
-    try {
-      await api().GenerateWarpProfile();
-      await refreshBootstrap();
-      showToast(t().toastWarpReady);
-    } catch (err) {
-      showError(String(err));
-    } finally {
-      generatingWarp = false;
-      applyStaticLabels();
-    }
-  });
+  el("btn-gen-warp").addEventListener("click", () => runQuickWarp(true));
   el("btn-new-profile").addEventListener("click", () => openEditor(null));
 
   el("set-killswitch").addEventListener("change", () =>

@@ -430,7 +430,7 @@ public class WgPlusFeatureSuiteTest {
 
     @Test
     public void testHybridContinuityTierResolutionAndVersionLabel() {
-        assertEquals("1.5.0", WgStrings.VERSION_LABEL);
+        assertEquals("1.7.0", WgStrings.VERSION_LABEL);
 
         assertEquals(
                 ContinuityBridgeManager.ContinuityTier.HYBRID_FULL,
@@ -551,6 +551,49 @@ public class WgPlusFeatureSuiteTest {
                     lower.contains("shizuku") || lower.contains("daemon") || lower.contains("loopback")
                             || lower.contains("-1000") || lower.contains("39121") || lower.contains("adb"));
         }
+    }
+
+    @Test
+    public void testAwg15WarpReservedRoundTripAndGeneratedJson() throws Exception {
+        String sampleI1 = "<b 0xc70000000108><r 8><b 0x0000449e><r 1200>";
+        String warpJson = "{"
+                + "\"name\":\"Cloudflare WARP (AWG 1.5)\","
+                + "\"privateKey\":\"" + SAMPLE_PRIV_B64 + "\","
+                + "\"clientIp\":\"172.16.0.2/32, 2606:4700:110:8::2/128\","
+                + "\"dns\":\"1.1.1.1\","
+                + "\"peerPublicKey\":\"" + SAMPLE_PUB_B64 + "\","
+                + "\"endpoint\":\"engage.cloudflareclient.com:2408\","
+                + "\"endpointV4\":\"162.159.192.1\","
+                + "\"keepAlive\":25,"
+                + "\"mtu\":1280,"
+                + "\"jc\":4,"
+                + "\"jmin\":40,"
+                + "\"jmax\":120,"
+                + "\"i1\":\"" + sampleI1 + "\","
+                + "\"reserved\":\"12,34,56\""
+                + "}";
+        String[] epV4 = new String[1];
+        WireGuardManager.TunnelConfig parsed = WireGuardManager.parseWarpGeneratedJson(warpJson, epV4);
+        assertTrue(parsed.isWarp);
+        assertEquals("162.159.192.1", epV4[0]);
+        assertEquals(sampleI1, parsed.i1);
+        assertEquals("12,34,56", parsed.reserved);
+        assertTrue(parsed.hasAwgConfigured());
+        String awgParams = parsed.toAwgParamsString();
+        assertTrue(awgParams.contains("I1=" + sampleI1));
+        assertTrue(awgParams.contains("Reserved=12,34,56"));
+
+        String conf = WireGuardManager.exportConfText(parsed);
+        WireGuardManager.TunnelConfig reparsed = WireGuardManager.parseConfText(conf, null);
+        assertEquals(sampleI1, reparsed.i1);
+        assertEquals("12,34,56", reparsed.reserved);
+
+        String backup = WireGuardManager.serializeProfilesBackupJson(java.util.Collections.singletonList(parsed));
+        List<WireGuardManager.TunnelConfig> restored = WireGuardManager.deserializeProfilesBackupJson(backup);
+        assertEquals(1, restored.size());
+        assertEquals(sampleI1, restored.get(0).i1);
+        assertEquals("12,34,56", restored.get(0).reserved);
+        assertTrue(restored.get(0).isWarp);
     }
 
     private static double contrastRatio(int rgb1, int rgb2) {

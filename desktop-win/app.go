@@ -574,9 +574,16 @@ func (a *App) toggleTunnelFromTray() {
 	}
 	if targetID != "" {
 		_ = a.Connect(targetID)
-	} else {
-		a.ShowWindow()
+		return
 	}
+	a.mu.Lock()
+	noProfiles := len(a.state.Profiles) == 0
+	a.mu.Unlock()
+	if noProfiles {
+		_, _ = a.QuickConnectWarp(false)
+		return
+	}
+	a.ShowWindow()
 }
 
 // ShowWindow restores the main Wails window from tray or minimized state.
@@ -993,6 +1000,52 @@ func (a *App) GetAwgPreset(name string) string {
 	return wgbridge.GetAwgPreset(name)
 }
 
+// QuickConnectWarpResult summarizes the outcome of 1-click Free WARP (AWG 1.5) provisioning and binding.
+type QuickConnectWarpResult struct {
+	Profile         config.ServerProfile `json:"profile"`
+	CreatedNew      bool                 `json:"createdNew"`
+	AppliedClients  []string             `json:"appliedClients"`
+	ClipboardCopied bool                 `json:"clipboardCopied"`
+	ProxyURI        string               `json:"proxyUri"`
+}
+
+func findReusableWarpProfile(profiles []config.ServerProfile) (config.ServerProfile, bool) {
+	for _, p := range profiles {
+		if p.IsWarp &&
+			strings.TrimSpace(p.PrivateKey) != "" &&
+			strings.TrimSpace(p.PeerPublicKey) != "" &&
+			strings.TrimSpace(p.Endpoint) != "" {
+			return p, true
+		}
+	}
+	return config.ServerProfile{}, false
+}
+
+func selectQuickWarpTargetClients(list []config.TelegramClientEntry) []config.TelegramClientEntry {
+	var running []config.TelegramClientEntry
+	var firstEnabled *config.TelegramClientEntry
+	for i := range list {
+		c := list[i]
+		if !c.Enabled {
+			continue
+		}
+		if c.Running {
+			running = append(running, c)
+		}
+		if firstEnabled == nil {
+			cp := c
+			firstEnabled = &cp
+		}
+	}
+	if len(running) > 0 {
+		return running
+	}
+	if firstEnabled != nil {
+		return []config.TelegramClientEntry{*firstEnabled}
+	}
+	return nil
+}
+
 func (a *App) GenerateWarpProfile() (config.ServerProfile, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -1002,6 +1055,73 @@ func (a *App) GenerateWarpProfile() (config.ServerProfile, error) {
 		return prof, err
 	}
 	return a.SaveProfile(prof)
+}
+
+// QuickConnectWarp provisions (or reuses) a Cloudflare WARP + AWG 1.5 profile, connects the tunnel,
+// and dispatches the local SOCKS5 proxy to active Telegram desktop clients in one click.
+func (a *App) QuickConnectWarp(forceNew bool) (QuickConnectWarpResult, error) {
+	var prof config.ServerProfile
+	createdNew := false
+
+	if !forceNew {
+		a.mu.Lock()
+		if existing, ok := findReusableWarpProfile(a.state.Profiles); ok {
+			prof = existing
+		}
+		a.mu.Unlock()
+	}
+
+	if prof.ID == "" {
+		var err error
+		prof, err = a.GenerateWarpProfile()
+		if err != nil {
+			return QuickConnectWarpResult{}, err
+		}
+		createdNew = true
+	}
+
+	if err := a.Connect(prof.ID); err != nil {
+		return QuickConnectWarpResult{}, err
+	}
+
+	proxyURI := a.GetProxyLink()
+	clientsList := a.ScanTelegramClients()
+	targets := selectQuickWarpTargetClients(clientsList)
+
+	applied := make([]string, 0, len(targets))
+	clipboardCopied := false
+	for _, c := range targets {
+		res, applyErr := a.ApplyProxyToClient(c.ID)
+		if applyErr == nil && res.Dispatched {
+			applied = append(applied, c.DisplayName)
+			if res.ClipboardCopied {
+				clipboardCopied = true
+			}
+		}
+	}
+
+	if len(applied) == 0 && strings.TrimSpace(proxyURI) != "" {
+		if err := syswin.CopyTextToClipboard(proxyURI); err == nil {
+			clipboardCopied = true
+		}
+	}
+
+	a.mu.Lock()
+	for _, p := range a.state.Profiles {
+		if p.ID == prof.ID {
+			prof = p
+			break
+		}
+	}
+	a.mu.Unlock()
+
+	return QuickConnectWarpResult{
+		Profile:         prof,
+		CreatedNew:      createdNew,
+		AppliedClients:  applied,
+		ClipboardCopied: clipboardCopied,
+		ProxyURI:        proxyURI,
+	}, nil
 }
 
 func (a *App) PingProfile(id string) (int, error) {

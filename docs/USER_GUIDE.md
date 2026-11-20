@@ -64,7 +64,7 @@ To bind a client to your encrypted local SOCKS5 listener (`127.0.0.1:48729` with
 ### 1. Installation Methods
 
 #### Option A: Rootless Setup via LSPatch + One-Time Silent Continuity (Recommended)
-1. Install `WireGuardPlus-1.5.0.apk` directly on your phone.
+1. Install `WireGuardPlus-1.7.0.apk` directly on your phone.
 2. Install **LSPatch** ([JingMatrix fork](https://github.com/JingMatrix/LSPatch)), tap **Manage -> +**, and select your **Telegram Plus** (`org.telegram.plus`) or **Telegram** (`org.telegram.messenger`) APK (back up secret chats first if replacing an existing install with a different signature).
 3. Choose **Portable** (tick **Embed modules -> WireGuard Plus**, plus any other modules you use such as **TeleVip**) **or Local** mode (enable **WireGuard Plus** in **LSPatch -> Modules** and select Telegram in its scope).
 4. Tap **Start Patch** and install the patched Telegram APK.
@@ -73,7 +73,7 @@ To bind a client to your encrypted local SOCKS5 listener (`127.0.0.1:48729` with
 7. Done once: silent background protection stays active across **Wi-Fi**, **Mobile Data**, and **reboots** with zero ongoing notifications.
 
 #### Option B: Rooted Installation via LSPosed
-1. Install `WireGuardPlus-1.5.0.apk`.
+1. Install `WireGuardPlus-1.7.0.apk`.
 2. Open **LSPosed Manager** -> **Modules** -> **WireGuard Plus**.
 3. Enable the module and check **Telegram Plus** (`org.telegram.plus`) and/or **Telegram** (`org.telegram.messenger`).
 4. Force-stop and reopen Telegram.
@@ -110,6 +110,6 @@ Tap **Verify route & calls** (`فحص المسار والمكالمات`) at any
 |---------|-------|----------|
 | **Handshake timed out / Route check failed** | Expired VPN peer keys, or ISP blocking UDP port `51820` | Generate fresh WireGuard credentials, enable the **Client junk preset** under DPI Obfuscation, or choose a peer endpoint on an alternative UDP port (such as `443` or `53`). |
 | **Voice & video calls shows "TCP fallback only"** | Your VPN provider blocks outbound UDP port `53` inside the tunnel or restricts UDP forwarding | Calls still connect over Telegram's TCP reflector fallback through the tunnel; switching to a full-UDP WireGuard peer enables low-latency UDP media. |
-| **WireGuard button does not appear in Proxy Settings** | Module was not embedded or scoped in LSPatch/LSPosed | Re-patch Telegram in LSPatch Portable mode with `WireGuardPlus-1.5.0.apk` checked under **Embed modules** (or enable Telegram in **Modules** scope). |
+| **WireGuard button does not appear in Proxy Settings** | Module was not embedded or scoped in LSPatch/LSPosed | Re-patch Telegram in LSPatch Portable mode with `WireGuardPlus-1.7.0.apk` checked under **Embed modules** (or enable Telegram in **Modules** scope). |
 | **Persistent "Continuity Guard Active" notification still appears** | One-time silent continuity is not yet paired/activated, so safe foreground fallback is active | Open **WireGuard Plus**, ensure **Work silently in background without notification** is ON, tap **Activate protection & battery exemptions now**, and complete the one-time 6-digit Wireless Debugging pairing (or grant Root). |
 | **Wireless Debugging option missing** | Developer Options are hidden | Open Android **Settings -> About phone -> Software information**, tap **Build number** 7 times, then tap **Activate protection & battery exemptions now** inside WireGuard Plus again. |

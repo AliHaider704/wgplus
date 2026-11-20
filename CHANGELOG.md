@@ -2,6 +2,13 @@
 
 All notable changes to **WireGuard Plus** (`Windows Desktop` & `Android org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [1.7.0] - 2026-11-20
+
+### Added
+- **Shared Free WARP (AWG 1.5) Core Provisioner (`wgbridge-go/warp.go`)**: Exported `GenerateWarpConfigJSON()` from the shared Go core (accessible to both Windows and Android via `gomobile`) generating X25519 WireGuard keys, registering anonymous Cloudflare WARP configs with AmneziaWG 1.5 QUIC mimicry (`Jc=4;Jmin=40;Jmax=120;I1=...`) + 3-byte `Reserved`, and registering IPv4 DoH fallback hints automatically.
+- **1-Click Free WARP (AWG 1.5) on Windows (`desktop-win/`)**: Added `App.QuickConnectWarp(forceNew)` and a focal **1-Click Free WARP (AWG 1.5)** button that provisions or reuses a Free WARP profile, connects the tunnel, automatically pushes the authenticated `tg://socks` link to running/enabled Telegram Desktop clients (or copies to clipboard if none are detected), and runs live route + UDP call verification in one click.
+- **1-Tap Free WARP (AWG 1.5) & Full AWG 1.5 on Android (`app/`)**: Rebuilt `wgbridge.aar` with AWG 1.5 + Cloudflare WARP `Reserved` handshake support, extended `TunnelConfig` and `.conf`/JSON serializers with `I1`-`I5` and `Reserved` fields, added an **AWG 1.5 QUIC** preset button, and added **1-Tap Free WARP (AWG 1.5)** actions in both `WireGuardDialog` and `ModuleLauncherActivity`.
+
 ## [1.6.1] - 2026-11-20
 
 ### Fixed

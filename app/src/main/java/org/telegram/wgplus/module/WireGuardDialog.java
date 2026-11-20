@@ -80,6 +80,7 @@ public final class WireGuardDialog {
         boolean connecting = false;
         boolean pingingAll = false;
         boolean discoveringMtu = false;
+        boolean generatingWarp = false;
         String switchingTargetName = "";
         boolean scrollToEditorNextRender = false;
         VerifyUiState verifyState = VerifyUiState.IDLE;
@@ -191,7 +192,7 @@ public final class WireGuardDialog {
         final Handler mainHandler = new Handler(Looper.getMainLooper());
         final DialogSessionState state = new DialogSessionState();
         state.draft = WireGuardManager.loadConfig(activityContext);
-        state.configExpanded = !state.draft.hasPeerConfigured();
+        state.configExpanded = false;
         state.advancedExpanded = state.draft.hasAwgConfigured();
 
         final FrameLayout dialogHost = new FrameLayout(activityContext);
@@ -396,6 +397,18 @@ public final class WireGuardDialog {
         actionRow.addView(disconnectBtn, discLp);
         statusCard.addView(actionRow, actionRowLp);
 
+        final Button quickWarpBtn = createPrimaryAccentButton(
+                ctx,
+                WgStrings.quickWarpBtn(isAr, state.generatingWarp),
+                theme
+        );
+        LinearLayout.LayoutParams quickWarpLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        quickWarpLp.topMargin = WgTheme.dp(ctx, 8);
+        statusCard.addView(quickWarpBtn, quickWarpLp);
+
         final Button verifyBtn = createSecondaryButton(ctx, WgStrings.verifyBtnLabel(isAr), theme);
         LinearLayout.LayoutParams verifyLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -542,9 +555,17 @@ public final class WireGuardDialog {
         final EditText h4Input = createTechnicalEditText(
                 ctx, "400001-500000", state.draft.h4, InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS, theme
         );
+        final EditText i1Input = createTechnicalEditText(
+                ctx, "<b 0xc70000000108><r 8><b 0x0000449e><r 1200>", state.draft.i1,
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS, theme
+        );
+        final EditText reservedInput = createTechnicalEditText(
+                ctx, "12,34,56", state.draft.reserved,
+                InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS, theme
+        );
 
         final Runnable captureDraftInputs = () -> state.draft = collectInputs(
-                state.draft.id,
+                state.draft,
                 autoStartSwitch.isChecked(),
                 routeCallsSwitch.isChecked(),
                 profileNameInput,
@@ -566,7 +587,9 @@ public final class WireGuardDialog {
                 h1Input,
                 h2Input,
                 h3Input,
-                h4Input
+                h4Input,
+                i1Input,
+                reservedInput
         );
 
         // 2C. Saved Profiles, Multi-Server Ping, QR Image Import & Backup Card
@@ -662,6 +685,15 @@ public final class WireGuardDialog {
         profileToolbar2.addView(backupAllBtn, tb2b);
         profileToolbar2.addView(restoreAllBtn, tb2c);
         profilesCard.addView(profileToolbar2, toolbarLp2);
+
+        final Button newWarpBtn = createSecondaryButton(ctx, WgStrings.newWarpChipBtn(isAr), theme);
+        newWarpBtn.setEnabled(!state.generatingWarp && !state.connecting);
+        LinearLayout.LayoutParams nwBtnLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        nwBtnLp.bottomMargin = WgTheme.dp(ctx, 8);
+        profilesCard.addView(newWarpBtn, nwBtnLp);
 
         final LinearLayout profilesListContainer = new LinearLayout(ctx);
         profilesListContainer.setOrientation(LinearLayout.VERTICAL);
@@ -860,6 +892,7 @@ public final class WireGuardDialog {
                 awgPresetLp.bottomMargin = WgTheme.dp(ctx, 10);
 
                 Button awgPresetBtn = createChipButton(ctx, WgStrings.awgPresetVanillaBtn(isAr), theme, false);
+                Button awgQuic15Btn = createChipButton(ctx, WgStrings.awgPresetQuic15Btn(isAr), theme, false);
                 Button awgClearBtn = createChipButton(ctx, WgStrings.awgClearBtn(isAr), theme, false);
 
                 awgPresetBtn.setOnClickListener(v -> {
@@ -867,6 +900,17 @@ public final class WireGuardDialog {
                     state.draft.jc = 4;
                     state.draft.jmin = 50;
                     state.draft.jmax = 250;
+                    WireGuardManager.saveConfig(ctx, state.draft);
+                    Toast.makeText(ctx, WgStrings.toastAwgPresetApplied(isAr), Toast.LENGTH_SHORT).show();
+                    rebuildUi.run();
+                });
+
+                awgQuic15Btn.setOnClickListener(v -> {
+                    captureDraftInputs.run();
+                    state.draft.jc = 4;
+                    state.draft.jmin = 40;
+                    state.draft.jmax = 120;
+                    state.draft.i1 = "<b 0xc70000000108><r 8><b 0x0000449e><r 1200>";
                     WireGuardManager.saveConfig(ctx, state.draft);
                     Toast.makeText(ctx, WgStrings.toastAwgPresetApplied(isAr), Toast.LENGTH_SHORT).show();
                     rebuildUi.run();
@@ -885,15 +929,24 @@ public final class WireGuardDialog {
                     state.draft.h2 = "";
                     state.draft.h3 = "";
                     state.draft.h4 = "";
+                    state.draft.i1 = "";
+                    state.draft.i2 = "";
+                    state.draft.i3 = "";
+                    state.draft.i4 = "";
+                    state.draft.i5 = "";
+                    state.draft.reserved = "";
                     WireGuardManager.saveConfig(ctx, state.draft);
                     Toast.makeText(ctx, WgStrings.toastAwgCleared(isAr), Toast.LENGTH_SHORT).show();
                     rebuildUi.run();
                 });
 
-                LinearLayout.LayoutParams prLp1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.55f);
+                LinearLayout.LayoutParams prLp1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.25f);
                 setMarginEndCompat(prLp1, WgTheme.dp(ctx, 6), isAr);
-                LinearLayout.LayoutParams prLp2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.75f);
+                LinearLayout.LayoutParams prLpQ = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
+                setMarginEndCompat(prLpQ, WgTheme.dp(ctx, 6), isAr);
+                LinearLayout.LayoutParams prLp2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.7f);
                 awgPresetRow.addView(awgPresetBtn, prLp1);
+                awgPresetRow.addView(awgQuic15Btn, prLpQ);
                 awgPresetRow.addView(awgClearBtn, prLp2);
                 advBox.addView(awgPresetRow, awgPresetLp);
 
@@ -940,8 +993,10 @@ public final class WireGuardDialog {
                     addFieldToContainer(advBox, ctx, WgStrings.labelAwgH1(isAr), h1Input, isAr, theme, WgTheme.dp(ctx, 8));
                     addFieldToContainer(advBox, ctx, WgStrings.labelAwgH2(isAr), h2Input, isAr, theme, WgTheme.dp(ctx, 8));
                     addFieldToContainer(advBox, ctx, WgStrings.labelAwgH3(isAr), h3Input, isAr, theme, WgTheme.dp(ctx, 8));
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgH4(isAr), h4Input, isAr, theme, WgTheme.dp(ctx, 10));
+                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgH4(isAr), h4Input, isAr, theme, WgTheme.dp(ctx, 8));
                 }
+                addFieldToContainer(advBox, ctx, WgStrings.labelAwgI1(isAr), i1Input, isAr, theme, WgTheme.dp(ctx, 8));
+                addFieldToContainer(advBox, ctx, WgStrings.labelAwgReserved(isAr), reservedInput, isAr, theme, WgTheme.dp(ctx, 10));
 
                 // Export Row: Copy .conf + Show QR Code Modal
                 LinearLayout exportRow = new LinearLayout(ctx);
@@ -1026,7 +1081,16 @@ public final class WireGuardDialog {
                     && connectedCfg != null
                     && !connectedCfg.id.equals(state.draft.id);
 
-            if (state.connecting) {
+            if (state.generatingWarp) {
+                statusDot.setBackground(WgTheme.statusDot(ctx, theme.pendingDot));
+                statusHeadline.setText(WgStrings.statusGeneratingWarp(isAr));
+                statusHeadline.setTextColor(theme.pendingText);
+                statusSubline.setText(WgStrings.verifyLoadingBody(isAr));
+                connectBtn.setEnabled(false);
+                quickWarpBtn.setEnabled(false);
+                quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, true));
+                disconnectBtn.setEnabled(false);
+            } else if (state.connecting) {
                 statusDot.setBackground(WgTheme.statusDot(ctx, theme.pendingDot));
                 statusHeadline.setText(!state.switchingTargetName.isEmpty()
                         ? WgStrings.statusSwitchingTo(isAr, state.switchingTargetName)
@@ -1035,6 +1099,8 @@ public final class WireGuardDialog {
                 statusSubline.setText(WgStrings.verifyLoadingBody(isAr));
                 connectBtn.setEnabled(false);
                 connectBtn.setText(WgStrings.connectingBtn(isAr));
+                quickWarpBtn.setEnabled(false);
+                quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, false));
                 disconnectBtn.setEnabled(false);
             } else if (active && port > 0) {
                 statusDot.setBackground(WgTheme.statusDot(ctx, theme.activeDot));
@@ -1046,6 +1112,8 @@ public final class WireGuardDialog {
                 connectBtn.setText(viewingDifferentFromConnected
                         ? WgStrings.switchToProfileBtn(isAr)
                         : WgStrings.reconnectPrimaryBtn(isAr));
+                quickWarpBtn.setEnabled(true);
+                quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, false));
                 disconnectBtn.setEnabled(true);
             } else if (guarded) {
                 statusDot.setBackground(WgTheme.statusDot(ctx, theme.pendingDot));
@@ -1054,6 +1122,8 @@ public final class WireGuardDialog {
                 statusSubline.setText(WgStrings.statusKillSwitchSubline(isAr));
                 connectBtn.setEnabled(true);
                 connectBtn.setText(WgStrings.connectPrimaryBtn(isAr));
+                quickWarpBtn.setEnabled(true);
+                quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, false));
                 disconnectBtn.setEnabled(false);
             } else {
                 statusDot.setBackground(WgTheme.statusDot(ctx, theme.stoppedDot));
@@ -1062,6 +1132,8 @@ public final class WireGuardDialog {
                 statusSubline.setText(WgStrings.statusEmptyHint(isAr));
                 connectBtn.setEnabled(true);
                 connectBtn.setText(WgStrings.connectPrimaryBtn(isAr));
+                quickWarpBtn.setEnabled(true);
+                quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, false));
                 disconnectBtn.setEnabled(false);
             }
 
@@ -1654,6 +1726,99 @@ public final class WireGuardDialog {
         );
 
         verifyBtn.setOnClickListener(v -> triggerVerification.run());
+
+        final Runnable startQuickWarpReuse = () -> {
+            if (state.generatingWarp || state.connecting) {
+                return;
+            }
+            captureDraftInputs.run();
+            WireGuardManager.saveConfig(ctx, state.draft);
+            state.generatingWarp = true;
+            state.connecting = true;
+            refreshStatusVisuals.run();
+            scrollView.post(() -> scrollView.smoothScrollTo(0, 0));
+
+            new Thread(() -> {
+                try {
+                    final WireGuardManager.QuickWarpResult res = WireGuardManager.quickConnectFreeWarp(
+                            ctx,
+                            moduleApkPath,
+                            telegramClassLoader,
+                            false
+                    );
+                    mainHandler.post(() -> {
+                        state.generatingWarp = false;
+                        state.connecting = false;
+                        state.draft = res.profile;
+                        state.configExpanded = false;
+                        state.advancedExpanded = state.draft.hasAwgConfigured();
+                        Toast.makeText(
+                                ctx,
+                                WgStrings.toastQuickWarpConnected(isAr, res.createdNew, res.localPort),
+                                Toast.LENGTH_SHORT
+                        ).show();
+                        rebuildUi.run();
+                        triggerVerification.run();
+                    });
+                } catch (final Throwable err) {
+                    mainHandler.post(() -> {
+                        state.generatingWarp = false;
+                        state.connecting = false;
+                        state.verifyState = VerifyUiState.ERROR;
+                        state.lastVerifyError = err;
+                        rebuildUi.run();
+                    });
+                }
+            }, "wg-plus-quick-warp").start();
+        };
+
+        final Runnable startQuickWarpFresh = () -> {
+            if (state.generatingWarp || state.connecting) {
+                return;
+            }
+            captureDraftInputs.run();
+            WireGuardManager.saveConfig(ctx, state.draft);
+            state.generatingWarp = true;
+            state.connecting = true;
+            refreshStatusVisuals.run();
+            scrollView.post(() -> scrollView.smoothScrollTo(0, 0));
+
+            new Thread(() -> {
+                try {
+                    final WireGuardManager.QuickWarpResult res = WireGuardManager.quickConnectFreeWarp(
+                            ctx,
+                            moduleApkPath,
+                            telegramClassLoader,
+                            true
+                    );
+                    mainHandler.post(() -> {
+                        state.generatingWarp = false;
+                        state.connecting = false;
+                        state.draft = res.profile;
+                        state.configExpanded = false;
+                        state.advancedExpanded = state.draft.hasAwgConfigured();
+                        Toast.makeText(
+                                ctx,
+                                WgStrings.toastQuickWarpConnected(isAr, res.createdNew, res.localPort),
+                                Toast.LENGTH_SHORT
+                        ).show();
+                        rebuildUi.run();
+                        triggerVerification.run();
+                    });
+                } catch (final Throwable err) {
+                    mainHandler.post(() -> {
+                        state.generatingWarp = false;
+                        state.connecting = false;
+                        state.verifyState = VerifyUiState.ERROR;
+                        state.lastVerifyError = err;
+                        rebuildUi.run();
+                    });
+                }
+            }, "wg-plus-new-warp").start();
+        };
+
+        quickWarpBtn.setOnClickListener(v -> startQuickWarpReuse.run());
+        newWarpBtn.setOnClickListener(v -> startQuickWarpFresh.run());
 
         connectBtn.setOnClickListener(v -> {
             captureDraftInputs.run();
@@ -2405,7 +2570,7 @@ public final class WireGuardDialog {
     }
 
     private static WireGuardManager.TunnelConfig collectInputs(
-            String id,
+            WireGuardManager.TunnelConfig base,
             boolean enabled,
             boolean routeCalls,
             EditText profileName,
@@ -2427,10 +2592,11 @@ public final class WireGuardDialog {
             EditText h1,
             EditText h2,
             EditText h3,
-            EditText h4
+            EditText h4,
+            EditText i1,
+            EditText reserved
     ) {
-        WireGuardManager.TunnelConfig cfg = new WireGuardManager.TunnelConfig();
-        cfg.id = id;
+        WireGuardManager.TunnelConfig cfg = base != null ? base.copy() : new WireGuardManager.TunnelConfig();
         cfg.enabled = enabled;
         cfg.routeCalls = routeCalls;
         cfg.name = textOf(profileName);
@@ -2453,6 +2619,8 @@ public final class WireGuardDialog {
         cfg.h2 = textOf(h2);
         cfg.h3 = textOf(h3);
         cfg.h4 = textOf(h4);
+        cfg.i1 = textOf(i1);
+        cfg.reserved = textOf(reserved);
         return cfg;
     }
 

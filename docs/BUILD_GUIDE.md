@@ -91,5 +91,5 @@ Upon completion the APK is copied to `dist/WireGuardPlus-<version>.apk`.
 #### Verify APK Signature Integrity
 
 ```powershell
-& "C:\Program Files (x86)\Android\android-sdk\build-tools\36.0.0\apksigner.bat" verify --verbose .\dist\WireGuardPlus-1.5.0.apk
+& "C:\Program Files (x86)\Android\android-sdk\build-tools\36.0.0\apksigner.bat" verify --verbose .\dist\WireGuardPlus-1.7.0.apk
 ```

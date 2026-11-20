@@ -26,13 +26,13 @@
 
 <div dir="rtl">
 
-## التحميل (`v1.6.1`)
+## التحميل (`v1.7.0`)
 
 | المنصة | رابط التحميل | المتطلبات | الملاحظات |
 |--------|--------------|-----------|-----------|
 | **ويندوز (ملف `.exe` مفرد)** | [`WireGuardPlus-Windows-x64.exe`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64.exe) | ويندوز 10/11 (x64)، بدون مسؤول | تشغيل مباشر، تشفير DPAPI، أيقونة شريط النظام |
 | **ويندوز المحمول (`.zip`)** | [`WireGuardPlus-Windows-x64-Portable.zip`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64-Portable.zip) | ويندوز 10/11 (x64)، فلاش/مجلد | يحتوي `portable.flag`، حفظ محلي كامل بدون AppData |
-| **أندرويد (LSPatch / LSPosed)** | [`WireGuardPlus-1.5.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.5.0.apk) | أندرويد 5.0+ (11+ للتفعيل الصامت) | بدون روت عبر LSPatch أو بالروت عبر LSPosed |
+| **أندرويد (LSPatch / LSPosed)** | [`WireGuardPlus-1.7.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.0.apk) | أندرويد 5.0+ (11+ للتفعيل الصامت) | بدون روت عبر LSPatch أو بالروت عبر LSPosed |
 
 تحقق من تطابق الملفات عبر [`SHA256SUMS.txt`](https://github.com/AliHaider704/wgplus/releases/latest/download/SHA256SUMS.txt) أو شاهد [فيديو الشرح العملي لويندوز (`MP4`)](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-Walkthrough.mp4).
 
@@ -148,7 +148,7 @@ flowchart LR
 
 يتطلب **أندرويد 5.0+** (**أندرويد 11+** للتفعيل الصامت عبر التصحيح اللاسلكي).
 
-1. حمّل [`WireGuardPlus-1.5.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.5.0.apk).
+1. حمّل [`WireGuardPlus-1.7.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.0.apk).
 2. **بدون روت (LSPatch):** ادمج **تليجرام بلس** (`org.telegram.plus`) أو **تليجرام الرسمي** (`org.telegram.messenger`) عبر [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch) بوضع **Portable** أو **Local**، ثم ثبّت تليجرام وافتح تطبيق **نفق وايرجارد بلس** لإكمال ربط التصحيح اللاسلكي ذي الـ 6 أرقام لمرة واحدة.
    - **مع روت (LSPosed):** فعّل **WireGuard Plus** في **LSPosed -> Modules** وحدد تليجرام ثم امنح الروت داخل التطبيق لحماية صامتة.
 3. داخل تليجرام افتح **الإعدادات -> البيانات والتخزين -> إعدادات البروكسي -> نفق وايرجارد** وأضف ملفك واتصل.

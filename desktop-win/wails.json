@@ -13,7 +13,7 @@
   "info": {
     "companyName": "WireGuard Plus Community",
     "productName": "WireGuard Plus",
-    "productVersion": "1.6.1",
+    "productVersion": "1.7.0",
     "copyright": "MIT License",
     "comments": "Userspace WireGuard & AmneziaWG inside Telegram for Windows"
   }

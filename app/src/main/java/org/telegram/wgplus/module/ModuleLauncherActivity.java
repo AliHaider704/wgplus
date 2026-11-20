@@ -31,6 +31,7 @@ public class ModuleLauncherActivity extends Activity {
 
     private volatile boolean mResumedActivationInFlight;
     private volatile boolean mDestroyed;
+    private volatile boolean mQuickWarpBusy;
     private boolean mPendingPairingAfterNotifPermission;
 
     @Override
@@ -277,6 +278,68 @@ public class ModuleLauncherActivity extends Activity {
         );
         openBtnLp.topMargin = WgTheme.dp(this, 14);
         statusCard.addView(openConfigBtn, openBtnLp);
+
+        Button quickWarpBtn = new Button(this);
+        quickWarpBtn.setAllCaps(false);
+        quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, mQuickWarpBusy));
+        quickWarpBtn.setEnabled(!mQuickWarpBusy);
+        quickWarpBtn.setTextColor(theme.textPrimary);
+        quickWarpBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
+        quickWarpBtn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
+        quickWarpBtn.setLineSpacing(WgTheme.dp(this, 2), 1.05f);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            quickWarpBtn.setLetterSpacing(0f);
+        }
+        quickWarpBtn.setMinHeight(ctaMinH);
+        quickWarpBtn.setMinimumHeight(ctaMinH);
+        quickWarpBtn.setFocusable(true);
+        quickWarpBtn.setPadding(WgTheme.dp(this, 16), WgTheme.dp(this, 10), WgTheme.dp(this, 16), WgTheme.dp(this, 10));
+        quickWarpBtn.setBackground(WgTheme.interactiveBackground(
+                this,
+                theme.surfaceSecondaryBtn,
+                theme.surfaceSecondaryBtnPressed,
+                theme.accentPrimary,
+                theme.textPrimary,
+                10f
+        ));
+        quickWarpBtn.setOnClickListener(v -> {
+            if (mQuickWarpBusy) {
+                return;
+            }
+            mQuickWarpBusy = true;
+            renderScreen();
+            new Thread(() -> {
+                try {
+                    final WireGuardManager.QuickWarpResult res =
+                            WireGuardManager.quickConnectFreeWarp(this, sourceApk, null, false);
+                    runOnUiThread(() -> {
+                        mQuickWarpBusy = false;
+                        if (!mDestroyed) {
+                            Toast.makeText(
+                                    this,
+                                    WgStrings.toastQuickWarpConnected(isAr, res.createdNew, res.localPort),
+                                    Toast.LENGTH_SHORT
+                            ).show();
+                            renderScreen();
+                        }
+                    });
+                } catch (final Throwable err) {
+                    runOnUiThread(() -> {
+                        mQuickWarpBusy = false;
+                        if (!mDestroyed) {
+                            Toast.makeText(this, WgStrings.localizeError(err, isAr), Toast.LENGTH_LONG).show();
+                            renderScreen();
+                        }
+                    });
+                }
+            }, "wg-plus-launcher-warp").start();
+        });
+        LinearLayout.LayoutParams quickWarpLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        quickWarpLp.topMargin = WgTheme.dp(this, 10);
+        statusCard.addView(quickWarpBtn, quickWarpLp);
 
         LinearLayout.LayoutParams statusCardLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,

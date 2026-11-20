@@ -12,7 +12,7 @@ public final class WgStrings {
 
     public static final String LANG_AR = "ar";
     public static final String LANG_EN = "en";
-    public static final String VERSION_LABEL = "1.5.0";
+    public static final String VERSION_LABEL = "1.7.0";
 
     private static final Map<String, String> AR_COUNTRIES = new HashMap<>();
 
@@ -685,6 +685,45 @@ public final class WgStrings {
         return ar
                 ? "نبضات التمويه العشوائية تعمل حتى مع خوادم وايرجارد العادية، بينما تُقرأ قيم الحشو والترويسات تلقائيًا عند استيراد ملف أمنيزيا."
                 : "Decoy junk bursts work even on standard WireGuard servers; padding and header values load automatically from AmneziaWG configs.";
+    }
+
+    public static String quickWarpBtn(boolean ar, boolean busy) {
+        if (busy) {
+            return ar ? ("جارٍ تجهيز نفق " + ltr("WARP") + " والاتصال...") : "Setting up Free WARP...";
+        }
+        return ar ? ("اتصال فوري: " + ltr("WARP") + " مجاني (" + ltr("AWG 1.5") + ")") : "1-Tap Free WARP (AWG 1.5)";
+    }
+
+    public static String newWarpChipBtn(boolean ar) {
+        return ar ? ("+ " + ltr("WARP") + " مجاني") : "+ Free WARP";
+    }
+
+    public static String statusGeneratingWarp(boolean ar) {
+        return ar ? ("جارٍ تسجيل نفق " + ltr("Cloudflare WARP (AWG 1.5)") + " وتشغيله...") : "Provisioning Free Cloudflare WARP (AWG 1.5)...";
+    }
+
+    public static String toastQuickWarpConnected(boolean ar, boolean createdNew, int port) {
+        String addr = ltr("127.0.0.1:" + port);
+        if (createdNew) {
+            return ar
+                    ? ("تم إنشاء وتشغيل نفق " + ltr("WARP (AWG 1.5)") + " على " + addr)
+                    : ("Created and connected Free WARP (AWG 1.5) on " + addr);
+        }
+        return ar
+                ? ("تم الاتصال بنفق " + ltr("WARP (AWG 1.5)") + " على " + addr)
+                : ("Connected Free WARP (AWG 1.5) on " + addr);
+    }
+
+    public static String awgPresetQuic15Btn(boolean ar) {
+        return ar ? ("محاكاة " + ltr("AWG 1.5 QUIC")) : "AWG 1.5 QUIC";
+    }
+
+    public static String labelAwgI1(boolean ar) {
+        return ar ? ("توقيع البدء (" + ltr("I1") + ")") : "Init signature (I1)";
+    }
+
+    public static String labelAwgReserved(boolean ar) {
+        return ar ? ("بايتات حجز " + ltr("WARP (Reserved)")) : "WARP Reserved bytes";
     }
 
     public static String awgPresetVanillaBtn(boolean ar) {
