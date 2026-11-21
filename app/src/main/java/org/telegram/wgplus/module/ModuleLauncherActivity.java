@@ -9,6 +9,9 @@ import android.content.res.ColorStateList;
 import android.graphics.Typeface;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.TypedValue;
 import android.view.Gravity;
@@ -28,16 +31,41 @@ import android.widget.Toast;
 public class ModuleLauncherActivity extends Activity {
 
     private static final int REQ_POST_NOTIFICATIONS = 7102;
+    private static final long STALLED_HANDSHAKE_THRESHOLD_MS = 10_000L;
+    private static final long STALE_HANDSHAKE_THRESHOLD_SEC = 150L;
 
+    private static volatile boolean sAutoContinuityAttemptedThisSession = false;
+
+    private final Handler mUiHandler = new Handler(Looper.getMainLooper());
     private volatile boolean mResumedActivationInFlight;
     private volatile boolean mDestroyed;
     private volatile boolean mQuickWarpBusy;
+    private volatile boolean mCleaningCache;
     private boolean mPendingPairingAfterNotifPermission;
+    private boolean mContinuityExpanded = false;
+    private boolean mGuideUserToggled = false;
+    private boolean mGuideExpanded = true;
+    private long mObservedActiveNoHsAtMs = 0L;
+    private Runnable mLiveRefreshTicker;
+    private ScrollView mScrollView;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         ensureLauncherComponentVisible();
+        mLiveRefreshTicker = new Runnable() {
+            @Override
+            public void run() {
+                if (mDestroyed) {
+                    return;
+                }
+                if (WireGuardManager.isTunnelRunning(ModuleLauncherActivity.this,
+                        getApplicationInfo() != null ? getApplicationInfo().sourceDir : null)) {
+                    renderScreen();
+                }
+                mUiHandler.postDelayed(this, 2500L);
+            }
+        };
         renderScreen();
         UpdateGate.check(this);
     }
@@ -45,7 +73,14 @@ public class ModuleLauncherActivity extends Activity {
     @Override
     protected void onDestroy() {
         mDestroyed = true;
+        mUiHandler.removeCallbacksAndMessages(null);
         super.onDestroy();
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        mUiHandler.removeCallbacksAndMessages(null);
     }
 
     private void ensureLauncherComponentVisible() {
@@ -68,18 +103,34 @@ public class ModuleLauncherActivity extends Activity {
         super.onResume();
         ContinuityBridgeManager.registerPassiveWifiRecovery(this);
         renderScreen();
-        if (!mResumedActivationInFlight && ContinuityBridgeManager.isStealthHybridEnabled(this)) {
-            ContinuityBridgeManager.StealthSnapshot snap = ContinuityBridgeManager.captureStatusSnapshot(this);
-            boolean sovereignReady = ContinuityBridgeManager.hasAnyPrivilegeBackend(this);
-            if (sovereignReady && (!snap.forcedImportant || !snap.listenerConnected)) {
-                mResumedActivationInFlight = true;
-                ContinuityBridgeManager.activateHybridAsync(this, () -> runOnUiThread(() -> {
-                    mResumedActivationInFlight = false;
-                    if (!mDestroyed) {
-                        renderScreen();
+        if (mLiveRefreshTicker != null) {
+            mUiHandler.removeCallbacks(mLiveRefreshTicker);
+            mUiHandler.postDelayed(mLiveRefreshTicker, 2500L);
+        }
+        // Only perform automatic continuity activation once per process session and NEVER re-spawn su per resume
+        if (!sAutoContinuityAttemptedThisSession
+                && !mResumedActivationInFlight
+                && ContinuityBridgeManager.isStealthHybridEnabled(this)) {
+            sAutoContinuityAttemptedThisSession = true;
+            mResumedActivationInFlight = true;
+            new Thread(() -> {
+                try {
+                    boolean daemonAlive = PrivilegeBridge.isStandaloneDaemonAlive(this);
+                    ContinuityBridgeManager.StealthSnapshot snap = ContinuityBridgeManager.captureStatusSnapshot(this);
+                    boolean sovereignReady = daemonAlive || ContinuityBridgeManager.hasAnyPrivilegeBackend(this);
+                    if (sovereignReady && (!daemonAlive || !snap.forcedImportant || !snap.listenerConnected)) {
+                        ContinuityBridgeManager.activateHybridOneTap(this);
                     }
-                }));
-            }
+                } catch (Throwable ignored) {
+                } finally {
+                    runOnUiThread(() -> {
+                        mResumedActivationInFlight = false;
+                        if (!mDestroyed) {
+                            renderScreen();
+                        }
+                    });
+                }
+            }, "wgplus-resume-continuity").start();
         }
     }
 
@@ -130,6 +181,7 @@ public class ModuleLauncherActivity extends Activity {
         topBar.addView(h1, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         Button themeToggle = createHeaderChip(WgStrings.themeToggleLabel(isAr, isDark), theme);
+        themeToggle.setContentDescription("wgplus_btn_theme");
         LinearLayout.LayoutParams themeLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -142,6 +194,7 @@ public class ModuleLauncherActivity extends Activity {
         topBar.addView(themeToggle, themeLp);
 
         Button langToggle = createHeaderChip(WgStrings.langToggleLabel(isAr), theme);
+        langToggle.setContentDescription("wgplus_btn_lang");
         LinearLayout.LayoutParams langLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -162,8 +215,10 @@ public class ModuleLauncherActivity extends Activity {
                 Math.max(1, WgTheme.dp(this, 1))
         ));
 
-        ScrollView scrollView = new ScrollView(this);
+        final int prevScrollY = mScrollView != null ? mScrollView.getScrollY() : 0;
+        final ScrollView scrollView = new ScrollView(this);
         scrollView.setFillViewport(true);
+        mScrollView = scrollView;
 
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
@@ -197,6 +252,7 @@ public class ModuleLauncherActivity extends Activity {
 
         boolean active = WireGuardManager.isTunnelRunning(this, sourceApk);
         boolean guarded = !active && WireGuardManager.isKillSwitchGuardActiveNow(this, sourceApk);
+        boolean hasProfile = WireGuardManager.hasAnyConfiguredProfile(this);
         int port = active ? WireGuardManager.getActivePort(this, sourceApk) : 0;
         WireGuardManager.TunnelConfig shownProfile = active
                 ? WireGuardManager.getConnectedProfile(this, sourceApk)
@@ -205,23 +261,61 @@ public class ModuleLauncherActivity extends Activity {
                 ? WgStrings.localizeProfileName(shownProfile.name, isAr)
                 : "";
 
+        WireGuardManager.TunnelStats stats = (active && port > 0)
+                ? WireGuardManager.getLiveStats(this, sourceApk)
+                : new WireGuardManager.TunnelStats();
+        int handshakeStateCode = 0; // 0=idle, 1=handshaking, 2=verified, 3=stalled
+        if (active && port > 0) {
+            long nowEpoch = System.currentTimeMillis() / 1000L;
+            boolean recentHs = stats.lastHandshakeSec > 0
+                    && Math.max(0L, nowEpoch - stats.lastHandshakeSec) < STALE_HANDSHAKE_THRESHOLD_SEC;
+            if (recentHs) {
+                mObservedActiveNoHsAtMs = 0L;
+                handshakeStateCode = 2;
+            } else {
+                long startedAtMs = WireGuardManager.getTunnelStartedAtMs();
+                if (startedAtMs <= 0L) {
+                    if (mObservedActiveNoHsAtMs <= 0L) {
+                        mObservedActiveNoHsAtMs = SystemClock.elapsedRealtime();
+                    }
+                    startedAtMs = mObservedActiveNoHsAtMs;
+                }
+                long elapsedNoHs = Math.max(0L, SystemClock.elapsedRealtime() - startedAtMs);
+                boolean staleOldHs = stats.lastHandshakeSec > 0
+                        && (nowEpoch - stats.lastHandshakeSec) >= STALE_HANDSHAKE_THRESHOLD_SEC;
+                handshakeStateCode = (elapsedNoHs >= STALLED_HANDSHAKE_THRESHOLD_MS || staleOldHs) ? 3 : 1;
+            }
+        } else {
+            mObservedActiveNoHsAtMs = 0L;
+        }
+
         LinearLayout stateRow = new LinearLayout(this);
         stateRow.setOrientation(LinearLayout.HORIZONTAL);
         stateRow.setGravity(Gravity.CENTER_VERTICAL);
 
         View dot = new View(this);
+        dot.setContentDescription("wgplus_status_dot");
         int dotPx = WgTheme.dp(this, 8);
-        int dotCol = (active && port > 0) ? theme.activeDot : (guarded ? theme.pendingDot : theme.stoppedDot);
+        int dotCol = (handshakeStateCode == 2)
+                ? theme.activeDot
+                : ((handshakeStateCode == 1 || handshakeStateCode == 3 || guarded) ? theme.pendingDot : theme.stoppedDot);
         dot.setBackground(WgTheme.statusDot(this, dotCol));
         LinearLayout.LayoutParams dotLp = new LinearLayout.LayoutParams(dotPx, dotPx);
         setMarginEnd(dotLp, WgTheme.dp(this, 9), isAr);
         stateRow.addView(dot, dotLp);
 
         TextView stateLabel = new TextView(this);
-        int labelCol = (active && port > 0) ? theme.activeText : (guarded ? theme.pendingText : theme.stoppedText);
+        stateLabel.setContentDescription("wgplus_status_headline");
+        int labelCol = (handshakeStateCode == 2)
+                ? theme.activeText
+                : ((handshakeStateCode == 1 || handshakeStateCode == 3 || guarded) ? theme.pendingText : theme.stoppedText);
         styleText(stateLabel, isAr, labelCol, 15f, true);
-        if (active && port > 0) {
+        if (handshakeStateCode == 2) {
             stateLabel.setText(WgStrings.statusActiveWithProfile(isAr, profileName, port));
+        } else if (handshakeStateCode == 1) {
+            stateLabel.setText(WgStrings.statusAwaitingHandshakeWithProfile(isAr, profileName));
+        } else if (handshakeStateCode == 3) {
+            stateLabel.setText(WgStrings.statusStalledWithProfile(isAr, profileName));
         } else if (guarded) {
             stateLabel.setText(WgStrings.statusKillSwitchGuarded(isAr, profileName));
         } else {
@@ -232,9 +326,10 @@ public class ModuleLauncherActivity extends Activity {
 
         TextView helper = new TextView(this);
         styleText(helper, isAr, theme.textSecondary, 13f, false);
-        if (active && port > 0) {
-            WireGuardManager.TunnelStats stats = WireGuardManager.getLiveStats(this, sourceApk);
+        if (handshakeStateCode == 2 || handshakeStateCode == 1) {
             helper.setText(WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec));
+        } else if (handshakeStateCode == 3) {
+            helper.setText(WgStrings.statusStalledHint(isAr));
         } else if (guarded) {
             helper.setText(WgStrings.statusKillSwitchSubline(isAr));
         } else {
@@ -247,100 +342,99 @@ public class ModuleLauncherActivity extends Activity {
         helpLp.topMargin = WgTheme.dp(this, 6);
         statusCard.addView(helper, helpLp);
 
-        Button openConfigBtn = new Button(this);
-        openConfigBtn.setAllCaps(false);
-        openConfigBtn.setText(WgStrings.launcherOpenConfigBtn(isAr));
-        openConfigBtn.setTextColor(theme.onAccent);
-        openConfigBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 14f);
-        openConfigBtn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        openConfigBtn.setLineSpacing(WgTheme.dp(this, 2), 1.05f);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            openConfigBtn.setLetterSpacing(0f);
+        if (handshakeStateCode == 3) {
+            LinearLayout recoveryBox = new LinearLayout(this);
+            recoveryBox.setOrientation(LinearLayout.VERTICAL);
+            recoveryBox.setBackground(WgTheme.cardBackground(this, theme.pendingBg, theme.pendingBorder, 8f));
+            int recPad = WgTheme.dp(this, 10);
+            recoveryBox.setPadding(recPad, recPad, recPad, recPad);
+            LinearLayout.LayoutParams recLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            );
+            recLp.topMargin = WgTheme.dp(this, 10);
+
+            Button recAwgBtn = createActionButton(WgStrings.recoverAwgBtn(isAr), theme, true);
+            recAwgBtn.setContentDescription("wgplus_btn_recover_awg");
+            recAwgBtn.setEnabled(!mQuickWarpBusy);
+            recAwgBtn.setOnClickListener(v -> {
+                if (mQuickWarpBusy) {
+                    return;
+                }
+                mQuickWarpBusy = true;
+                renderScreen();
+                new Thread(() -> {
+                    try {
+                        int recPort = WireGuardManager.applyAwg15AndReconnect(this, sourceApk, null);
+                        mObservedActiveNoHsAtMs = 0L;
+                        runOnUiThread(() -> {
+                            mQuickWarpBusy = false;
+                            if (!mDestroyed) {
+                                Toast.makeText(this, WgStrings.toastAwgRecovered(isAr, recPort), Toast.LENGTH_SHORT).show();
+                                renderScreen();
+                            }
+                        });
+                    } catch (final Throwable err) {
+                        runOnUiThread(() -> {
+                            mQuickWarpBusy = false;
+                            if (!mDestroyed) {
+                                Toast.makeText(this, WgStrings.localizeError(err, isAr), Toast.LENGTH_LONG).show();
+                                renderScreen();
+                            }
+                        });
+                    }
+                }, "wgplus-recover-awg").start();
+            });
+            recoveryBox.addView(recAwgBtn, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            ));
+
+            Button recWarpBtn = createActionButton(WgStrings.recoverWarpBtn(isAr), theme, true);
+            recWarpBtn.setContentDescription("wgplus_btn_recover_warp");
+            recWarpBtn.setEnabled(!mQuickWarpBusy);
+            recWarpBtn.setOnClickListener(v -> launchQuickWarpFlow(isAr, sourceApk));
+            LinearLayout.LayoutParams rwLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            );
+            rwLp.topMargin = WgTheme.dp(this, 6);
+            recoveryBox.addView(recWarpBtn, rwLp);
+
+            statusCard.addView(recoveryBox, recLp);
         }
-        int ctaMinH = WgTheme.dp(this, 46);
-        openConfigBtn.setMinHeight(ctaMinH);
-        openConfigBtn.setMinimumHeight(ctaMinH);
-        openConfigBtn.setFocusable(true);
-        openConfigBtn.setPadding(WgTheme.dp(this, 16), WgTheme.dp(this, 11), WgTheme.dp(this, 16), WgTheme.dp(this, 11));
-        openConfigBtn.setBackground(WgTheme.interactiveBackground(
-                this,
-                theme.accentPrimary,
-                theme.accentPressed,
-                theme.accentPrimary,
-                theme.textPrimary,
-                10f
-        ));
+
+        String manageLabel = hasProfile
+                ? WgStrings.launcherOpenConfigBtn(isAr)
+                : WgStrings.launcherManageSecondaryBtn(isAr);
+        Button openConfigBtn = createActionButton(manageLabel, theme, !hasProfile);
+        openConfigBtn.setContentDescription("wgplus_btn_manage");
         openConfigBtn.setOnClickListener(v ->
                 WireGuardDialog.show(this, null, sourceApk, this::renderScreen)
         );
-        LinearLayout.LayoutParams openBtnLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-        );
-        openBtnLp.topMargin = WgTheme.dp(this, 14);
-        statusCard.addView(openConfigBtn, openBtnLp);
 
-        Button quickWarpBtn = new Button(this);
-        quickWarpBtn.setAllCaps(false);
-        quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, mQuickWarpBusy));
+        Button quickWarpBtn = createActionButton(WgStrings.quickWarpBtn(isAr, mQuickWarpBusy), theme, hasProfile);
+        quickWarpBtn.setContentDescription("wgplus_btn_quick_warp");
         quickWarpBtn.setEnabled(!mQuickWarpBusy);
-        quickWarpBtn.setTextColor(theme.textPrimary);
-        quickWarpBtn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
-        quickWarpBtn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        quickWarpBtn.setLineSpacing(WgTheme.dp(this, 2), 1.05f);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            quickWarpBtn.setLetterSpacing(0f);
-        }
-        quickWarpBtn.setMinHeight(ctaMinH);
-        quickWarpBtn.setMinimumHeight(ctaMinH);
-        quickWarpBtn.setFocusable(true);
-        quickWarpBtn.setPadding(WgTheme.dp(this, 16), WgTheme.dp(this, 10), WgTheme.dp(this, 16), WgTheme.dp(this, 10));
-        quickWarpBtn.setBackground(WgTheme.interactiveBackground(
-                this,
-                theme.surfaceSecondaryBtn,
-                theme.surfaceSecondaryBtnPressed,
-                theme.accentPrimary,
-                theme.textPrimary,
-                10f
-        ));
-        quickWarpBtn.setOnClickListener(v -> {
-            if (mQuickWarpBusy) {
-                return;
-            }
-            mQuickWarpBusy = true;
-            renderScreen();
-            new Thread(() -> {
-                try {
-                    final WireGuardManager.QuickWarpResult res =
-                            WireGuardManager.quickConnectFreeWarp(this, sourceApk, null, false);
-                    runOnUiThread(() -> {
-                        mQuickWarpBusy = false;
-                        if (!mDestroyed) {
-                            Toast.makeText(
-                                    this,
-                                    WgStrings.toastQuickWarpConnected(isAr, res.createdNew, res.localPort),
-                                    Toast.LENGTH_SHORT
-                            ).show();
-                            renderScreen();
-                        }
-                    });
-                } catch (final Throwable err) {
-                    runOnUiThread(() -> {
-                        mQuickWarpBusy = false;
-                        if (!mDestroyed) {
-                            Toast.makeText(this, WgStrings.localizeError(err, isAr), Toast.LENGTH_LONG).show();
-                            renderScreen();
-                        }
-                    });
-                }
-            }, "wg-plus-launcher-warp").start();
-        });
-        LinearLayout.LayoutParams quickWarpLp = new LinearLayout.LayoutParams(
+        quickWarpBtn.setOnClickListener(v -> launchQuickWarpFlow(isAr, sourceApk));
+
+        // Adaptive single accentPrimary button: promote 1-Tap Free WARP when zero servers exist
+        Button firstBtn = hasProfile ? openConfigBtn : quickWarpBtn;
+        Button secondBtn = hasProfile ? quickWarpBtn : openConfigBtn;
+
+        LinearLayout.LayoutParams firstLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
         );
-        quickWarpLp.topMargin = WgTheme.dp(this, 10);
-        statusCard.addView(quickWarpBtn, quickWarpLp);
+        firstLp.topMargin = WgTheme.dp(this, 14);
+        statusCard.addView(firstBtn, firstLp);
+
+        LinearLayout.LayoutParams secondLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        secondLp.topMargin = WgTheme.dp(this, 10);
+        statusCard.addView(secondBtn, secondLp);
 
         LinearLayout.LayoutParams statusCardLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -349,47 +443,216 @@ public class ModuleLauncherActivity extends Activity {
         statusCardLp.bottomMargin = WgTheme.dp(this, 16);
         content.addView(statusCard, statusCardLp);
 
-        // 2. Silent Background Continuity Card
-        content.addView(buildHybridContinuityCard(isAr, theme, cardPad), createCardParamsWithBottom(16));
-
-        // 3. Real 4-Step Activation Guide Card
-        LinearLayout guideCard = new LinearLayout(this);
-        guideCard.setOrientation(LinearLayout.VERTICAL);
-        guideCard.setBackground(WgTheme.cardBackground(this, theme.surfaceCard, theme.borderSubtle, 12f));
-        guideCard.setPadding(cardPad, cardPad, cardPad, cardPad);
-
-        TextView guideTitle = new TextView(this);
-        styleText(guideTitle, isAr, theme.textPrimary, 15f, true);
-        guideTitle.setText(WgStrings.launcherGuideHeading(isAr));
-        LinearLayout.LayoutParams gtLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
+        // 2. Live Setup Readiness Checklist + Collapsible Quick Guide + Safe Cache Optimizer
+        content.addView(
+                buildReadinessChecklistCard(isAr, theme, cardPad, hasProfile, handshakeStateCode),
+                createCardParamsWithBottom(16)
         );
-        gtLp.bottomMargin = WgTheme.dp(this, 10);
-        guideCard.addView(guideTitle, gtLp);
 
-        String[] steps = WgStrings.launcherSteps(isAr);
-        for (int i = 0; i < steps.length; i++) {
-            TextView stepView = new TextView(this);
-            styleText(stepView, isAr, theme.textSecondary, 13.5f, false);
-            stepView.setLineSpacing(WgTheme.dp(this, 3), 1.0f);
-            stepView.setText(steps[i]);
-            LinearLayout.LayoutParams stepLp = new LinearLayout.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.WRAP_CONTENT
-            );
-            if (i < steps.length - 1) {
-                stepLp.bottomMargin = WgTheme.dp(this, 9);
-            }
-            guideCard.addView(stepView, stepLp);
-        }
-
-        content.addView(guideCard, new LinearLayout.LayoutParams(
+        // 3. Optional Advanced Background Stability Card (collapsed by default)
+        content.addView(buildHybridContinuityCard(isAr, theme, cardPad), new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
         ));
 
         setContentView(screenRoot);
+        if (prevScrollY > 0) {
+            scrollView.post(() -> scrollView.scrollTo(0, prevScrollY));
+        }
+    }
+
+    private void launchQuickWarpFlow(final boolean isAr, final String sourceApk) {
+        if (mQuickWarpBusy) {
+            return;
+        }
+        mQuickWarpBusy = true;
+        renderScreen();
+        new Thread(() -> {
+            try {
+                final WireGuardManager.QuickWarpResult res =
+                        WireGuardManager.quickConnectFreeWarp(this, sourceApk, null, false);
+                mObservedActiveNoHsAtMs = 0L;
+                runOnUiThread(() -> {
+                    mQuickWarpBusy = false;
+                    if (!mDestroyed) {
+                        Toast.makeText(
+                                this,
+                                WgStrings.toastQuickWarpConnected(isAr, res.createdNew, res.localPort),
+                                Toast.LENGTH_SHORT
+                        ).show();
+                        renderScreen();
+                        WireGuardManager.maybeInviteToOfficialChannel(this, isAr);
+                    }
+                });
+            } catch (final Throwable err) {
+                runOnUiThread(() -> {
+                    mQuickWarpBusy = false;
+                    if (!mDestroyed) {
+                        Toast.makeText(this, WgStrings.localizeError(err, isAr), Toast.LENGTH_LONG).show();
+                        renderScreen();
+                    }
+                });
+            }
+        }, "wg-plus-launcher-warp").start();
+    }
+
+    private LinearLayout buildReadinessChecklistCard(
+            final boolean isAr,
+            WgTheme theme,
+            int cardPad,
+            boolean hasProfile,
+            int handshakeStateCode
+    ) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(WgTheme.cardBackground(this, theme.surfaceCard, theme.borderSubtle, 12f));
+        card.setPadding(cardPad, cardPad, cardPad, cardPad);
+
+        TextView heading = new TextView(this);
+        styleText(heading, isAr, theme.textPrimary, 15f, true);
+        heading.setText(WgStrings.readinessHeading(isAr));
+        LinearLayout.LayoutParams hLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        hLp.bottomMargin = WgTheme.dp(this, 10);
+        card.addView(heading, hLp);
+
+        Bundle hookBundle = KeepaliveStatusProvider.readHookTelemetryBundle(this);
+        String hookedPkg = hookBundle.getString(KeepaliveStatusProvider.RESULT_HOOK_PKG, "");
+        boolean hookVerified = hookedPkg != null && !hookedPkg.trim().isEmpty();
+        if (!mGuideUserToggled) {
+            mGuideExpanded = !hookVerified;
+        }
+
+        addChecklistItem(
+                card, isAr, theme,
+                hasProfile ? theme.activeDot : theme.stoppedDot,
+                hasProfile ? theme.textPrimary : theme.textSecondary,
+                WgStrings.readinessItemServer(isAr, hasProfile)
+        );
+        addChecklistItem(
+                card, isAr, theme,
+                hookVerified ? theme.activeDot : theme.pendingDot,
+                hookVerified ? theme.textPrimary : theme.textSecondary,
+                WgStrings.readinessItemHook(isAr, hookedPkg)
+        );
+        int hsDot = (handshakeStateCode == 2)
+                ? theme.activeDot
+                : ((handshakeStateCode == 1 || handshakeStateCode == 3) ? theme.pendingDot : theme.stoppedDot);
+        addChecklistItem(
+                card, isAr, theme,
+                hsDot,
+                handshakeStateCode == 2 ? theme.activeText : theme.textSecondary,
+                WgStrings.readinessItemHandshake(isAr, handshakeStateCode)
+        );
+
+        Button toggleGuideBtn = createActionButton(WgStrings.launcherStepsToggleBtn(isAr, mGuideExpanded), theme, true);
+        toggleGuideBtn.setContentDescription("wgplus_toggle_guide");
+        toggleGuideBtn.setOnClickListener(v -> {
+            mGuideUserToggled = true;
+            mGuideExpanded = !mGuideExpanded;
+            renderScreen();
+        });
+        LinearLayout.LayoutParams tgLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        tgLp.topMargin = WgTheme.dp(this, 6);
+        card.addView(toggleGuideBtn, tgLp);
+
+        if (mGuideExpanded) {
+            LinearLayout guideBox = new LinearLayout(this);
+            guideBox.setOrientation(LinearLayout.VERTICAL);
+            LinearLayout.LayoutParams gbLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            );
+            gbLp.topMargin = WgTheme.dp(this, 10);
+
+            String[] steps = WgStrings.launcherSteps(isAr);
+            for (int i = 0; i < steps.length; i++) {
+                TextView stepView = new TextView(this);
+                styleText(stepView, isAr, theme.textSecondary, 13f, false);
+                stepView.setLineSpacing(WgTheme.dp(this, 3), 1.0f);
+                stepView.setText(steps[i]);
+                LinearLayout.LayoutParams stepLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                );
+                if (i < steps.length - 1) {
+                    stepLp.bottomMargin = WgTheme.dp(this, 7);
+                }
+                guideBox.addView(stepView, stepLp);
+            }
+            card.addView(guideBox, gbLp);
+        }
+
+        Button cleanCacheBtn = createActionButton(WgStrings.cleanCacheBtn(isAr, mCleaningCache), theme, true);
+        cleanCacheBtn.setContentDescription("wgplus_btn_clean_cache");
+        cleanCacheBtn.setEnabled(!mCleaningCache);
+        cleanCacheBtn.setOnClickListener(v -> {
+            if (mCleaningCache) {
+                return;
+            }
+            mCleaningCache = true;
+            renderScreen();
+            new Thread(() -> {
+                KeepaliveStatusProvider.requestRemoteHygieneLocal(this);
+                ModuleHygieneManager.HygieneReport report = ModuleHygieneManager.cleanCachesSafely(this, true);
+                runOnUiThread(() -> {
+                    mCleaningCache = false;
+                    if (!mDestroyed) {
+                        Toast.makeText(
+                                this,
+                                WgStrings.toastCacheCleaned(isAr, report.freedBytes, report.filesDeleted),
+                                Toast.LENGTH_SHORT
+                        ).show();
+                        renderScreen();
+                    }
+                });
+            }, "wgplus-clean-cache").start();
+        });
+        LinearLayout.LayoutParams ccLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        ccLp.topMargin = WgTheme.dp(this, 8);
+        card.addView(cleanCacheBtn, ccLp);
+
+        return card;
+    }
+
+    private void addChecklistItem(
+            LinearLayout parent,
+            boolean isAr,
+            WgTheme theme,
+            int dotColor,
+            int textColor,
+            String text
+    ) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams rLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        rLp.bottomMargin = WgTheme.dp(this, 7);
+
+        View dot = new View(this);
+        int dotPx = WgTheme.dp(this, 8);
+        dot.setBackground(WgTheme.statusDot(this, dotColor));
+        LinearLayout.LayoutParams dLp = new LinearLayout.LayoutParams(dotPx, dotPx);
+        setMarginEnd(dLp, WgTheme.dp(this, 9), isAr);
+        row.addView(dot, dLp);
+
+        TextView tv = new TextView(this);
+        styleText(tv, isAr, textColor, 13.5f, false);
+        tv.setText(text);
+        row.addView(tv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        parent.addView(row, rLp);
     }
 
     private LinearLayout buildHybridContinuityCard(boolean isAr, WgTheme theme, int cardPad) {
@@ -405,14 +668,44 @@ public class ModuleLauncherActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
         );
-        hLp.bottomMargin = WgTheme.dp(this, 8);
+        hLp.bottomMargin = WgTheme.dp(this, 4);
         hybridCard.addView(heading, hLp);
+
+        TextView optNote = new TextView(this);
+        styleText(optNote, isAr, theme.textHint, 12.2f, false);
+        optNote.setText(WgStrings.hybridOptionalNote(isAr));
+        LinearLayout.LayoutParams optLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        optLp.bottomMargin = WgTheme.dp(this, 8);
+        hybridCard.addView(optNote, optLp);
+
+        Button collapseBtn = createActionButton(WgStrings.hybridToggleCardBtn(isAr, mContinuityExpanded), theme, true);
+        collapseBtn.setContentDescription("wgplus_toggle_continuity");
+        collapseBtn.setOnClickListener(v -> {
+            mContinuityExpanded = !mContinuityExpanded;
+            renderScreen();
+        });
+        hybridCard.addView(collapseBtn, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        if (!mContinuityExpanded) {
+            return hybridCard;
+        }
 
         ContinuityBridgeManager.StealthSnapshot snap = ContinuityBridgeManager.captureStatusSnapshot(this);
 
         LinearLayout tierRow = new LinearLayout(this);
         tierRow.setOrientation(LinearLayout.HORIZONTAL);
         tierRow.setGravity(Gravity.CENTER_VERTICAL);
+        LinearLayout.LayoutParams trHeadLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        trHeadLp.topMargin = WgTheme.dp(this, 12);
 
         View dot = new View(this);
         int dotPx = WgTheme.dp(this, 8);
@@ -431,7 +724,7 @@ public class ModuleLauncherActivity extends Activity {
         styleText(tierLabel, isAr, tierColor, 14.5f, true);
         tierLabel.setText(WgStrings.hybridTierLabel(isAr, snap.tier));
         tierRow.addView(tierLabel, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
-        hybridCard.addView(tierRow);
+        hybridCard.addView(tierRow, trHeadLp);
 
         TextView detailView = new TextView(this);
         styleText(detailView, isAr, theme.textSecondary, 12.5f, false);

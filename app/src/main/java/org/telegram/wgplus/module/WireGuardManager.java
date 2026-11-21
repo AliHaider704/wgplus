@@ -91,6 +91,18 @@ public final class WireGuardManager {
     private static volatile long sLastStealthQueryMs;
     private static volatile boolean sLastStealthProtected;
     private static volatile boolean sLastStealthWantsAwake;
+    private static volatile long sTunnelStartedAtMs;
+    private static volatile long sLastRemoteHygieneCheckMs;
+    private static volatile long sLastHandledHygieneReqMs;
+    private static final String KEY_SHARED_STATE_REV = "wg_shared_state_rev";
+    private static final ExecutorService SYNC_EXEC = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(r, "wgplus-shared-sync");
+        t.setDaemon(true);
+        return t;
+    });
+    private static volatile Context sSyncContext;
+    private static volatile boolean sSuppressSyncPush;
+    private static volatile long sLastSyncPullMs;
 
     // Legacy v1.1.0 single-profile keys (transparently migrated once)
     public static final String KEY_PRIVATE_KEY = "wg_private_key";
@@ -102,6 +114,33 @@ public final class WireGuardManager {
 
     public static final String KEY_UI_LANG = "wg_ui_lang";
     public static final String KEY_UI_DARK = "wg_ui_dark";
+    public static final String OFFICIAL_CHANNEL_URL = "https://t.me/wgplus_official";
+    private static final String KEY_CHANNEL_INVITED_V1 = "wg_channel_invited_v1";
+
+    public static void maybeInviteToOfficialChannel(final Context ctx, final boolean isAr) {
+        if (ctx == null) {
+            return;
+        }
+        try {
+            SharedPreferences prefs = getPrefs(ctx);
+            if (prefs.getBoolean(KEY_CHANNEL_INVITED_V1, false)) {
+                return;
+            }
+            prefs.edit().putBoolean(KEY_CHANNEL_INVITED_V1, true).apply();
+            final Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
+            Handler h = new Handler(Looper.getMainLooper());
+            Toast.makeText(ctx, WgStrings.channelInviteNotice(isAr), Toast.LENGTH_LONG).show();
+            h.postDelayed(() -> {
+                try {
+                    Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(OFFICIAL_CHANNEL_URL));
+                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    appCtx.startActivity(i);
+                } catch (Throwable ignored) {
+                }
+            }, 700L);
+        } catch (Throwable ignored) {
+        }
+    }
 
     // Snapshot keys to cleanly restore any pre-existing user proxy in Telegram's mainconfig
     private static final String KEY_MC_SNAPSHOT_TAKEN = "wg_mc_snapshot_taken";
@@ -346,7 +385,184 @@ public final class WireGuardManager {
     }
 
     public static SharedPreferences getPrefs(Context context) {
+        if (context != null && sSyncContext == null) {
+            Context app = context.getApplicationContext();
+            sSyncContext = app != null ? app : context;
+        }
         return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+    }
+
+    public static synchronized String exportSharedSyncBundleJson(Context context) {
+        if (context == null) {
+            return "{}";
+        }
+        SharedPreferences prefs = getPrefs(context);
+        List<TunnelConfig> profiles = loadProfiles(context);
+        JSONObject root = new JSONObject();
+        try {
+            root.put("stateRev", prefs.getLong(KEY_SHARED_STATE_REV, 0L));
+            root.put("activeProfileId", prefs.getString(KEY_ACTIVE_PROFILE_ID, ""));
+            root.put("enabled", isAutoConnectEnabled(context));
+            root.put("routeCalls", isRouteCallsEnabled(context));
+            root.put("killSwitch", isKillSwitchEnabled(context));
+            root.put("autoFailover", isAutoFailoverEnabled(context));
+            root.put("dohEnabled", isDohEnabled(context));
+            root.put("smartKeepalive", isSmartKeepaliveEnabled(context));
+            root.put("uiLang", prefs.getString(KEY_UI_LANG, ""));
+            root.put("uiDark", prefs.contains(KEY_UI_DARK) ? (prefs.getBoolean(KEY_UI_DARK, true) ? 1 : 0) : -1);
+            JSONArray arr = new JSONArray();
+            for (TunnelConfig cfg : profiles) {
+                arr.put(configToJsonObject(cfg, false));
+            }
+            root.put("profiles", arr);
+        } catch (Throwable ignored) {
+        }
+        return root.toString();
+    }
+
+    public static synchronized long importSharedSyncBundleJson(Context context, String rawJson, boolean keepIncomingRev) {
+        if (context == null || rawJson == null || rawJson.trim().isEmpty()) {
+            return -1L;
+        }
+        try {
+            JSONObject root = new JSONObject(rawJson);
+            SharedPreferences prefs = getPrefs(context);
+            long localRev = prefs.getLong(KEY_SHARED_STATE_REV, 0L);
+            long incomingRev = root.optLong("stateRev", 0L);
+            if (keepIncomingRev && incomingRev <= localRev && hasAnyConfiguredProfile(context)) {
+                return localRev;
+            }
+            JSONArray arr = root.optJSONArray("profiles");
+            List<TunnelConfig> profiles = new ArrayList<>();
+            if (arr != null) {
+                for (int i = 0; i < arr.length(); i++) {
+                    JSONObject item = arr.optJSONObject(i);
+                    if (item != null) {
+                        TunnelConfig cfg = configFromJsonObject(item, false);
+                        if (cfg != null) {
+                            profiles.add(cfg);
+                        }
+                    }
+                }
+            }
+            long nextRev = keepIncomingRev ? incomingRev : Math.max(localRev + 1L, incomingRev + 1L);
+            sSuppressSyncPush = true;
+            try {
+                boolean enabled = root.optBoolean("enabled", isAutoConnectEnabled(context));
+                boolean routeCalls = root.optBoolean("routeCalls", isRouteCallsEnabled(context));
+                String activeId = root.optString("activeProfileId", "");
+                if (activeId.isEmpty() && !profiles.isEmpty()) {
+                    activeId = profiles.get(0).id;
+                }
+                if (!profiles.isEmpty()) {
+                    persistProfilesLocked(prefs, profiles, activeId, enabled, routeCalls);
+                }
+                SharedPreferences.Editor ed = prefs.edit()
+                        .putLong(KEY_SHARED_STATE_REV, nextRev)
+                        .putBoolean(KEY_ENABLED, enabled)
+                        .putBoolean(KEY_ROUTE_CALLS, routeCalls)
+                        .putBoolean(KEY_KILL_SWITCH, root.optBoolean("killSwitch", false))
+                        .putBoolean(KEY_AUTO_FAILOVER, root.optBoolean("autoFailover", false))
+                        .putBoolean(KEY_DOH_ENABLED, root.optBoolean("dohEnabled", true))
+                        .putBoolean(KEY_SMART_KEEPALIVE, root.optBoolean("smartKeepalive", false))
+                        .putBoolean(KEY_MIGRATED_FORCED_CONTINUITY_V1, true);
+                String uiLang = root.optString("uiLang", "");
+                if (!uiLang.isEmpty()) {
+                    ed.putString(KEY_UI_LANG, uiLang);
+                }
+                int uiDark = root.optInt("uiDark", -1);
+                if (uiDark == 0 || uiDark == 1) {
+                    ed.putBoolean(KEY_UI_DARK, uiDark == 1);
+                }
+                ed.commit();
+            } finally {
+                sSuppressSyncPush = false;
+            }
+            return nextRev;
+        } catch (Throwable ignored) {
+            return -1L;
+        }
+    }
+
+    public static boolean syncPullSharedStateFromProvider(Context context, boolean force) {
+        if (context == null || "org.telegram.wgplus.module".equals(context.getPackageName())) {
+            return false;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (!force && now - sLastSyncPullMs < 8_000L) {
+            return false;
+        }
+        sLastSyncPullMs = now;
+        try {
+            Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+            Bundle res = appCtx.getContentResolver().call(
+                    STATUS_PROVIDER_URI,
+                    KeepaliveStatusProvider.METHOD_SYNC_PULL_STATE,
+                    appCtx.getPackageName(),
+                    null
+            );
+            if (res == null) {
+                return false;
+            }
+            String json = res.getString(KeepaliveStatusProvider.RESULT_JSON, "");
+            if (json == null || json.isEmpty()) {
+                return false;
+            }
+            JSONObject obj = new JSONObject(json);
+            long remoteRev = obj.optLong("stateRev", 0L);
+            long localRev = getPrefs(appCtx).getLong(KEY_SHARED_STATE_REV, 0L);
+            JSONArray remoteProfiles = obj.optJSONArray("profiles");
+            boolean remoteHasPeer = false;
+            if (remoteProfiles != null) {
+                for (int i = 0; i < remoteProfiles.length(); i++) {
+                    JSONObject p = remoteProfiles.optJSONObject(i);
+                    if (p != null && !p.optString("endpoint", "").trim().isEmpty()) {
+                        remoteHasPeer = true;
+                        break;
+                    }
+                }
+            }
+            if (remoteRev > localRev || (remoteHasPeer && !hasAnyConfiguredProfile(appCtx))) {
+                long applied = importSharedSyncBundleJson(appCtx, json, true);
+                return applied >= 0L;
+            }
+            if (remoteRev == 0L && !remoteHasPeer && hasAnyConfiguredProfile(appCtx)) {
+                scheduleSyncPushToProvider(appCtx);
+            }
+        } catch (Throwable ignored) {
+        }
+        return false;
+    }
+
+    public static void scheduleSyncPushToProvider(Context context) {
+        if (sSuppressSyncPush) {
+            return;
+        }
+        final Context appCtx = context != null
+                ? (context.getApplicationContext() != null ? context.getApplicationContext() : context)
+                : sSyncContext;
+        if (appCtx == null) {
+            return;
+        }
+        SharedPreferences prefs = getPrefs(appCtx);
+        long nextRev = prefs.getLong(KEY_SHARED_STATE_REV, 0L) + 1L;
+        prefs.edit().putLong(KEY_SHARED_STATE_REV, nextRev).apply();
+        if ("org.telegram.wgplus.module".equals(appCtx.getPackageName())) {
+            return;
+        }
+        SYNC_EXEC.execute(() -> {
+            try {
+                Bundle extras = new Bundle();
+                extras.putString(KeepaliveStatusProvider.EXTRA_JSON, exportSharedSyncBundleJson(appCtx));
+                appCtx.getContentResolver().call(
+                        STATUS_PROVIDER_URI,
+                        KeepaliveStatusProvider.METHOD_SYNC_PUSH_STATE,
+                        appCtx.getPackageName(),
+                        extras
+                );
+            } catch (Throwable ignored) {
+            }
+        });
     }
 
     public static Integer getCachedPingMs(String profileId) {
@@ -354,6 +570,69 @@ public final class WireGuardManager {
             return null;
         }
         return sPingCacheMs.get(profileId);
+    }
+
+    public static void clearRuntimePingCache() {
+        sPingCacheMs.clear();
+    }
+
+    public static long getTunnelStartedAtMs() {
+        return sTunnelStartedAtMs;
+    }
+
+    public static void reportHookActiveToProvider(Context context, String hostPkg) {
+        if (context == null || hostPkg == null || hostPkg.isEmpty()) {
+            return;
+        }
+        try {
+            Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+            appCtx.getContentResolver().call(
+                    STATUS_PROVIDER_URI,
+                    KeepaliveStatusProvider.METHOD_REPORT_HOOK_ACTIVE,
+                    hostPkg,
+                    null
+            );
+        } catch (Throwable ignored) {
+        }
+    }
+
+    public static Bundle queryHookStatusFromProvider(Context context) {
+        if (context == null || Looper.myLooper() == Looper.getMainLooper()) {
+            return null;
+        }
+        try {
+            Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+            return appCtx.getContentResolver().call(
+                    STATUS_PROVIDER_URI,
+                    KeepaliveStatusProvider.METHOD_QUERY_HOOK_STATUS,
+                    appCtx.getPackageName(),
+                    null
+            );
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    public static void pollAndRunRemoteHygieneIfRequested(Context context) {
+        if (context == null || Looper.myLooper() == Looper.getMainLooper()) {
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (now - sLastRemoteHygieneCheckMs < 15_000L) {
+            return;
+        }
+        sLastRemoteHygieneCheckMs = now;
+        try {
+            Bundle b = queryHookStatusFromProvider(context);
+            if (b != null) {
+                long reqTs = b.getLong(KeepaliveStatusProvider.RESULT_HYGIENE_REQ_MS, 0L);
+                if (reqTs > 0L && reqTs > sLastHandledHygieneReqMs) {
+                    sLastHandledHygieneReqMs = reqTs;
+                    ModuleHygieneManager.cleanCachesSafely(context, true);
+                }
+            }
+        } catch (Throwable ignored) {
+        }
     }
 
     public static boolean isArabic(Context context) {
@@ -370,6 +649,7 @@ public final class WireGuardManager {
         getPrefs(context).edit()
                 .putString(KEY_UI_LANG, arabic ? WgStrings.LANG_AR : WgStrings.LANG_EN)
                 .apply();
+        scheduleSyncPushToProvider(context);
     }
 
     public static boolean isDarkTheme(Context context) {
@@ -389,6 +669,7 @@ public final class WireGuardManager {
 
     public static void setDarkTheme(Context context, boolean dark) {
         getPrefs(context).edit().putBoolean(KEY_UI_DARK, dark).apply();
+        scheduleSyncPushToProvider(context);
     }
 
     public static boolean isAutoConnectEnabled(Context context) {
@@ -397,6 +678,7 @@ public final class WireGuardManager {
 
     public static void setEnabled(Context context, boolean enabled) {
         getPrefs(context).edit().putBoolean(KEY_ENABLED, enabled).apply();
+        scheduleSyncPushToProvider(context);
     }
 
     public static boolean isRouteCallsEnabled(Context context) {
@@ -405,6 +687,7 @@ public final class WireGuardManager {
 
     public static void setRouteCallsEnabled(Context context, boolean routeCalls) {
         getPrefs(context).edit().putBoolean(KEY_ROUTE_CALLS, routeCalls).apply();
+        scheduleSyncPushToProvider(context);
     }
 
     public static boolean isKillSwitchEnabled(Context context) {
@@ -421,6 +704,7 @@ public final class WireGuardManager {
             return;
         }
         getPrefs(context).edit().putBoolean(KEY_KILL_SWITCH, enabled).commit();
+        scheduleSyncPushToProvider(context);
         if (isTunnelRunning(context, moduleApkPath)) {
             return;
         }
@@ -445,6 +729,7 @@ public final class WireGuardManager {
             return;
         }
         getPrefs(context).edit().putBoolean(KEY_AUTO_FAILOVER, enabled).commit();
+        scheduleSyncPushToProvider(context);
         if (isTunnelRunning(context, moduleApkPath)) {
             startFailoverMonitor(context, moduleApkPath, telegramClassLoader);
         }
@@ -457,6 +742,7 @@ public final class WireGuardManager {
     public static void setDohEnabled(Context context, boolean enabled) {
         if (context != null) {
             getPrefs(context).edit().putBoolean(KEY_DOH_ENABLED, enabled).apply();
+            scheduleSyncPushToProvider(context);
         }
     }
 
@@ -483,6 +769,7 @@ public final class WireGuardManager {
                 .putBoolean(KEY_SMART_KEEPALIVE, enabled)
                 .putBoolean(KEY_MIGRATED_FORCED_CONTINUITY_V1, true)
                 .apply();
+        scheduleSyncPushToProvider(context);
         if (!enabled && sKeepalivePausedForIdle) {
             restoreActiveKeepaliveNow(context, moduleApkPath);
         }
@@ -603,11 +890,19 @@ public final class WireGuardManager {
             return false;
         }
         long now = SystemClock.elapsedRealtime();
-        if (!forceFresh && wantsAwake == sLastStealthWantsAwake && (now - sLastStealthQueryMs) < 1500L) {
+        if (!forceFresh && wantsAwake == sLastStealthWantsAwake && (now - sLastStealthQueryMs) < 60_000L) {
+            return sLastStealthProtected;
+        }
+        final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        // Never block the host app UI thread on synchronous ContentProvider Binder IPC
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            if (now - sLastStealthQueryMs >= 10_000L) {
+                sLastStealthQueryMs = now;
+                getGuardianExecutor().execute(() -> queryAndSyncStealthContinuity(appCtx, wantsAwake, true));
+            }
             return sLastStealthProtected;
         }
         try {
-            Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
             Bundle extras = new Bundle();
             extras.putInt(KeepaliveStatusProvider.EXTRA_PID, Process.myPid());
             extras.putBoolean(KeepaliveStatusProvider.EXTRA_WANTS_ALWAYS_AWAKE, wantsAwake);
@@ -1030,6 +1325,19 @@ public final class WireGuardManager {
         return addedCount;
     }
 
+    public static synchronized boolean hasAnyConfiguredProfile(Context context) {
+        if (context == null) {
+            return false;
+        }
+        List<TunnelConfig> profiles = loadProfiles(context);
+        for (TunnelConfig p : profiles) {
+            if (p != null && p.hasPeerConfigured()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static synchronized TunnelConfig loadConfig(Context context) {
         List<TunnelConfig> profiles = loadProfiles(context);
         String activeId = getPrefs(context).getString(KEY_ACTIVE_PROFILE_ID, "");
@@ -1074,6 +1382,7 @@ public final class WireGuardManager {
         for (TunnelConfig p : profiles) {
             if (p.id.equals(profileId)) {
                 prefs.edit().putString(KEY_ACTIVE_PROFILE_ID, p.id).commit();
+                scheduleSyncPushToProvider(context);
                 return p.copy();
             }
         }
@@ -1223,6 +1532,7 @@ public final class WireGuardManager {
                 .putBoolean(KEY_ENABLED, enabled)
                 .putBoolean(KEY_ROUTE_CALLS, routeCalls)
                 .commit();
+        scheduleSyncPushToProvider(null);
     }
 
     private static String sanitizeSuggestedName(String raw) {
@@ -1657,6 +1967,26 @@ public final class WireGuardManager {
         return res;
     }
 
+    public static int applyAwg15AndReconnect(
+            Context context,
+            String moduleApkPath,
+            ClassLoader telegramClassLoader
+    ) throws Exception {
+        TunnelConfig cfg = getConnectedProfile(context, moduleApkPath);
+        if (cfg == null || !cfg.hasPeerConfigured()) {
+            cfg = loadConfig(context);
+        }
+        if (cfg == null || !cfg.hasPeerConfigured()) {
+            throw new WgStrings.WgException(WgStrings.ErrorCode.MISSING_ENDPOINT);
+        }
+        cfg.jc = 4;
+        cfg.jmin = 40;
+        cfg.jmax = 120;
+        cfg.i1 = "<b 0xc70000000108><r 8><b 0x0000449e><r 1200>";
+        saveConfig(context, cfg);
+        return startAndBindProfile(context, cfg, moduleApkPath, telegramClassLoader);
+    }
+
     public static int startAndBind(Context context, String moduleApkPath, ClassLoader telegramClassLoader) throws Exception {
         TunnelConfig cfg = loadConfig(context);
         return startAndBindProfile(context, cfg, moduleApkPath, telegramClassLoader);
@@ -1767,6 +2097,7 @@ public final class WireGuardManager {
         int localPort = (int) portLong;
 
         sConnectedProfileId = cfg.id;
+        sTunnelStartedAtMs = SystemClock.elapsedRealtime();
         sActiveTunnelMtu = mtu;
         sLastActiveNetworkSignature = computeActiveNetworkSignature(context);
         sLastRoamingUpdateMs = System.currentTimeMillis();
@@ -1799,6 +2130,7 @@ public final class WireGuardManager {
         unregisterNetworkWatchdog(context);
         releaseForcedContinuityLocks();
         sConnectedProfileId = "";
+        sTunnelStartedAtMs = 0L;
         sKeepalivePausedForIdle = false;
         sLastActiveNetworkSignature = "";
         sActiveTunnelMtu = 1280;

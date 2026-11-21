@@ -291,6 +291,10 @@ public class WgPlusFeatureSuiteTest {
                     assertFalse("Banned buzzword '" + buzz + "' in " + name + ": " + out, lower.contains(buzz));
                 }
 
+                // Official Arabic spelling from Google Play
+                assertFalse("Non-standard Telegram spelling in " + name + ": " + out,
+                        out.contains("تليجرام") || out.contains("تيليغرام"));
+
                 if ("langToggleLabel".equals(name)) {
                     if (ar) {
                         assertEquals("English", out);
@@ -315,6 +319,22 @@ public class WgPlusFeatureSuiteTest {
             }
         }
         assertTrue("Expected at least 60 localized methods checked, got " + checkedMethods, checkedMethods >= 60);
+
+        for (boolean ar : new boolean[]{true, false}) {
+            String[] steps = WgStrings.launcherSteps(ar);
+            assertEquals(4, steps.length);
+            for (String step : steps) {
+                assertFalse("Em dash in launcherStep: " + step, step.contains("\u2014"));
+                assertFalse("Non-standard Telegram spelling in launcherStep: " + step,
+                        step.contains("تليجرام") || step.contains("تيليغرام"));
+                if (ar) {
+                    String stripped = isolateSpan.matcher(step).replaceAll("");
+                    assertFalse("Latin leak in AR launcherStep: " + step, latinLetters.matcher(stripped).find());
+                } else {
+                    assertFalse("Arabic leak in EN launcherStep: " + step, arabicLetters.matcher(step).find());
+                }
+            }
+        }
 
         // Default profile names ("خادم N" / "Server N") must dynamically localize across languages
         assertEquals("Server 1", WgStrings.localizeProfileName("خادم 1", false));
@@ -430,7 +450,7 @@ public class WgPlusFeatureSuiteTest {
 
     @Test
     public void testHybridContinuityTierResolutionAndVersionLabel() {
-        assertEquals("1.7.0", WgStrings.VERSION_LABEL);
+        assertEquals("1.7.3", WgStrings.VERSION_LABEL);
 
         assertEquals(
                 ContinuityBridgeManager.ContinuityTier.HYBRID_FULL,
@@ -594,6 +614,50 @@ public class WgPlusFeatureSuiteTest {
         assertEquals(sampleI1, restored.get(0).i1);
         assertEquals("12,34,56", restored.get(0).reserved);
         assertTrue(restored.get(0).isWarp);
+    }
+
+    @Test
+    public void testSafeCacheHygieneWhitelistAndNewUiStateStrings() {
+        assertTrue(ModuleHygieneManager.isSafeCachePath("tgcache/photo_123.jpg"));
+        assertTrue(ModuleHygieneManager.isSafeCachePath("/data/user/0/org.telegram.plus/cache/thumb_tmp.webp"));
+        assertFalse(ModuleHygieneManager.isSafeCachePath(""));
+        assertFalse(ModuleHygieneManager.isSafeCachePath(null));
+
+        String[] protectedPaths = new String[]{
+                "/data/user/0/org.telegram.plus/files/lspatch/origin.apk",
+                "/data/user/0/org.telegram.plus/cache/xposed_meta",
+                "/data/user/0/org.telegram.plus/cache/classes.dex",
+                "/data/user/0/org.telegram.plus/oat/arm64/base.oat",
+                "/data/user/0/org.telegram.plus/app_webview/Default",
+                "/data/user/0/org.telegram.plus/databases/cache4.db",
+                "/data/user/0/org.telegram.plus/shared_prefs/wg_plus_isolated_prefs.xml",
+                "/data/user/0/org.telegram.plus/files/wg_native/libgojni.so",
+                "/data/user/0/org.telegram.plus/files/televip/config.json"
+        };
+        for (String p : protectedPaths) {
+            assertFalse("Protected path must NEVER be treated as disposable cache: " + p,
+                    ModuleHygieneManager.isSafeCachePath(p));
+        }
+
+        for (boolean ar : new boolean[]{true, false}) {
+            for (int st = 0; st <= 3; st++) {
+                String item = WgStrings.readinessItemHandshake(ar, st);
+                assertFalse(item.isEmpty());
+                assertFalse(item.contains("\u2014"));
+                assertFalse(item.contains("تليجرام") || item.contains("تيليغرام"));
+            }
+            assertFalse(WgStrings.readinessItemServer(ar, true).isEmpty());
+            assertFalse(WgStrings.readinessItemServer(ar, false).isEmpty());
+            assertFalse(WgStrings.readinessItemHook(ar, "org.telegram.plus").isEmpty());
+            assertFalse(WgStrings.readinessItemHook(ar, "").isEmpty());
+            assertFalse(WgStrings.statusAwaitingHandshakeWithProfile(ar, "WARP").isEmpty());
+            assertFalse(WgStrings.statusStalledWithProfile(ar, "WARP").isEmpty());
+            assertFalse(WgStrings.recoverAwgBtn(ar).isEmpty());
+            assertFalse(WgStrings.cleanCacheBtn(ar, false).isEmpty());
+            assertFalse(WgStrings.cleanCacheBtn(ar, true).isEmpty());
+            assertFalse(WgStrings.toastCacheCleaned(ar, 1024L * 1024L, 5).isEmpty());
+            assertFalse(WgStrings.toastCacheCleaned(ar, 0L, 0).isEmpty());
+        }
     }
 
     private static double contrastRatio(int rgb1, int rgb2) {

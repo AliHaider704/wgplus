@@ -2,6 +2,23 @@
 
 All notable changes to **WireGuard Plus** (`Windows Desktop` & `Android org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [1.7.3] - 2026-11-21
+
+### Added
+- **Multi-Client Simultaneous Support & Shared Config Sync (`KeepaliveStatusProvider`, `WireGuardManager`)**: Expanded Android module scope to **Telegram**, **Telegram Plus** (`v12.8.1.0+`), **Telegram Web**, **Telegram Beta**, **Telegram Gold**, **Telegraph**, **AyuGram**, and **Telegram X** (`TelegramXBridge`), syncing server profiles, active profile, Kill Switch, auto-connect, DoH, and call settings across all clients simultaneously.
+- **Android Adaptive Launcher Icon**: Added crisp dark-slate & blue/emerald adaptive icon assets across `mipmap-*` densities.
+- **Lightweight Non-Root Startup & Safe Cache Hygiene (`ModuleHygieneManager`, `NativeBridgeLoader`)**: Offloaded native library loading and auto-connect off the Telegram UI thread, plus safe temporary cache cleanup protecting LSPatch/Xposed, databases, prefs, and DEX/OAT caches.
+- **Headless Automation APIs & Build Metadata**: Added `automation_status`, `automation_quick_warp`, `automation_import_conf`, `automation_clean_cache` and `dist/android-build-meta.json`.
+- **Official Telegram Channel Invite**: Added a polite one-time notice and link to [`t.me/wgplus_official`](https://t.me/wgplus_official) after first successful connection on Android and Windows.
+
+### Changed
+- **73% Android APK Size Reduction**: Enabled R8 minification (`minifyEnabled true`), `shrinkResources true`, NDK `llvm-strip --strip-unneeded`, `gomobile -trimpath -ldflags="-s -w -buildid="`, BouncyCastle PQC table excludes, and ABI splits (`5.08 MB` arm64-v8a / `5.04 MB` armeabi-v7a / `11.26 MB` universal vs `18.82 MB` previously).
+- **Bilingual MSA (`تيليجرام`) & Progressive UI Overhaul**: Refined zero-state onboarding, single primary CTA rule, 3-state handshake diagnostics with inline AWG 1.5/WARP recovery, and zero language leakage across Android & Windows.
+- **8K Showcase Assets**: Regenerated `docs/assets/` showcase banners, Android/Windows screens, and `WireGuardPlus-Windows-Walkthrough.mp4` at 8K (`7680x4320`).
+
+### Fixed
+- **Eliminated Repeated Magisk Superuser Toasts (`PrivilegeBridge`, `ContinuityBridgeManager`)**: Consolidated root daemon bootstrap into a single per-boot `su -c` call (`bootstrapRootOncePerBoot`) with Binder IPC afterwards.
+
 ## [1.7.1] - 2026-11-20
 
 ### Fixed

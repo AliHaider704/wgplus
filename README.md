@@ -24,15 +24,16 @@
 
 ---
 
-## Downloads (`v1.7.2`)
+## Downloads (`v1.7.3`)
 
 | Platform | Download | Requirements | Notes |
 |----------|----------|--------------|-------|
 | **Windows Desktop (Single `.exe`)** | [`WireGuardPlus-Windows-x64.exe`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64.exe) | Windows 10/11 x64, Zero Admin | Single executable, DPAPI vault, System Tray |
 | **Windows Portable (`.zip`)** | [`WireGuardPlus-Windows-x64-Portable.zip`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64-Portable.zip) | Windows 10/11 x64, USB/folder | Includes `portable.flag`, zero AppData writes |
-| **Android (LSPatch / LSPosed)** | [`WireGuardPlus-1.7.2.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.2.apk) | Android 5.0+ (11+ silent pairing) | Rootless via LSPatch or Rooted via LSPosed |
+| **Android ARM64 (`5.08 MB`, Recommended)** | [`WireGuardPlus-1.7.3-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.3-arm64-v8a.apk) | Android 5.0+ (arm64-v8a) | Rootless via LSPatch or Rooted via LSPosed |
+| **Android Universal (`11.26 MB`)** | [`WireGuardPlus-1.7.3.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.3.apk) | Android 5.0+ (arm64 + armv7a) | Universal fallback + auto-updater compatible |
 
-Verify any download against [`SHA256SUMS.txt`](https://github.com/AliHaider704/wgplus/releases/latest/download/SHA256SUMS.txt) or watch the [Windows Walkthrough Video (`MP4`)](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-Walkthrough.mp4).
+Verify any download against [`SHA256SUMS.txt`](https://github.com/AliHaider704/wgplus/releases/latest/download/SHA256SUMS.txt), watch the [8K Walkthrough Video (`MP4`)](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-Walkthrough.mp4), or join our [Official Telegram Channel](https://t.me/wgplus_official).
 
 ---
 
@@ -142,7 +143,7 @@ Requires **Windows 10/11 (x64)** (WebView2 runtime is pre-installed on Windows 1
 
 Requires **Android 5.0+** (**Android 11+** for one-time silent Wireless Debugging activation).
 
-1. Download [`WireGuardPlus-1.7.2.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.2.apk).
+1. Download [`WireGuardPlus-1.7.3-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.3-arm64-v8a.apk) (`5.08 MB`) or [`WireGuardPlus-1.7.3.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.3.apk) (universal).
 2. **Rootless (LSPatch):** Patch **Telegram Plus** (`org.telegram.plus`) or **Telegram** (`org.telegram.messenger`) using [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch) in **Portable** (embed WireGuard Plus + any other modules such as TeleVip) or **Local** mode, then install and open **WireGuard Plus** for one-time 6-digit Wireless Debugging pairing.
    - **Rooted (LSPosed):** Enable **WireGuard Plus** in **LSPosed -> Modules**, scope Telegram Plus / Telegram, reopen Telegram, and grant Root in WireGuard Plus for silent continuity.
 3. Open **Telegram -> Settings -> Data and Storage -> Proxy Settings -> WireGuard**, import your `.conf` / QR screenshot / clipboard, tap **Connect**, and run **Verify route & calls**.

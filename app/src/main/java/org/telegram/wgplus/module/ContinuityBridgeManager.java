@@ -45,7 +45,11 @@ public final class ContinuityBridgeManager {
             PKG_OFFICIAL,
             PKG_GOLD,
             "org.telegram.messenger.beta",
-            "org.telegram.messenger.web"
+            "org.telegram.messenger.web",
+            "ir.ilmili.telegraph",
+            "ir.p2021.telegraph",
+            "com.radolyn.ayugram",
+            "org.thunderdog.challegram"
     );
 
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor();
@@ -126,6 +130,19 @@ public final class ContinuityBridgeManager {
         notifyInstalledTelegramServices(context);
     }
 
+    public static List<String> getInstalledTargetPackages(Context context) {
+        if (context == null) {
+            return Collections.emptyList();
+        }
+        ArrayList<String> installed = new ArrayList<>();
+        for (String pkg : DEFAULT_TARGET_PACKAGES) {
+            if (isPackageInstalled(context, pkg) && !installed.contains(pkg)) {
+                installed.add(pkg);
+            }
+        }
+        return installed;
+    }
+
     public static Set<String> getWantedPackages(Context context) {
         if (context == null) {
             return Collections.emptySet();
@@ -134,15 +151,10 @@ public final class ContinuityBridgeManager {
         HashSet<String> result = new HashSet<>();
         if (stored != null && !stored.isEmpty()) {
             result.addAll(stored);
-        } else {
-            if (isPackageInstalled(context, PKG_PLUS)) {
-                result.add(PKG_PLUS);
-            }
-            if (isPackageInstalled(context, PKG_OFFICIAL)) {
-                result.add(PKG_OFFICIAL);
-            }
-            if (isPackageInstalled(context, PKG_GOLD)) {
-                result.add(PKG_GOLD);
+        }
+        for (String pkg : DEFAULT_TARGET_PACKAGES) {
+            if (isPackageInstalled(context, pkg)) {
+                result.add(pkg);
             }
         }
         return result;
@@ -201,11 +213,11 @@ public final class ContinuityBridgeManager {
     }
 
     public static String getActivePrivilegeMode(Context context) {
-        if (PrivilegeBridge.hasRootAccess()) {
-            return "ROOT";
-        }
         if (context != null && PrivilegeBridge.isStandaloneDaemonAlive(context)) {
-            return "WGPLUS_DAEMON";
+            return PrivilegeBridge.getLastDaemonUid() == 0 ? "ROOT_DAEMON" : "WGPLUS_DAEMON";
+        }
+        if (PrivilegeBridge.isRootAvailablePassive(context)) {
+            return "ROOT";
         }
         if (context != null && PrivilegeBridge.hasSelfProcessLimitPermission(context)) {
             return BuiltinAdbKeyManager.isPaired(context) ? "BUILTIN_ADB_SELF" : "SELF_PRIVILEGED";
@@ -221,7 +233,7 @@ public final class ContinuityBridgeManager {
     }
 
     public static boolean hasAnyPrivilegeBackend(Context context) {
-        if (PrivilegeBridge.hasRootAccess()) {
+        if (PrivilegeBridge.isRootAvailablePassive(context)) {
             return true;
         }
         if (context == null) {
@@ -229,7 +241,8 @@ public final class ContinuityBridgeManager {
         }
         return PrivilegeBridge.hasSelfProcessLimitPermission(context)
                 || PrivilegeBridge.isStandaloneDaemonAlive(context)
-                || BuiltinAdbKeyManager.isPaired(context);
+                || BuiltinAdbKeyManager.isPaired(context)
+                || PrivilegeBridge.hasRootBinaryOnDisk();
     }
 
     public static void registerPassiveWifiRecovery(Context context) {
@@ -255,18 +268,19 @@ public final class ContinuityBridgeManager {
                     if (!isStealthHybridEnabled(appCtx)) {
                         return;
                     }
-                    if (!BuiltinAdbKeyManager.isPaired(appCtx) && !PrivilegeBridge.hasRootAccess()) {
+                    if (!BuiltinAdbKeyManager.isPaired(appCtx) && !PrivilegeBridge.isRootAvailablePassive(appCtx)) {
                         return;
                     }
                     WORKER.execute(() -> {
                         try {
                             if (!PrivilegeBridge.isStandaloneDaemonAlive(appCtx)) {
-                                if (PrivilegeBridge.hasRootAccess()) {
-                                    PrivilegeBridge.bootstrapStandaloneDaemonAsync(appCtx, new ArrayList<>(getWantedPackages(appCtx)));
+                                if (PrivilegeBridge.isRootAvailablePassive(appCtx)) {
+                                    List<String> pkgs = collectInstalledTargetsAndModule(appCtx);
+                                    String listenerComp = appCtx.getPackageName() + "/" + KeepaliveBridgeListenerService.class.getName();
+                                    PrivilegeBridge.bootstrapRootOncePerBoot(appCtx, pkgs, listenerComp, true);
                                 } else {
                                     WgAdbConnectionManager.getInstance(appCtx).bootstrapSovereignShell(true);
                                 }
-                                activateHybridOneTap(appCtx);
                             }
                         } catch (Throwable ignored) {
                         }
@@ -289,16 +303,6 @@ public final class ContinuityBridgeManager {
             return;
         }
         activateHybridOneTap(appCtx);
-        if (!PrivilegeBridge.isStandaloneDaemonAlive(appCtx)) {
-            if (PrivilegeBridge.hasRootAccess()) {
-                PrivilegeBridge.bootstrapStandaloneDaemonAsync(appCtx, new ArrayList<>(getWantedPackages(appCtx)));
-            } else if (BuiltinAdbKeyManager.isPaired(appCtx)) {
-                try {
-                    WgAdbConnectionManager.getInstance(appCtx).bootstrapSovereignShell(true);
-                } catch (Throwable ignored) {
-                }
-            }
-        }
     }
 
     public static StealthSnapshot ensureStealthProtection(
@@ -324,11 +328,11 @@ public final class ContinuityBridgeManager {
         }
         boolean listenerConnected = KeepaliveBridgeListenerService.isConnected();
 
-        boolean rootReady = PrivilegeBridge.hasRootAccess();
-        boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
         boolean daemonAlive = PrivilegeBridge.isStandaloneDaemonAlive(appCtx);
+        boolean rootReady = PrivilegeBridge.isRootAvailablePassive(appCtx);
+        boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
         boolean builtinAdbPaired = BuiltinAdbKeyManager.isPaired(appCtx);
-        boolean privilegeReady = rootReady || selfPrivileged || daemonAlive || builtinAdbPaired;
+        boolean privilegeReady = daemonAlive || rootReady || selfPrivileged || builtinAdbPaired;
 
         if (!stealthEnabled || !wantsAlwaysAwake) {
             if (targetPid > 0 && privilegeReady && sElevatedPids.containsKey(targetPid)) {
@@ -392,11 +396,11 @@ public final class ContinuityBridgeManager {
         boolean listenerEnabled = KeepaliveBridgeListenerService.isNotificationListenerEnabled(appCtx);
         boolean listenerConnected = KeepaliveBridgeListenerService.isConnected();
 
-        boolean rootReady = PrivilegeBridge.hasRootAccess();
-        boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
         boolean daemonAlive = PrivilegeBridge.isStandaloneDaemonAlive(appCtx);
+        boolean rootReady = PrivilegeBridge.isRootAvailablePassive(appCtx);
+        boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
         boolean builtinAdbPaired = BuiltinAdbKeyManager.isPaired(appCtx);
-        boolean sovereignReady = rootReady || selfPrivileged || daemonAlive;
+        boolean sovereignReady = daemonAlive || rootReady || selfPrivileged;
         boolean backendReady = sovereignReady || builtinAdbPaired;
         boolean forcedImportant = backendReady && (!sElevatedPids.isEmpty() || sovereignReady);
         ContinuityTier tier = computeContinuityTier(stealthEnabled, backendReady, listenerConnected || listenerEnabled);
@@ -420,26 +424,36 @@ public final class ContinuityBridgeManager {
         prefs(appCtx).edit().putBoolean(KEY_STEALTH_HYBRID_ENABLED, true).apply();
         registerPassiveWifiRecovery(appCtx);
 
-        boolean rootReady = PrivilegeBridge.hasRootAccess();
-        boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
         boolean daemonAlive = PrivilegeBridge.isStandaloneDaemonAlive(appCtx);
+        boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
         boolean builtinAdbPaired = BuiltinAdbKeyManager.isPaired(appCtx);
+        List<String> pkgs = collectInstalledTargetsAndModule(appCtx);
+        String listenerComp = appCtx.getPackageName() + "/" + KeepaliveBridgeListenerService.class.getName();
 
-        if (rootReady || selfPrivileged || daemonAlive || builtinAdbPaired) {
+        boolean rootBootstrapped = false;
+        if (!daemonAlive && !builtinAdbPaired && PrivilegeBridge.hasRootBinaryOnDisk()) {
+            // Single consolidated su invocation once per boot (starts root daemon + exemptions)
+            rootBootstrapped = PrivilegeBridge.bootstrapRootOncePerBoot(appCtx, pkgs, listenerComp, true);
+            daemonAlive = PrivilegeBridge.isStandaloneDaemonAlive(appCtx);
+        }
+
+        boolean rootReady = rootBootstrapped || PrivilegeBridge.isRootAvailablePassive(appCtx);
+        if (daemonAlive || selfPrivileged || builtinAdbPaired || rootReady) {
             PrivilegeBridge.selfHealNotificationListener(appCtx);
-            List<String> pkgs = collectInstalledTargetsAndModule(appCtx);
-            String listenerComp = appCtx.getPackageName() + "/" + KeepaliveBridgeListenerService.class.getName();
-            sExemptionsAppliedOnce = PrivilegeBridge.applyOsContinuityExemptions(appCtx, pkgs, listenerComp, true);
-
-            if ((rootReady || builtinAdbPaired) && !daemonAlive) {
-                PrivilegeBridge.bootstrapStandaloneDaemonAsync(appCtx, pkgs);
+            if (!PrivilegeBridge.hasExemptionsAppliedThisBoot(appCtx)) {
+                sExemptionsAppliedOnce = PrivilegeBridge.applyOsContinuityExemptions(appCtx, pkgs, listenerComp, true);
+            } else {
+                sExemptionsAppliedOnce = true;
             }
 
-            for (String pkg : getWantedPackages(appCtx)) {
-                List<Integer> pids = resolveRunningPids(appCtx, pkg);
-                for (int pid : pids) {
-                    if (PrivilegeBridge.applyProcessImportant(appCtx, pid, true)) {
-                        sElevatedPids.put(pid, System.currentTimeMillis());
+            // Boost processes ONLY via daemon/self Binder - never spawn per-package su calls!
+            if (daemonAlive || selfPrivileged) {
+                for (String pkg : getWantedPackages(appCtx)) {
+                    List<Integer> pids = resolveRunningPidsViaDaemon(appCtx, pkg);
+                    for (int pid : pids) {
+                        if (PrivilegeBridge.applyProcessImportant(appCtx, pid, true)) {
+                            sElevatedPids.put(pid, System.currentTimeMillis());
+                        }
                     }
                 }
             }
@@ -521,8 +535,11 @@ public final class ContinuityBridgeManager {
         return pkgs;
     }
 
-    private static List<Integer> resolveRunningPids(Context context, String pkg) {
+    private static List<Integer> resolveRunningPidsViaDaemon(Context context, String pkg) {
         ArrayList<Integer> pids = new ArrayList<>();
+        if (context == null || !PrivilegeBridge.isStandaloneDaemonAlive(context)) {
+            return pids;
+        }
         PrivilegeBridge.ShellResult res = PrivilegeBridge.runShellCommand(context, "pidof " + pkg, 3000);
         if (!res.output.isEmpty()) {
             String[] parts = res.output.trim().split("\\s+");

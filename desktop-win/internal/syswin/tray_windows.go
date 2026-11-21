@@ -467,15 +467,15 @@ func (h *Host) showContextMenu(hwnd uintptr) {
 	lblCopy := "Copy tg://socks Link"
 	lblQuit := "Quit"
 	if isAr {
-		lblOpen = "فتح WireGuard Plus"
+		lblOpen = "فتح نفق وايرجارد بلس"
 		if connected {
 			lblConnect = "قطع الاتصال"
 		} else {
 			lblConnect = "تشغيل النفق"
 		}
 		lblSwitch = "تبديل الخادم"
-		lblAttach = "ربط مع تطبيق تيليغرام"
-		lblCopy = "نسخ رابط البروكسي tg://socks"
+		lblAttach = "ربط مع تطبيق تيليجرام"
+		lblCopy = "نسخ رابط البروكسي المحلي"
 		lblQuit = "خروج"
 	}
 
@@ -491,7 +491,11 @@ func (h *Host) showContextMenu(hwnd uintptr) {
 				}
 				label := p.Name
 				if p.LastPingMs > 0 {
-					label = fmt.Sprintf("%s (%d ms)", p.Name, p.LastPingMs)
+					if isAr {
+						label = fmt.Sprintf("%s (%d مللي ثانية)", p.Name, p.LastPingMs)
+					} else {
+						label = fmt.Sprintf("%s (%d ms)", p.Name, p.LastPingMs)
+					}
 				}
 				flags := uint32(mfString)
 				if p.Active {

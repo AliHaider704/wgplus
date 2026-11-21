@@ -17,6 +17,7 @@ import android.net.Uri;
 import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.provider.OpenableColumns;
 import android.text.Editable;
 import android.text.InputType;
@@ -75,6 +76,7 @@ public final class WireGuardDialog {
         boolean networkOptionsExpanded = false;
         boolean configExpanded = false;
         boolean advancedExpanded = false;
+        boolean rawAwgFieldsExpanded = false;
         boolean showPrivateKey = false;
         boolean showPresharedKey = false;
         boolean connecting = false;
@@ -83,6 +85,7 @@ public final class WireGuardDialog {
         boolean generatingWarp = false;
         String switchingTargetName = "";
         boolean scrollToEditorNextRender = false;
+        long observedActiveNoHsAtMs = 0L;
         VerifyUiState verifyState = VerifyUiState.IDLE;
         WireGuardManager.TunnelVerifyResult verifyResult = null;
         Throwable lastVerifyError = null;
@@ -244,6 +247,17 @@ public final class WireGuardDialog {
 
         renderRef[0].run();
 
+        new Thread(() -> {
+            if (WireGuardManager.syncPullSharedStateFromProvider(activityContext, true)) {
+                mainHandler.post(() -> {
+                    if (dialog.isShowing()) {
+                        state.draft = WireGuardManager.loadConfig(activityContext);
+                        renderRef[0].run();
+                    }
+                });
+            }
+        }, "wg-plus-dialog-sync").start();
+
         statsTickerRef[0] = () -> {
             if (!dialog.isShowing()) {
                 return;
@@ -365,6 +379,7 @@ public final class WireGuardDialog {
         statusHeaderRow.addView(statusDot, dotLp);
 
         final TextView statusHeadline = new TextView(ctx);
+        statusHeadline.setContentDescription("wgplus_dlg_status_headline");
         applyProseTextStyle(statusHeadline, isAr, theme.textPrimary, 14.5f, true);
         statusHeaderRow.addView(statusHeadline, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         statusCard.addView(statusHeaderRow);
@@ -378,6 +393,8 @@ public final class WireGuardDialog {
         subLp.topMargin = WgTheme.dp(ctx, 5);
         statusCard.addView(statusSubline, subLp);
 
+        final boolean hasConfiguredAtRender = WireGuardManager.hasAnyConfiguredProfile(ctx);
+
         LinearLayout actionRow = new LinearLayout(ctx);
         actionRow.setOrientation(LinearLayout.HORIZONTAL);
         LinearLayout.LayoutParams actionRowLp = new LinearLayout.LayoutParams(
@@ -386,8 +403,14 @@ public final class WireGuardDialog {
         );
         actionRowLp.topMargin = WgTheme.dp(ctx, 12);
 
-        final Button connectBtn = createPrimaryAccentButton(ctx, WgStrings.connectPrimaryBtn(isAr), theme);
+        // Single accentPrimary CTA rule: promote 1-Tap Free WARP when no configured profile exists;
+        // otherwise Connect holds the single accentPrimary role.
+        final Button connectBtn = hasConfiguredAtRender
+                ? createPrimaryAccentButton(ctx, WgStrings.connectPrimaryBtn(isAr), theme)
+                : createSecondaryButton(ctx, WgStrings.connectPrimaryBtn(isAr), theme);
+        connectBtn.setContentDescription("wgplus_dlg_btn_connect");
         final Button disconnectBtn = createDisconnectButton(ctx, WgStrings.disconnectBtn(isAr), theme);
+        disconnectBtn.setContentDescription("wgplus_dlg_btn_disconnect");
 
         LinearLayout.LayoutParams connLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.3f);
         setMarginEndCompat(connLp, WgTheme.dp(ctx, 8), isAr);
@@ -397,11 +420,10 @@ public final class WireGuardDialog {
         actionRow.addView(disconnectBtn, discLp);
         statusCard.addView(actionRow, actionRowLp);
 
-        final Button quickWarpBtn = createPrimaryAccentButton(
-                ctx,
-                WgStrings.quickWarpBtn(isAr, state.generatingWarp),
-                theme
-        );
+        final Button quickWarpBtn = hasConfiguredAtRender
+                ? createSecondaryButton(ctx, WgStrings.quickWarpBtn(isAr, state.generatingWarp), theme)
+                : createPrimaryAccentButton(ctx, WgStrings.quickWarpBtn(isAr, state.generatingWarp), theme);
+        quickWarpBtn.setContentDescription("wgplus_dlg_btn_quick_warp");
         LinearLayout.LayoutParams quickWarpLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -409,7 +431,47 @@ public final class WireGuardDialog {
         quickWarpLp.topMargin = WgTheme.dp(ctx, 8);
         statusCard.addView(quickWarpBtn, quickWarpLp);
 
+        final LinearLayout recoveryBox = new LinearLayout(ctx);
+        recoveryBox.setOrientation(LinearLayout.VERTICAL);
+        recoveryBox.setBackground(WgTheme.cardBackground(ctx, theme.pendingBg, theme.pendingBorder, 8f));
+        int recPad = WgTheme.dp(ctx, 10);
+        recoveryBox.setPadding(recPad, recPad, recPad, recPad);
+        recoveryBox.setVisibility(View.GONE);
+        LinearLayout.LayoutParams recoveryBoxLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        recoveryBoxLp.topMargin = WgTheme.dp(ctx, 8);
+
+        TextView recoveryHint = new TextView(ctx);
+        applyProseTextStyle(recoveryHint, isAr, theme.pendingText, 12.2f, false);
+        recoveryHint.setText(WgStrings.statusStalledHint(isAr));
+        recoveryBox.addView(recoveryHint, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        final Button recoveryAwgBtn = createSecondaryButton(ctx, WgStrings.recoverAwgBtn(isAr), theme);
+        recoveryAwgBtn.setContentDescription("wgplus_dlg_btn_recover_awg");
+        LinearLayout.LayoutParams recAwgLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        recAwgLp.topMargin = WgTheme.dp(ctx, 8);
+        recoveryBox.addView(recoveryAwgBtn, recAwgLp);
+
+        final Button recoveryWarpBtn = createSecondaryButton(ctx, WgStrings.recoverWarpBtn(isAr), theme);
+        recoveryWarpBtn.setContentDescription("wgplus_dlg_btn_recover_warp");
+        LinearLayout.LayoutParams recWarpLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        recWarpLp.topMargin = WgTheme.dp(ctx, 6);
+        recoveryBox.addView(recoveryWarpBtn, recWarpLp);
+        statusCard.addView(recoveryBox, recoveryBoxLp);
+
         final Button verifyBtn = createSecondaryButton(ctx, WgStrings.verifyBtnLabel(isAr), theme);
+        verifyBtn.setContentDescription("wgplus_dlg_btn_verify");
         LinearLayout.LayoutParams verifyLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -482,6 +544,29 @@ public final class WireGuardDialog {
             nbBox.addView(createSwitchRow(ctx, WgStrings.encryptedDohLabel(isAr), dohToggle, isAr, theme));
             nbBox.addView(createDivider(ctx, theme));
             nbBox.addView(createSwitchRow(ctx, WgStrings.smartKeepaliveLabel(isAr), smartKeepaliveToggle, isAr, theme));
+            Button cleanCacheDlgBtn = createSecondaryButton(ctx, WgStrings.cleanCacheBtn(isAr, false), theme);
+            cleanCacheDlgBtn.setContentDescription("wgplus_dlg_btn_clean_cache");
+            cleanCacheDlgBtn.setOnClickListener(v -> {
+                cleanCacheDlgBtn.setEnabled(false);
+                cleanCacheDlgBtn.setText(WgStrings.cleanCacheBtn(isAr, true));
+                new Thread(() -> {
+                    ModuleHygieneManager.HygieneReport report = ModuleHygieneManager.cleanCachesSafely(ctx, true);
+                    mainHandler.post(() -> {
+                        Toast.makeText(
+                                ctx,
+                                WgStrings.toastCacheCleaned(isAr, report.freedBytes, report.filesDeleted),
+                                Toast.LENGTH_SHORT
+                        ).show();
+                        rebuildUi.run();
+                    });
+                }, "wg-plus-dlg-hygiene").start();
+            });
+            LinearLayout.LayoutParams ccDlgLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            );
+            ccDlgLp.topMargin = WgTheme.dp(ctx, 8);
+            nbBox.addView(cleanCacheDlgBtn, ccDlgLp);
             optionsCard.addView(nbBox, nbBoxLp);
         }
 
@@ -883,17 +968,17 @@ public final class WireGuardDialog {
                 awgHintLp.bottomMargin = WgTheme.dp(ctx, 8);
                 advBox.addView(awgHint, awgHintLp);
 
-                LinearLayout awgPresetRow = new LinearLayout(ctx);
-                awgPresetRow.setOrientation(LinearLayout.HORIZONTAL);
-                LinearLayout.LayoutParams awgPresetLp = new LinearLayout.LayoutParams(
+                LinearLayout awgPresetRow1 = new LinearLayout(ctx);
+                awgPresetRow1.setOrientation(LinearLayout.HORIZONTAL);
+                LinearLayout.LayoutParams awgPresetLp1 = new LinearLayout.LayoutParams(
                         ViewGroup.LayoutParams.MATCH_PARENT,
                         ViewGroup.LayoutParams.WRAP_CONTENT
                 );
-                awgPresetLp.bottomMargin = WgTheme.dp(ctx, 10);
+                awgPresetLp1.bottomMargin = WgTheme.dp(ctx, 6);
 
+                Button awgClearBtn = createChipButton(ctx, WgStrings.awgPresetOffBtn(isAr), theme, false);
                 Button awgPresetBtn = createChipButton(ctx, WgStrings.awgPresetVanillaBtn(isAr), theme, false);
                 Button awgQuic15Btn = createChipButton(ctx, WgStrings.awgPresetQuic15Btn(isAr), theme, false);
-                Button awgClearBtn = createChipButton(ctx, WgStrings.awgClearBtn(isAr), theme, false);
 
                 awgPresetBtn.setOnClickListener(v -> {
                     captureDraftInputs.run();
@@ -940,63 +1025,87 @@ public final class WireGuardDialog {
                     rebuildUi.run();
                 });
 
-                LinearLayout.LayoutParams prLp1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.25f);
+                LinearLayout.LayoutParams prLp1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
                 setMarginEndCompat(prLp1, WgTheme.dp(ctx, 6), isAr);
-                LinearLayout.LayoutParams prLpQ = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.0f);
-                setMarginEndCompat(prLpQ, WgTheme.dp(ctx, 6), isAr);
-                LinearLayout.LayoutParams prLp2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.7f);
-                awgPresetRow.addView(awgPresetBtn, prLp1);
-                awgPresetRow.addView(awgQuic15Btn, prLpQ);
-                awgPresetRow.addView(awgClearBtn, prLp2);
-                advBox.addView(awgPresetRow, awgPresetLp);
+                LinearLayout.LayoutParams prLp2 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+                awgPresetRow1.addView(awgClearBtn, prLp1);
+                awgPresetRow1.addView(awgPresetBtn, prLp2);
+                advBox.addView(awgPresetRow1, awgPresetLp1);
 
-                if (useTwoColumns) {
-                    advBox.addView(createTwoColumnRow(
-                            ctx,
-                            WgStrings.labelAwgJc(isAr), jcInput, 1f,
-                            WgStrings.labelAwgJmin(isAr), jminInput, 1f,
-                            isAr, theme, WgTheme.dp(ctx, 8)
-                    ));
-                    advBox.addView(createTwoColumnRow(
-                            ctx,
-                            WgStrings.labelAwgJmax(isAr), jmaxInput, 1f,
-                            WgStrings.labelAwgS1(isAr), s1Input, 1f,
-                            isAr, theme, WgTheme.dp(ctx, 8)
-                    ));
-                    advBox.addView(createTwoColumnRow(
-                            ctx,
-                            WgStrings.labelAwgS2(isAr), s2Input, 1f,
-                            WgStrings.labelAwgS3(isAr), s3Input, 1f,
-                            isAr, theme, WgTheme.dp(ctx, 8)
-                    ));
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgS4(isAr), s4Input, isAr, theme, WgTheme.dp(ctx, 8));
-                    advBox.addView(createTwoColumnRow(
-                            ctx,
-                            WgStrings.labelAwgH1(isAr), h1Input, 1f,
-                            WgStrings.labelAwgH2(isAr), h2Input, 1f,
-                            isAr, theme, WgTheme.dp(ctx, 8)
-                    ));
-                    advBox.addView(createTwoColumnRow(
-                            ctx,
-                            WgStrings.labelAwgH3(isAr), h3Input, 1f,
-                            WgStrings.labelAwgH4(isAr), h4Input, 1f,
-                            isAr, theme, WgTheme.dp(ctx, 10)
-                    ));
-                } else {
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgJc(isAr), jcInput, isAr, theme, WgTheme.dp(ctx, 8));
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgJmin(isAr), jminInput, isAr, theme, WgTheme.dp(ctx, 8));
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgJmax(isAr), jmaxInput, isAr, theme, WgTheme.dp(ctx, 8));
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgS1(isAr), s1Input, isAr, theme, WgTheme.dp(ctx, 8));
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgS2(isAr), s2Input, isAr, theme, WgTheme.dp(ctx, 8));
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgS3(isAr), s3Input, isAr, theme, WgTheme.dp(ctx, 8));
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgS4(isAr), s4Input, isAr, theme, WgTheme.dp(ctx, 8));
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgH1(isAr), h1Input, isAr, theme, WgTheme.dp(ctx, 8));
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgH2(isAr), h2Input, isAr, theme, WgTheme.dp(ctx, 8));
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgH3(isAr), h3Input, isAr, theme, WgTheme.dp(ctx, 8));
-                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgH4(isAr), h4Input, isAr, theme, WgTheme.dp(ctx, 8));
+                LinearLayout.LayoutParams prLpQ = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                );
+                prLpQ.bottomMargin = WgTheme.dp(ctx, 8);
+                advBox.addView(awgQuic15Btn, prLpQ);
+
+                Button rawAwgToggleBtn = createSecondaryButton(
+                        ctx,
+                        WgStrings.awgRawToggleLabel(isAr, state.rawAwgFieldsExpanded),
+                        theme
+                );
+                rawAwgToggleBtn.setContentDescription("wgplus_dlg_toggle_raw_awg");
+                rawAwgToggleBtn.setOnClickListener(v -> {
+                    captureDraftInputs.run();
+                    state.rawAwgFieldsExpanded = !state.rawAwgFieldsExpanded;
+                    rebuildUi.run();
+                });
+                LinearLayout.LayoutParams rawToggleLp = new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.WRAP_CONTENT
+                );
+                rawToggleLp.bottomMargin = WgTheme.dp(ctx, 10);
+                advBox.addView(rawAwgToggleBtn, rawToggleLp);
+
+                if (state.rawAwgFieldsExpanded) {
+                    if (useTwoColumns) {
+                        advBox.addView(createTwoColumnRow(
+                                ctx,
+                                WgStrings.labelAwgJc(isAr), jcInput, 1f,
+                                WgStrings.labelAwgJmin(isAr), jminInput, 1f,
+                                isAr, theme, WgTheme.dp(ctx, 8)
+                        ));
+                        advBox.addView(createTwoColumnRow(
+                                ctx,
+                                WgStrings.labelAwgJmax(isAr), jmaxInput, 1f,
+                                WgStrings.labelAwgS1(isAr), s1Input, 1f,
+                                isAr, theme, WgTheme.dp(ctx, 8)
+                        ));
+                        advBox.addView(createTwoColumnRow(
+                                ctx,
+                                WgStrings.labelAwgS2(isAr), s2Input, 1f,
+                                WgStrings.labelAwgS3(isAr), s3Input, 1f,
+                                isAr, theme, WgTheme.dp(ctx, 8)
+                        ));
+                        addFieldToContainer(advBox, ctx, WgStrings.labelAwgS4(isAr), s4Input, isAr, theme, WgTheme.dp(ctx, 8));
+                        advBox.addView(createTwoColumnRow(
+                                ctx,
+                                WgStrings.labelAwgH1(isAr), h1Input, 1f,
+                                WgStrings.labelAwgH2(isAr), h2Input, 1f,
+                                isAr, theme, WgTheme.dp(ctx, 8)
+                        ));
+                        advBox.addView(createTwoColumnRow(
+                                ctx,
+                                WgStrings.labelAwgH3(isAr), h3Input, 1f,
+                                WgStrings.labelAwgH4(isAr), h4Input, 1f,
+                                isAr, theme, WgTheme.dp(ctx, 10)
+                        ));
+                    } else {
+                        addFieldToContainer(advBox, ctx, WgStrings.labelAwgJc(isAr), jcInput, isAr, theme, WgTheme.dp(ctx, 8));
+                        addFieldToContainer(advBox, ctx, WgStrings.labelAwgJmin(isAr), jminInput, isAr, theme, WgTheme.dp(ctx, 8));
+                        addFieldToContainer(advBox, ctx, WgStrings.labelAwgJmax(isAr), jmaxInput, isAr, theme, WgTheme.dp(ctx, 8));
+                        addFieldToContainer(advBox, ctx, WgStrings.labelAwgS1(isAr), s1Input, isAr, theme, WgTheme.dp(ctx, 8));
+                        addFieldToContainer(advBox, ctx, WgStrings.labelAwgS2(isAr), s2Input, isAr, theme, WgTheme.dp(ctx, 8));
+                        addFieldToContainer(advBox, ctx, WgStrings.labelAwgS3(isAr), s3Input, isAr, theme, WgTheme.dp(ctx, 8));
+                        addFieldToContainer(advBox, ctx, WgStrings.labelAwgS4(isAr), s4Input, isAr, theme, WgTheme.dp(ctx, 8));
+                        addFieldToContainer(advBox, ctx, WgStrings.labelAwgH1(isAr), h1Input, isAr, theme, WgTheme.dp(ctx, 8));
+                        addFieldToContainer(advBox, ctx, WgStrings.labelAwgH2(isAr), h2Input, isAr, theme, WgTheme.dp(ctx, 8));
+                        addFieldToContainer(advBox, ctx, WgStrings.labelAwgH3(isAr), h3Input, isAr, theme, WgTheme.dp(ctx, 8));
+                        addFieldToContainer(advBox, ctx, WgStrings.labelAwgH4(isAr), h4Input, isAr, theme, WgTheme.dp(ctx, 8));
+                    }
+                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgI1(isAr), i1Input, isAr, theme, WgTheme.dp(ctx, 8));
+                    addFieldToContainer(advBox, ctx, WgStrings.labelAwgReserved(isAr), reservedInput, isAr, theme, WgTheme.dp(ctx, 10));
                 }
-                addFieldToContainer(advBox, ctx, WgStrings.labelAwgI1(isAr), i1Input, isAr, theme, WgTheme.dp(ctx, 8));
-                addFieldToContainer(advBox, ctx, WgStrings.labelAwgReserved(isAr), reservedInput, isAr, theme, WgTheme.dp(ctx, 10));
 
                 // Export Row: Copy .conf + Show QR Code Modal
                 LinearLayout exportRow = new LinearLayout(ctx);
@@ -1086,6 +1195,7 @@ public final class WireGuardDialog {
                 statusHeadline.setText(WgStrings.statusGeneratingWarp(isAr));
                 statusHeadline.setTextColor(theme.pendingText);
                 statusSubline.setText(WgStrings.verifyLoadingBody(isAr));
+                recoveryBox.setVisibility(View.GONE);
                 connectBtn.setEnabled(false);
                 quickWarpBtn.setEnabled(false);
                 quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, true));
@@ -1097,17 +1207,46 @@ public final class WireGuardDialog {
                         : WgStrings.statusConnecting(isAr));
                 statusHeadline.setTextColor(theme.pendingText);
                 statusSubline.setText(WgStrings.verifyLoadingBody(isAr));
+                recoveryBox.setVisibility(View.GONE);
                 connectBtn.setEnabled(false);
                 connectBtn.setText(WgStrings.connectingBtn(isAr));
                 quickWarpBtn.setEnabled(false);
                 quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, false));
                 disconnectBtn.setEnabled(false);
             } else if (active && port > 0) {
-                statusDot.setBackground(WgTheme.statusDot(ctx, theme.activeDot));
-                statusHeadline.setText(WgStrings.statusActiveWithProfile(isAr, connectedName, port));
-                statusHeadline.setTextColor(theme.activeText);
                 WireGuardManager.TunnelStats stats = WireGuardManager.getLiveStats(ctx, moduleApkPath);
-                statusSubline.setText(WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec));
+                long nowEpoch = System.currentTimeMillis() / 1000L;
+                boolean recentHs = stats.lastHandshakeSec > 0
+                        && Math.max(0L, nowEpoch - stats.lastHandshakeSec) < 150L;
+                if (recentHs) {
+                    state.observedActiveNoHsAtMs = 0L;
+                    statusDot.setBackground(WgTheme.statusDot(ctx, theme.activeDot));
+                    statusHeadline.setText(WgStrings.statusActiveWithProfile(isAr, connectedName, port));
+                    statusHeadline.setTextColor(theme.activeText);
+                    statusSubline.setText(WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec));
+                    recoveryBox.setVisibility(View.GONE);
+                } else {
+                    long startedMs = WireGuardManager.getTunnelStartedAtMs();
+                    if (startedMs <= 0L) {
+                        if (state.observedActiveNoHsAtMs <= 0L) {
+                            state.observedActiveNoHsAtMs = SystemClock.elapsedRealtime();
+                        }
+                        startedMs = state.observedActiveNoHsAtMs;
+                    }
+                    long elapsedMs = Math.max(0L, SystemClock.elapsedRealtime() - startedMs);
+                    boolean staleOldHs = stats.lastHandshakeSec > 0 && (nowEpoch - stats.lastHandshakeSec) >= 150L;
+                    boolean stalled = elapsedMs >= 10_000L || staleOldHs;
+
+                    statusDot.setBackground(WgTheme.statusDot(ctx, theme.pendingDot));
+                    statusHeadline.setText(stalled
+                            ? WgStrings.statusStalledWithProfile(isAr, connectedName)
+                            : WgStrings.statusAwaitingHandshakeWithProfile(isAr, connectedName));
+                    statusHeadline.setTextColor(theme.pendingText);
+                    statusSubline.setText(stalled
+                            ? WgStrings.statusStalledHint(isAr)
+                            : WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec));
+                    recoveryBox.setVisibility(stalled ? View.VISIBLE : View.GONE);
+                }
                 connectBtn.setEnabled(true);
                 connectBtn.setText(viewingDifferentFromConnected
                         ? WgStrings.switchToProfileBtn(isAr)
@@ -1116,20 +1255,24 @@ public final class WireGuardDialog {
                 quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, false));
                 disconnectBtn.setEnabled(true);
             } else if (guarded) {
+                state.observedActiveNoHsAtMs = 0L;
                 statusDot.setBackground(WgTheme.statusDot(ctx, theme.pendingDot));
                 statusHeadline.setText(WgStrings.statusKillSwitchGuarded(isAr, state.draft.name));
                 statusHeadline.setTextColor(theme.pendingText);
                 statusSubline.setText(WgStrings.statusKillSwitchSubline(isAr));
+                recoveryBox.setVisibility(View.GONE);
                 connectBtn.setEnabled(true);
                 connectBtn.setText(WgStrings.connectPrimaryBtn(isAr));
                 quickWarpBtn.setEnabled(true);
                 quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, false));
                 disconnectBtn.setEnabled(false);
             } else {
+                state.observedActiveNoHsAtMs = 0L;
                 statusDot.setBackground(WgTheme.statusDot(ctx, theme.stoppedDot));
                 statusHeadline.setText(WgStrings.statusStoppedWithProfile(isAr, state.draft.name));
                 statusHeadline.setTextColor(theme.stoppedText);
                 statusSubline.setText(WgStrings.statusEmptyHint(isAr));
+                recoveryBox.setVisibility(View.GONE);
                 connectBtn.setEnabled(true);
                 connectBtn.setText(WgStrings.connectPrimaryBtn(isAr));
                 quickWarpBtn.setEnabled(true);
@@ -1192,6 +1335,7 @@ public final class WireGuardDialog {
                         ).show();
                         rebuildUi.run();
                         triggerVerification.run();
+                        WireGuardManager.maybeInviteToOfficialChannel(ctx, isAr);
                     });
                 } catch (final Throwable err) {
                     mainHandler.post(() -> {
@@ -1759,6 +1903,7 @@ public final class WireGuardDialog {
                         ).show();
                         rebuildUi.run();
                         triggerVerification.run();
+                        WireGuardManager.maybeInviteToOfficialChannel(ctx, isAr);
                     });
                 } catch (final Throwable err) {
                     mainHandler.post(() -> {
@@ -1804,6 +1949,7 @@ public final class WireGuardDialog {
                         ).show();
                         rebuildUi.run();
                         triggerVerification.run();
+                        WireGuardManager.maybeInviteToOfficialChannel(ctx, isAr);
                     });
                 } catch (final Throwable err) {
                     mainHandler.post(() -> {
@@ -1818,6 +1964,37 @@ public final class WireGuardDialog {
         };
 
         quickWarpBtn.setOnClickListener(v -> startQuickWarpReuse.run());
+        recoveryWarpBtn.setOnClickListener(v -> startQuickWarpReuse.run());
+        recoveryAwgBtn.setOnClickListener(v -> {
+            if (state.generatingWarp || state.connecting) {
+                return;
+            }
+            captureDraftInputs.run();
+            WireGuardManager.saveConfig(ctx, state.draft);
+            state.connecting = true;
+            state.observedActiveNoHsAtMs = 0L;
+            refreshStatusVisuals.run();
+            new Thread(() -> {
+                try {
+                    final int port = WireGuardManager.applyAwg15AndReconnect(ctx, moduleApkPath, telegramClassLoader);
+                    mainHandler.post(() -> {
+                        state.connecting = false;
+                        state.draft = WireGuardManager.loadConfig(ctx);
+                        state.advancedExpanded = true;
+                        Toast.makeText(ctx, WgStrings.toastAwgRecovered(isAr, port), Toast.LENGTH_SHORT).show();
+                        rebuildUi.run();
+                        triggerVerification.run();
+                    });
+                } catch (final Throwable err) {
+                    mainHandler.post(() -> {
+                        state.connecting = false;
+                        state.verifyState = VerifyUiState.ERROR;
+                        state.lastVerifyError = err;
+                        rebuildUi.run();
+                    });
+                }
+            }, "wg-plus-dlg-recover-awg").start();
+        });
         newWarpBtn.setOnClickListener(v -> startQuickWarpFresh.run());
 
         connectBtn.setOnClickListener(v -> {

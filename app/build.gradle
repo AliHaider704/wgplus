@@ -11,11 +11,16 @@ android {
         applicationId "org.telegram.wgplus.module"
         minSdk 21
         targetSdk 34
-        versionCode 12
-        versionName "1.7.2"
+        versionCode 13
+        versionName "1.7.3"
+    }
 
-        ndk {
-            abiFilters 'arm64-v8a', 'armeabi-v7a'
+    splits {
+        abi {
+            enable true
+            reset()
+            include 'arm64-v8a', 'armeabi-v7a'
+            universalApk true
         }
     }
 
@@ -43,8 +48,9 @@ android {
 
     buildTypes {
         release {
-            minifyEnabled false
-            shrinkResources false
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
             if (keystoreFile.exists()) {
                 signingConfig signingConfigs.release
             }
@@ -67,6 +73,20 @@ android {
         jniLibs {
             useLegacyPackaging = true
         }
+        resources {
+            excludes += [
+                'org/bouncycastle/pqc/**',
+                'org/bouncycastle/x509/CertPathReviewerMessages*.properties',
+                'kotlin/**',
+                'META-INF/*.kotlin_module',
+                'META-INF/androidx/**',
+                'META-INF/LICENSE*',
+                'META-INF/NOTICE*',
+                'META-INF/DEPENDENCIES',
+                'DebugProbesKt.bin',
+                'kotlin-tooling-metadata.json'
+            ]
+        }
     }
 }
 
@@ -85,14 +105,63 @@ dependencies {
 tasks.whenTaskAdded { task ->
     if (task.name == 'assembleRelease') {
         task.doLast {
-            def builtApk = file("${buildDir}/outputs/apk/release/app-release.apk")
-            if (builtApk.exists()) {
-                copy {
-                    from builtApk
-                    into new File(rootProject.projectDir, 'dist')
-                    rename { "WireGuardPlus-${android.defaultConfig.versionName}.apk" }
+            def distDir = new File(rootProject.projectDir, 'dist')
+            distDir.mkdirs()
+            def ver = android.defaultConfig.versionName
+            def relDir = file("${buildDir}/outputs/apk/release")
+            def mapping = [
+                [src: "app-arm64-v8a-release.apk",   abi: "arm64-v8a",   dst: "WireGuardPlus-${ver}-arm64-v8a.apk"],
+                [src: "app-armeabi-v7a-release.apk", abi: "armeabi-v7a", dst: "WireGuardPlus-${ver}-armeabi-v7a.apk"],
+                [src: "app-universal-release.apk",   abi: "universal",   dst: "WireGuardPlus-${ver}.apk"]
+            ]
+            def artifactsMeta = []
+            mapping.each { entry ->
+                def srcFile = new File(relDir, entry.src)
+                if (srcFile.exists()) {
+                    def dstFile = new File(distDir, entry.dst)
+                    copy {
+                        from srcFile
+                        into distDir
+                        rename { entry.dst }
+                    }
+                    def digest = java.security.MessageDigest.getInstance('SHA-256')
+                    dstFile.withInputStream { is ->
+                        byte[] buf = new byte[8192]
+                        int read
+                        while ((read = is.read(buf)) > 0) {
+                            digest.update(buf, 0, read)
+                        }
+                    }
+                    def shaHex = digest.digest().collect { String.format('%02x', it) }.join('')
+                    artifactsMeta << [
+                        file: entry.dst,
+                        abi: entry.abi,
+                        sizeBytes: dstFile.length(),
+                        sha256: shaHex
+                    ]
                 }
             }
+            def meta = [
+                versionName: ver,
+                versionCode: android.defaultConfig.versionCode,
+                packageName: android.defaultConfig.applicationId,
+                supportedTargetPackages: [
+                    'org.telegram.plus',
+                    'org.telegram.messenger',
+                    'org.telegram.messenger.web',
+                    'org.telegram.messenger.beta',
+                    'org.telegram.gold',
+                    'ir.ilmili.telegraph',
+                    'ir.p2021.telegraph',
+                    'com.radolyn.ayugram',
+                    'org.thunderdog.challegram'
+                ],
+                artifacts: artifactsMeta
+            ]
+            new File(distDir, 'android-build-meta.json').setText(
+                groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(meta)) + '\n',
+                'UTF-8'
+            )
         }
     }
 }

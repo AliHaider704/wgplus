@@ -57,33 +57,35 @@ type BridgeStats struct {
 
 // BootstrapState is the complete UI hydration payload.
 type BootstrapState struct {
-	Settings        config.AppSettings           `json:"settings"`
-	Profiles        []config.ServerProfile       `json:"profiles"`
-	Clients         []config.TelegramClientEntry `json:"clients"`
-	PortableMode    bool                         `json:"portableMode"`
-	DataDir         string                       `json:"dataDir"`
-	Connected       bool                         `json:"connected"`
-	Connecting      bool                         `json:"connecting"`
-	ActiveProfileID string                       `json:"activeProfileId"`
-	LastError       string                       `json:"lastError"`
-	ProxyURI        string                       `json:"proxyUri"`
-	Stats           BridgeStats                  `json:"stats"`
-	GuardEvents     []guard.GuardEvent           `json:"guardEvents"`
-	RxHistory       []uint64                     `json:"rxHistory"`
-	TxHistory       []uint64                     `json:"txHistory"`
+	Settings           config.AppSettings           `json:"settings"`
+	Profiles           []config.ServerProfile       `json:"profiles"`
+	Clients            []config.TelegramClientEntry `json:"clients"`
+	PortableMode       bool                         `json:"portableMode"`
+	DataDir            string                       `json:"dataDir"`
+	Connected          bool                         `json:"connected"`
+	Connecting         bool                         `json:"connecting"`
+	ConnectedSinceUnix int64                        `json:"connectedSinceUnix"`
+	ActiveProfileID    string                       `json:"activeProfileId"`
+	LastError          string                       `json:"lastError"`
+	ProxyURI           string                       `json:"proxyUri"`
+	Stats              BridgeStats                  `json:"stats"`
+	GuardEvents        []guard.GuardEvent           `json:"guardEvents"`
+	RxHistory          []uint64                     `json:"rxHistory"`
+	TxHistory          []uint64                     `json:"txHistory"`
 }
 
 // TelemetrySnapshot is emitted every second while the main window is visible.
 type TelemetrySnapshot struct {
-	Connected       bool                         `json:"connected"`
-	Connecting      bool                         `json:"connecting"`
-	ActiveProfileID string                       `json:"activeProfileId"`
-	LastError       string                       `json:"lastError"`
-	Stats           BridgeStats                  `json:"stats"`
-	Clients         []config.TelegramClientEntry `json:"clients"`
-	GuardEvents     []guard.GuardEvent           `json:"guardEvents"`
-	RxHistory       []uint64                     `json:"rxHistory"`
-	TxHistory       []uint64                     `json:"txHistory"`
+	Connected          bool                         `json:"connected"`
+	Connecting         bool                         `json:"connecting"`
+	ConnectedSinceUnix int64                        `json:"connectedSinceUnix"`
+	ActiveProfileID    string                       `json:"activeProfileId"`
+	LastError          string                       `json:"lastError"`
+	Stats              BridgeStats                  `json:"stats"`
+	Clients            []config.TelegramClientEntry `json:"clients"`
+	GuardEvents        []guard.GuardEvent           `json:"guardEvents"`
+	RxHistory          []uint64                     `json:"rxHistory"`
+	TxHistory          []uint64                     `json:"txHistory"`
 }
 
 // App coordinates the Go WireGuard engine, Windows Process Guard, DPAPI Vault,
@@ -480,16 +482,21 @@ func (a *App) telemetryLoop(ctx context.Context) {
 			}
 			visible := a.windowVisible.Load() && a.ctx != nil
 			if visible {
+				var sinceUnix int64
+				if a.connected && !a.startedAt.IsZero() {
+					sinceUnix = a.startedAt.Unix()
+				}
 				snap := TelemetrySnapshot{
-					Connected:       a.connected,
-					Connecting:      a.connecting,
-					ActiveProfileID: a.activeID,
-					LastError:       a.lastError,
-					Stats:           stats,
-					Clients:         a.mergeClientTraffic(a.clients, stats),
-					GuardEvents:     a.procGuard.Events(),
-					RxHistory:       append([]uint64(nil), a.rxHistory...),
-					TxHistory:       append([]uint64(nil), a.txHistory...),
+					Connected:          a.connected,
+					Connecting:         a.connecting,
+					ConnectedSinceUnix: sinceUnix,
+					ActiveProfileID:    a.activeID,
+					LastError:          a.lastError,
+					Stats:              stats,
+					Clients:            a.mergeClientTraffic(a.clients, stats),
+					GuardEvents:        a.procGuard.Events(),
+					RxHistory:          append([]uint64(nil), a.rxHistory...),
+					TxHistory:          append([]uint64(nil), a.txHistory...),
 				}
 				a.mu.Unlock()
 				runtime.EventsEmit(a.ctx, "telemetry", snap)
@@ -594,16 +601,29 @@ func (a *App) traySnapshot() (string, syswin.TrayVisualState, string, bool, []sy
 
 	vis := syswin.TrayDisconnected
 	tip := "WireGuard Plus - Disconnected"
+	if lang == "ar" {
+		tip = "نفق وايرجارد بلس - متوقف"
+	}
 	if conn {
 		vis = syswin.TrayConnected
 		if activeName != "" {
-			tip = "WireGuard Plus - " + activeName
+			if lang == "ar" {
+				tip = "نفق وايرجارد بلس - " + activeName
+			} else {
+				tip = "WireGuard Plus - " + activeName
+			}
+		} else if lang == "ar" {
+			tip = "نفق وايرجارد بلس - متصل"
 		} else {
 			tip = "WireGuard Plus - Connected"
 		}
 	} else if ks {
 		vis = syswin.TrayKillSwitch
-		tip = "WireGuard Plus - Kill Switch Guard"
+		if lang == "ar" {
+			tip = "نفق وايرجارد بلس - مانع التسريب نشط"
+		} else {
+			tip = "WireGuard Plus - Kill Switch Guard"
+		}
 	}
 	return lang, vis, tip, conn, profiles, clis
 }
@@ -685,15 +705,20 @@ func (a *App) GetBootstrapState() BootstrapState {
 	profiles := make([]config.ServerProfile, len(a.state.Profiles))
 	copy(profiles, a.state.Profiles)
 
+	var sinceUnix int64
+	if a.connected && !a.startedAt.IsZero() {
+		sinceUnix = a.startedAt.Unix()
+	}
 	return BootstrapState{
-		Settings:        a.state.Settings,
-		Profiles:        profiles,
-		Clients:         a.mergeClientTraffic(a.clients, stats),
-		PortableMode:    a.store.IsPortable(),
-		DataDir:         a.store.DataDir(),
-		Connected:       a.connected,
-		Connecting:      a.connecting,
-		ActiveProfileID: a.activeID,
+		Settings:           a.state.Settings,
+		Profiles:           profiles,
+		Clients:            a.mergeClientTraffic(a.clients, stats),
+		PortableMode:       a.store.IsPortable(),
+		DataDir:            a.store.DataDir(),
+		Connected:          a.connected,
+		Connecting:         a.connecting,
+		ConnectedSinceUnix: sinceUnix,
+		ActiveProfileID:    a.activeID,
 		LastError:       a.lastError,
 		ProxyURI:        a.GetProxyLinkLocked(),
 		Stats:           stats,
@@ -827,6 +852,40 @@ func (a *App) Disconnect() error {
 
 func (a *App) SwitchProfile(profileID string) error {
 	return a.Connect(profileID)
+}
+
+// EnableAwg15AndReconnect applies the strong AmneziaWG 1.5 DPI bypass preset to the active server
+// profile, saves it to the vault, and reconnects the tunnel.
+func (a *App) EnableAwg15AndReconnect() error {
+	preset := strings.TrimSpace(wgbridge.GetAwgPreset("quic_mimicry_15"))
+	if preset == "" {
+		return errors.New("AWG 1.5 preset unavailable")
+	}
+
+	a.mu.Lock()
+	targetID := strings.TrimSpace(a.activeID)
+	if targetID == "" {
+		targetID = strings.TrimSpace(a.state.Settings.ActiveProfileID)
+	}
+	idx := -1
+	for i := range a.state.Profiles {
+		if targetID == "" || a.state.Profiles[i].ID == targetID {
+			idx = i
+			targetID = a.state.Profiles[i].ID
+			break
+		}
+	}
+	if idx < 0 {
+		a.mu.Unlock()
+		return errors.New("no server profile available")
+	}
+	a.state.Profiles[idx].AwgParams = preset
+	err := a.store.Save(a.state)
+	a.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	return a.Connect(targetID)
 }
 
 func (a *App) SaveProfile(p config.ServerProfile) (config.ServerProfile, error) {

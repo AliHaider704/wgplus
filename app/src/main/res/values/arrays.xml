@@ -3,6 +3,12 @@
     <string-array name="xposed_scope">
         <item>org.telegram.plus</item>
         <item>org.telegram.messenger</item>
+        <item>org.telegram.messenger.web</item>
+        <item>org.telegram.messenger.beta</item>
         <item>org.telegram.gold</item>
+        <item>ir.ilmili.telegraph</item>
+        <item>ir.p2021.telegraph</item>
+        <item>com.radolyn.ayugram</item>
+        <item>org.thunderdog.challegram</item>
     </string-array>
 </resources>

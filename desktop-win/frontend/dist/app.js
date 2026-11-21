@@ -7,8 +7,10 @@ let state = null;
 let toastTimer = null;
 let verifying = false;
 let generatingWarp = false;
+let recoveringAwg = false;
 let pingingAll = false;
 let probingMtu = false;
+let onboardingDismissed = false;
 
 const el = (id) => document.getElementById(id);
 
@@ -53,12 +55,27 @@ function applyThemeAndDirection() {
 function applyStaticLabels() {
   const tr = t();
   const theme = state?.settings?.theme === "light" ? "light" : "dark";
+  document.title = tr.appTitle;
   el("app-title").textContent = tr.appTitle;
   el("storage-mode-label").textContent = state?.portableMode ? tr.modePortable : tr.modeStandard;
   el("btn-hide-tray").textContent = tr.hideToTray;
   el("btn-lang-toggle").textContent = tr.langToggle;
   el("btn-theme-toggle").textContent = theme === "dark" ? tr.themeLight : tr.themeDark;
   el("btn-dismiss-error").textContent = tr.dismiss;
+
+  el("lbl-onboard-title").textContent = tr.onboardTitle;
+  el("lbl-onboard-desc").textContent = tr.onboardDesc;
+  el("btn-onboard-warp").textContent = generatingWarp ? tr.quickWarpBusy : tr.quickWarpBtn;
+  el("btn-onboard-warp").disabled = generatingWarp || state?.connecting;
+  el("btn-onboard-conf").textContent = tr.onboardConf;
+  el("btn-onboard-qr").textContent = tr.onboardQr;
+  el("btn-onboard-paste").textContent = tr.onboardPaste;
+  el("btn-onboard-show-full").textContent = tr.onboardShowFull;
+
+  el("lbl-recovery-hint").textContent = tr.recoveryHint;
+  el("btn-recovery-awg").textContent = tr.recoverAwgBtn;
+  el("btn-recovery-warp").textContent = tr.recoverWarpBtn;
+  el("btn-quick-apply-tg").textContent = tr.quickBindBtn;
 
   el("lbl-rx-total").textContent = tr.rxTotal;
   el("lbl-tx-total").textContent = tr.txTotal;
@@ -96,6 +113,7 @@ function applyStaticLabels() {
 
   el("lbl-protection-title").textContent = tr.protectionTitle;
   el("lbl-protection-desc").textContent = tr.protectionDesc;
+  el("lbl-advanced-settings-summary").textContent = tr.advancedSettingsSummary;
   el("lbl-killswitch").textContent = tr.killSwitchLbl;
   el("desc-killswitch").textContent = tr.killSwitchDesc;
   el("lbl-guard-mode").textContent = tr.guardModeLbl;
@@ -197,20 +215,44 @@ function updateSparkline(rxHist, txHist) {
   el("spark-tx-line").setAttribute("points", toPoints(tx));
 }
 
+function renderOnboardingVisibility() {
+  if (!state) return;
+  const hasProfiles = Array.isArray(state.profiles) && state.profiles.length > 0;
+  const showOnboarding = !hasProfiles && !onboardingDismissed;
+  el("onboarding-card").classList.toggle("hidden", !showOnboarding);
+  el("main-grid").classList.toggle("hidden", showOnboarding);
+  el("quick-warp-bar").classList.toggle("hidden", hasProfiles);
+}
+
 function renderStatusAndTelemetry() {
   if (!state) return;
   const tr = t();
   const s = state.stats || {};
-  const activeProf = (state.profiles || []).find((p) => p.id === (state.activeProfileId || state.settings.activeProfileId));
+  const profiles = state.profiles || [];
+  const activeProf = profiles.find((p) => p.id === (state.activeProfileId || state.settings.activeProfileId));
 
   let dotClass = "dot-idle";
   let titleText = tr.statusDisconnected;
+  let showRecovery = false;
+
   if (state.connecting) {
     dotClass = "dot-warn";
     titleText = tr.statusConnecting;
   } else if (state.connected) {
-    dotClass = "dot-connected";
-    titleText = tr.statusConnected;
+    const hsAge = typeof s.handshakeAgeSec === "number" ? s.handshakeAgeSec : -1;
+    const nowSec = Math.floor(Date.now() / 1000);
+    const connElapsed = state.connectedSinceUnix > 0 ? Math.max(0, nowSec - state.connectedSinceUnix) : 0;
+    if (hsAge >= 0 && hsAge < 150) {
+      dotClass = "dot-connected";
+      titleText = tr.statusConnected;
+    } else if ((hsAge < 0 && connElapsed >= 10) || hsAge >= 150) {
+      dotClass = "dot-warn";
+      titleText = tr.statusStalled;
+      showRecovery = true;
+    } else {
+      dotClass = "dot-warn";
+      titleText = tr.statusAwaitingHandshake;
+    }
   } else if (state.settings.killSwitch) {
     dotClass = "dot-warn";
     titleText = tr.statusKillSwitch;
@@ -223,14 +265,36 @@ function renderStatusAndTelemetry() {
     ? `${activeProf.name} (${lri(s.resolvedEndpoint || activeProf.endpoint)})`
     : tr.noActiveServer;
 
+  el("recovery-banner").classList.toggle("hidden", !showRecovery);
+  el("btn-recovery-awg").disabled = recoveringAwg || generatingWarp || state.connecting;
+  el("btn-recovery-warp").disabled = recoveringAwg || generatingWarp || state.connecting;
+
+  const runningClients = (state.clients || []).filter((c) => c.running && c.enabled !== false);
+  const showQuickBind = !!(state.connected && runningClients.length > 0);
+  el("telegram-quick-bind").classList.toggle("hidden", !showQuickBind);
+  if (showQuickBind) {
+    el("lbl-quick-bind").textContent = tr.quickBindText(runningClients.map((c) => c.displayName).join(", "));
+  }
+
+  const hasProfiles = profiles.length > 0;
   const btnConn = el("btn-primary-connect");
   btnConn.textContent = state.connected ? tr.disconnect : tr.connect;
-  btnConn.disabled = state.connecting || generatingWarp || (!state.connected && (!state.profiles || state.profiles.length === 0));
+  btnConn.disabled = state.connecting || generatingWarp || recoveringAwg || (!state.connected && !hasProfiles);
+  btnConn.classList.toggle("btn-primary", hasProfiles);
+  btnConn.classList.toggle("btn-secondary", !hasProfiles);
+
+  const btnOnboardWarp = el("btn-onboard-warp");
+  if (btnOnboardWarp) {
+    btnOnboardWarp.textContent = generatingWarp ? tr.quickWarpBusy : tr.quickWarpBtn;
+    btnOnboardWarp.disabled = generatingWarp || state.connecting;
+  }
 
   const btnQuickWarp = el("btn-quick-warp");
   if (btnQuickWarp) {
     btnQuickWarp.textContent = generatingWarp ? tr.quickWarpBusy : tr.quickWarpBtn;
     btnQuickWarp.disabled = generatingWarp || state.connecting;
+    btnQuickWarp.classList.toggle("btn-primary", !hasProfiles);
+    btnQuickWarp.classList.toggle("btn-secondary", hasProfiles);
   }
 
   const btnVerify = el("btn-verify-route");
@@ -284,9 +348,9 @@ function renderClients() {
     meta.className = "row-meta mono";
     const trafficPart =
       c.rxBytes || c.txBytes || c.activeConns
-        ? ` | ${c.activeConns} conn | ${formatBytes(c.rxBytes, tr)} / ${formatBytes(c.txBytes, tr)}`
+        ? ` | ${tr.clientConns(c.activeConns)} | ${formatBytes(c.rxBytes, tr)} / ${formatBytes(c.txBytes, tr)}`
         : "";
-    meta.textContent = `${lri(c.exePath || "Microsoft Store MSIX")}${trafficPart}`;
+    meta.textContent = `${lri(c.exePath || tr.clientStoreLabel)}${trafficPart}`;
 
     main.appendChild(title);
     main.appendChild(meta);
@@ -386,14 +450,14 @@ function renderProfiles() {
     const title = document.createElement("div");
     title.className = "row-title";
     let pingTag = tr.pingPending;
-    if (p.lastPingMs > 0) pingTag = lri(`${p.lastPingMs} ms`);
+    if (p.lastPingMs > 0) pingTag = lri(`${p.lastPingMs} `) + tr.unitsMs;
     else if (p.lastPingMs < 0) pingTag = tr.pingUnreachable;
     title.textContent = `${isActive ? "* " : ""}${p.name} | ${pingTag}`;
 
     const meta = document.createElement("div");
     meta.className = "row-meta mono";
-    const awgTag = p.awgParams ? " | AWG" : "";
-    meta.textContent = `${lri(p.endpoint)} | MTU ${lri(String(p.mtu || 1280))}${awgTag}`;
+    const awgPart = p.awgParams ? ` | ${tr.awgTag}` : "";
+    meta.textContent = `${lri(p.endpoint)} | ${tr.mtuTag(p.mtu || 1280)}${awgPart}`;
 
     main.appendChild(title);
     main.appendChild(meta);
@@ -500,6 +564,7 @@ function renderSettingsAndLogs() {
 function renderAll() {
   applyThemeAndDirection();
   applyStaticLabels();
+  renderOnboardingVisibility();
   renderStatusAndTelemetry();
   renderClients();
   renderProfiles();
@@ -558,6 +623,7 @@ function openEditor(profile) {
   el("ed-mtu").value = p.mtu || 1280;
   el("ed-use-doh").checked = p.useDoH !== false;
   el("ed-awg-raw").value = p.awgParams || "";
+  el("awg-raw-details").open = false;
   el("modal-editor").classList.remove("hidden");
 }
 
@@ -602,18 +668,18 @@ async function runVerifyRoute() {
     body.innerHTML = "";
 
     const row1 = document.createElement("div");
-    row1.textContent = `${tr.verifyExit}: ${rep.exitIp ? lri(`${rep.exitIp} (${rep.country || "?"}) - ${rep.exitRttMs} ms`) : tr.verifyFail + (rep.exitError ? ` (${rep.exitError})` : "")}`;
+    row1.textContent = `${tr.verifyExit}: ${rep.exitIp ? lri(`${rep.exitIp} (${rep.country || "?"}) - ${rep.exitRttMs} `) + tr.unitsMs : tr.verifyFail + (rep.exitError ? ` (${lri(rep.exitError)})` : "")}`;
     body.appendChild(row1);
 
     const row2 = document.createElement("div");
-    row2.textContent = `${tr.verifyUdpReady}: ${rep.udpOk ? `${tr.verifyPass} (${lri(rep.udpRttMs + " ms")})` : `${tr.verifyFail} (${rep.udpError || ""})`}`;
+    row2.textContent = `${tr.verifyUdpReady}: ${rep.udpOk ? `${tr.verifyPass} (${lri(String(rep.udpRttMs))} ${tr.unitsMs})` : `${tr.verifyFail}${rep.udpError ? ` (${lri(rep.udpError)})` : ""}`}`;
     body.appendChild(row2);
 
     if (Array.isArray(rep.dcLatencies) && rep.dcLatencies.length) {
       const dcLine = document.createElement("div");
       dcLine.className = "mono";
       dcLine.textContent = rep.dcLatencies
-        .map((d) => `${d.dc}: ${d.ok ? d.rttMs + "ms" : "fail"}`)
+        .map((d) => `${lri(d.dc)}: ${d.ok ? `${lri(String(d.rttMs))} ${tr.unitsMs}` : tr.verifyDcFail}`)
         .join(" | ");
       body.appendChild(dcLine);
     }
@@ -624,6 +690,19 @@ async function runVerifyRoute() {
     verifying = false;
     renderStatusAndTelemetry();
   }
+}
+
+function maybeInviteToOfficialChannel() {
+  try {
+    if (localStorage.getItem("wgplus_channel_invited_v1") === "1") return;
+    localStorage.setItem("wgplus_channel_invited_v1", "1");
+    showToast(t().channelInviteToast);
+    setTimeout(() => {
+      try {
+        wailsRuntime()?.BrowserOpenURL("https://t.me/wgplus_official");
+      } catch {}
+    }, 700);
+  } catch {}
 }
 
 async function runQuickWarp(forceNew) {
@@ -643,6 +722,7 @@ async function runQuickWarp(forceNew) {
     } else {
       showToast(tr.toastWarpReady);
     }
+    maybeInviteToOfficialChannel();
     await runVerifyRoute();
   } catch (err) {
     showError(String(err));
@@ -667,6 +747,15 @@ function wireEvents() {
   );
   el("btn-dismiss-error").addEventListener("click", () => showError(""));
 
+  el("btn-onboard-warp").addEventListener("click", () => runQuickWarp(false));
+  el("btn-onboard-conf").addEventListener("click", () => el("btn-import-conf").click());
+  el("btn-onboard-qr").addEventListener("click", () => el("btn-import-qr").click());
+  el("btn-onboard-paste").addEventListener("click", () => el("btn-paste-import").click());
+  el("btn-onboard-show-full").addEventListener("click", () => {
+    onboardingDismissed = true;
+    renderOnboardingVisibility();
+  });
+
   el("btn-primary-connect").addEventListener("click", async () => {
     try {
       showError("");
@@ -675,6 +764,7 @@ function wireEvents() {
       } else {
         const target = state.activeProfileId || state.settings.activeProfileId || state.profiles?.[0]?.id || "";
         await api().Connect(target);
+        maybeInviteToOfficialChannel();
       }
       await refreshBootstrap();
     } catch (err) {
@@ -685,6 +775,35 @@ function wireEvents() {
 
   el("btn-verify-route").addEventListener("click", () => runVerifyRoute());
   el("btn-quick-warp").addEventListener("click", () => runQuickWarp(false));
+  el("btn-recovery-awg").addEventListener("click", async () => {
+    if (recoveringAwg) return;
+    recoveringAwg = true;
+    renderStatusAndTelemetry();
+    try {
+      await api().EnableAwg15AndReconnect();
+      await refreshBootstrap();
+      showToast(t().toastAwgRecovered);
+      await runVerifyRoute();
+    } catch (err) {
+      showError(String(err));
+    } finally {
+      recoveringAwg = false;
+      renderStatusAndTelemetry();
+    }
+  });
+  el("btn-recovery-warp").addEventListener("click", () => runQuickWarp(false));
+  el("btn-quick-apply-tg").addEventListener("click", async () => {
+    const runningClients = (state?.clients || []).filter((c) => c.running && c.enabled !== false);
+    if (!runningClients.length) return;
+    try {
+      const target = runningClients[0];
+      const res = await api().ApplyProxyToClient(target.id);
+      showToast(res.clipboardCopied ? t().toastAppliedCopy(target.displayName) : t().toastApplied(target.displayName));
+    } catch (err) {
+      showError(String(err));
+    }
+  });
+
   el("btn-close-verify").addEventListener("click", () => el("verify-panel").classList.add("hidden"));
 
   el("btn-scan-clients").addEventListener("click", async () => {
@@ -875,7 +994,7 @@ function wireEvents() {
         useDoH: el("ed-use-doh").checked,
       });
       el("ed-mtu").value = best;
-      showToast(`MTU ${best}`);
+      showToast(t().toastMtuFound(best));
     } catch (err) {
       showError(String(err));
     } finally {
@@ -974,6 +1093,7 @@ function subscribeRuntimeEvents() {
     if (!state || !snap) return;
     state.connected = snap.connected;
     state.connecting = snap.connecting;
+    state.connectedSinceUnix = snap.connectedSinceUnix;
     state.activeProfileId = snap.activeProfileId;
     state.lastError = snap.lastError;
     state.stats = snap.stats;
@@ -994,7 +1114,7 @@ function subscribeRuntimeEvents() {
 
   rt.EventsOn("failover", (info) => {
     if (info?.profileName) {
-      showToast(`${info.profileName} (${info.rttMs} ms)`);
+      showToast(`${info.profileName} (${info.rttMs} ${t().unitsMs})`);
     }
   });
 }

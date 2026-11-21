@@ -6,15 +6,18 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
+import android.content.ComponentCallbacks2;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.ServiceInfo;
+import android.content.res.Configuration;
 import android.graphics.Typeface;
 import android.os.Binder;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.Process;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.View;
@@ -25,6 +28,12 @@ import android.widget.TextView;
 
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
+import java.util.Arrays;
+import java.util.HashSet;
+import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import de.robv.android.xposed.IXposedHookLoadPackage;
@@ -36,16 +45,65 @@ import de.robv.android.xposed.callbacks.XC_LoadPackage;
 import de.robv.android.xposed.callbacks.XCallback;
 
 public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit {
-    private static final String TARGET_PLUS = "org.telegram.plus";
-    private static final String TARGET_OFFICIAL = "org.telegram.messenger";
+    private static final Set<String> SUPPORTED_TGNET_PACKAGES = new HashSet<>(Arrays.asList(
+            "org.telegram.plus",
+            "org.telegram.messenger",
+            "org.telegram.messenger.web",
+            "org.telegram.messenger.beta",
+            "org.telegram.gold",
+            "ir.ilmili.telegraph",
+            "ir.p2021.telegraph",
+            "com.radolyn.ayugram"
+    ));
     private static final String FAB_TAG = "wg_plus_floating_trigger";
+
+    private static final ExecutorService STARTUP_EXEC = Executors.newSingleThreadExecutor(r -> {
+        Thread t = new Thread(() -> {
+            try {
+                Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND);
+            } catch (Throwable ignored) {
+            }
+            r.run();
+        }, "wgplus-host-startup");
+        t.setDaemon(true);
+        return t;
+    });
 
     private static volatile String MODULE_PATH = null;
     private static volatile Context sHostAppContext = null;
     private static volatile boolean sLifecycleRegistered = false;
+    private static final AtomicBoolean sMemoryCallbacksRegistered = new AtomicBoolean(false);
 
     public static String getModulePath() {
         return MODULE_PATH;
+    }
+
+    public static void registerHostMemoryCallbacks(Context ctx) {
+        if (ctx == null || !sMemoryCallbacksRegistered.compareAndSet(false, true)) {
+            return;
+        }
+        Context appCandidate = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
+        if (!(appCandidate instanceof Application)) {
+            sMemoryCallbacksRegistered.set(false);
+            return;
+        }
+        ((Application) appCandidate).registerComponentCallbacks(new ComponentCallbacks2() {
+            @Override
+            public void onTrimMemory(int level) {
+                if (level >= TRIM_MEMORY_RUNNING_LOW || level >= TRIM_MEMORY_UI_HIDDEN) {
+                    ModuleHygieneManager.trimInMemoryCaches();
+                }
+            }
+
+            @Override
+            public void onConfigurationChanged(Configuration newConfig) {
+            }
+
+            @Override
+            public void onLowMemory() {
+                ModuleHygieneManager.trimInMemoryCaches();
+            }
+        });
     }
 
     @Override
@@ -60,7 +118,17 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
         if (lpparam == null || lpparam.packageName == null) {
             return;
         }
-        if (!TARGET_PLUS.equals(lpparam.packageName) && !TARGET_OFFICIAL.equals(lpparam.packageName)) {
+        if ("org.telegram.wgplus.module".equals(lpparam.packageName)) {
+            return;
+        }
+        if (TelegramXBridge.PACKAGE_NAME.equals(lpparam.packageName)) {
+            TelegramXBridge.installHooks(lpparam, MODULE_PATH);
+            return;
+        }
+        boolean knownClient = SUPPORTED_TGNET_PACKAGES.contains(lpparam.packageName);
+        boolean dynamicTgnetClient = !knownClient
+                && XposedHelpers.findClassIfExists("org.telegram.messenger.ApplicationLoader", lpparam.classLoader) != null;
+        if (!knownClient && !dynamicTgnetClient) {
             return;
         }
 
@@ -88,54 +156,63 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                 }
                                 sHostAppContext = appContext;
                                 final Context hostAppCtx = appContext;
-                                NativeBridgeLoader.ensureLoaded(hostAppCtx, MODULE_PATH);
 
-                                final boolean autoConnect = WireGuardManager.isAutoConnectEnabled(hostAppCtx);
-                                if (autoConnect) {
-                                    try {
-                                        wgbridge.Wgbridge.setTunnelStartupPending(true);
-                                    } catch (Throwable ignored) {
-                                    }
-                                }
-
-                                // 1. Engage strict fail-closed Kill Switch immediately before any network socket opens
-                                if (WireGuardManager.isKillSwitchEnabled(hostAppCtx)) {
-                                    int ksPort = WireGuardManager.enforceKillSwitchIfDisconnected(
-                                            hostAppCtx,
-                                            MODULE_PATH,
-                                            lpparam.classLoader
-                                    );
-                                    if (ksPort > 0) {
-                                        XposedBridge.log("WGPlus: Engaged strict kill switch guard on 127.0.0.1:" + ksPort);
-                                    }
-                                }
-
-                                // 2. Register ActivityLifecycleCallbacks for 24/7 Continuity & Foreground Fast-Resume
+                                // Fast lifecycle registration on main thread; zero heavy I/O or ZIP scanning here
                                 registerSmartKeepaliveLifecycle(hostAppCtx, lpparam.classLoader);
-                                if (WireGuardManager.shouldForceTelegramAlwaysAwake(hostAppCtx, MODULE_PATH)) {
-                                    WireGuardManager.syncForegroundKeepaliveService(hostAppCtx, true);
-                                }
+                                registerHostMemoryCallbacks(hostAppCtx);
 
-                                // 3. Auto-start configured WireGuard / AmneziaWG tunnel if enabled
-                                if (autoConnect) {
-                                    new Thread(() -> {
-                                        try {
-                                            int port = WireGuardManager.startAndBind(
+                                STARTUP_EXEC.execute(() -> {
+                                    try {
+                                        WireGuardManager.reportHookActiveToProvider(hostAppCtx, lpparam.packageName);
+                                        WireGuardManager.syncPullSharedStateFromProvider(hostAppCtx, true);
+                                        NativeBridgeLoader.ensureLoaded(hostAppCtx, MODULE_PATH);
+
+                                        final boolean autoConnect = WireGuardManager.isAutoConnectEnabled(hostAppCtx);
+                                        if (autoConnect) {
+                                            try {
+                                                wgbridge.Wgbridge.setTunnelStartupPending(true);
+                                            } catch (Throwable ignored) {
+                                            }
+                                        }
+
+                                        if (WireGuardManager.isKillSwitchEnabled(hostAppCtx)) {
+                                            int ksPort = WireGuardManager.enforceKillSwitchIfDisconnected(
                                                     hostAppCtx,
                                                     MODULE_PATH,
                                                     lpparam.classLoader
                                             );
-                                            XposedBridge.log("WGPlus: Auto-started WireGuard tunnel on 127.0.0.1:" + port);
-                                        } catch (Throwable err) {
-                                            XposedBridge.log("WGPlus: Auto-start failed: " + err.getMessage());
-                                        } finally {
-                                            try {
-                                                wgbridge.Wgbridge.setTunnelStartupPending(false);
-                                            } catch (Throwable ignored) {
+                                            if (ksPort > 0) {
+                                                XposedBridge.log("WGPlus: Engaged strict kill switch guard on 127.0.0.1:" + ksPort);
                                             }
                                         }
-                                    }, "wg-plus-autostart").start();
-                                }
+
+                                        if (WireGuardManager.shouldForceTelegramAlwaysAwake(hostAppCtx, MODULE_PATH)) {
+                                            WireGuardManager.syncForegroundKeepaliveService(hostAppCtx, true);
+                                        }
+
+                                        if (autoConnect) {
+                                            try {
+                                                int port = WireGuardManager.startAndBind(
+                                                        hostAppCtx,
+                                                        MODULE_PATH,
+                                                        lpparam.classLoader
+                                                );
+                                                XposedBridge.log("WGPlus: Auto-started WireGuard tunnel on 127.0.0.1:" + port);
+                                            } catch (Throwable err) {
+                                                XposedBridge.log("WGPlus: Auto-start failed: " + err.getMessage());
+                                            } finally {
+                                                try {
+                                                    wgbridge.Wgbridge.setTunnelStartupPending(false);
+                                                } catch (Throwable ignored) {
+                                                }
+                                            }
+                                        }
+
+                                        ModuleHygieneManager.runAutoHygieneIfDueAsync(hostAppCtx);
+                                    } catch (Throwable t) {
+                                        XposedBridge.log("WGPlus startup worker warning: " + t.getMessage());
+                                    }
+                                });
                             } catch (Throwable t) {
                                 XposedBridge.log(t);
                             }
@@ -186,6 +263,10 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                 if (remaining <= 0) {
                     startedCount.set(0);
                     WireGuardManager.onAppForegroundStateChanged(hostAppCtx, MODULE_PATH, telegramClassLoader, false);
+                    STARTUP_EXEC.execute(() -> {
+                        ModuleHygieneManager.trimInMemoryCaches();
+                        WireGuardManager.pollAndRunRemoteHygieneIfRequested(hostAppCtx);
+                    });
                 }
             }
 
@@ -650,17 +731,17 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                         protected void afterHookedMethod(MethodHookParam param) {
                             try {
                                 Object result = param.getResult();
-                                if (!(result instanceof FrameLayout)) {
+                                if (!(result instanceof ViewGroup)) {
                                     return;
                                 }
-                                FrameLayout rootFrame = (FrameLayout) result;
-                                if (rootFrame.findViewWithTag(FAB_TAG) != null) {
+                                ViewGroup rootGroup = (ViewGroup) result;
+                                if (rootGroup.findViewWithTag(FAB_TAG) != null) {
                                     return;
                                 }
 
                                 Context argCtx = (param.args != null && param.args.length > 0 && param.args[0] instanceof Context)
                                         ? (Context) param.args[0]
-                                        : rootFrame.getContext();
+                                        : rootGroup.getContext();
                                 Context resolvedCtx = resolveActivityContext(param.thisObject, argCtx);
                                 if (resolvedCtx == null) {
                                     return;
@@ -744,7 +825,14 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                         WireGuardDialog.show(dialogCtx, lpparam.classLoader, MODULE_PATH, syncTriggerStyle)
                                 );
 
-                                rootFrame.addView(triggerBtn, lp);
+                                if (rootGroup instanceof FrameLayout) {
+                                    rootGroup.addView(triggerBtn, lp);
+                                } else {
+                                    rootGroup.addView(triggerBtn, new ViewGroup.LayoutParams(
+                                            ViewGroup.LayoutParams.WRAP_CONTENT,
+                                            ViewGroup.LayoutParams.WRAP_CONTENT
+                                    ));
+                                }
 
                                 try {
                                     Object actionBar = XposedHelpers.getObjectField(param.thisObject, "actionBar");

@@ -50,11 +50,16 @@ public final class PrivilegeBridge {
     private static final String KEY_DAEMON_UID = "daemon_uid";
     private static final String KEY_DAEMON_TOKEN = "daemon_token";
     private static final String KEY_DAEMON_SEEN_MS = "daemon_seen_ms";
+    private static final String KEY_ROOT_GRANTED_BOOT = "root_granted_boot";
+    private static final String KEY_EXEMPTIONS_BOOT = "exemptions_applied_boot";
 
+    private static final Object ROOT_BOOTSTRAP_LOCK = new Object();
     private static final ExecutorService DAEMON_EXEC = Executors.newSingleThreadExecutor();
     private static volatile IBinder sCachedActivityBinder;
     private static volatile int sCachedSetProcessImportantTx = -1;
+    private static volatile int sCachedBootCount = -2;
     private static volatile long sLastRootCheckMs;
+    private static volatile boolean sRootProbedOnce;
     private static volatile boolean sLastRootAvailable;
     private static volatile long sLastDaemonPingMs;
     private static volatile boolean sLastDaemonAlive;
@@ -135,21 +140,94 @@ public final class PrivilegeBridge {
         }
     }
 
+    public static int getBootCount(Context context) {
+        if (sCachedBootCount >= 0) {
+            return sCachedBootCount;
+        }
+        if (context == null) {
+            return -1;
+        }
+        try {
+            int count = Settings.Global.getInt(context.getContentResolver(), Settings.Global.BOOT_COUNT, -1);
+            if (count >= 0) {
+                sCachedBootCount = count;
+            }
+            return count;
+        } catch (Throwable ignored) {
+            return -1;
+        }
+    }
+
+    public static boolean hasExemptionsAppliedThisBoot(Context context) {
+        if (context == null) {
+            return false;
+        }
+        int boot = getBootCount(context);
+        if (boot < 0) {
+            return false;
+        }
+        return cachePrefs(context).getInt(KEY_EXEMPTIONS_BOOT, -2) == boot;
+    }
+
+    public static void markExemptionsAppliedThisBoot(Context context) {
+        if (context == null) {
+            return;
+        }
+        int boot = getBootCount(context);
+        if (boot >= 0) {
+            cachePrefs(context).edit().putInt(KEY_EXEMPTIONS_BOOT, boot).apply();
+        }
+    }
+
+    public static boolean hasRootBinaryOnDisk() {
+        for (String path : new String[]{
+                "/system/bin/su",
+                "/system/xbin/su",
+                "/sbin/su",
+                "/debug_ramdisk/su",
+                "/vendor/bin/su",
+                "/data/local/tmp/su"
+        }) {
+            if (new File(path).exists()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Passive root status check used by UI renderers and snapshots.
+     * NEVER spawns a {@code su} child process or triggers Magisk superuser toasts.
+     */
+    public static boolean isRootAvailablePassive(Context context) {
+        if (sLastDaemonAlive && sLastDaemonUid == 0) {
+            return true;
+        }
+        if (sRootProbedOnce) {
+            return sLastRootAvailable;
+        }
+        if (context != null) {
+            int boot = getBootCount(context);
+            if (boot >= 0 && cachePrefs(context).getInt(KEY_ROOT_GRANTED_BOOT, -2) == boot) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static boolean hasRootAccess() {
-        long now = System.currentTimeMillis();
-        if (sLastRootCheckMs > 0 && (now - sLastRootCheckMs) < 30000L) {
+        if (sLastDaemonAlive && sLastDaemonUid == 0) {
+            sLastRootAvailable = true;
+            sRootProbedOnce = true;
+            return true;
+        }
+        if (sRootProbedOnce) {
             return sLastRootAvailable;
         }
         if (Looper.myLooper() == Looper.getMainLooper()) {
             return sLastRootAvailable;
         }
-        boolean foundBin = false;
-        for (String path : new String[]{"/system/bin/su", "/system/xbin/su", "/sbin/su", "/vendor/bin/su", "/data/local/tmp/su"}) {
-            if (new File(path).exists()) {
-                foundBin = true;
-                break;
-            }
-        }
+        boolean foundBin = hasRootBinaryOnDisk();
         if (!foundBin) {
             ShellResult res = runLocalProcess(new String[]{"/system/bin/sh", "-c", "command -v su"}, 800);
             foundBin = res.ok && !res.output.isEmpty();
@@ -160,6 +238,7 @@ public final class PrivilegeBridge {
             rootOk = idRes.ok && idRes.output.contains("uid=0");
         }
         sLastRootAvailable = rootOk;
+        sRootProbedOnce = true;
         sLastRootCheckMs = System.currentTimeMillis();
         return rootOk;
     }
@@ -373,27 +452,90 @@ public final class PrivilegeBridge {
                 if (isStandaloneDaemonAlive(appCtx)) {
                     return;
                 }
-                String launchCmd = buildDaemonLaunchCommand(appCtx, targets);
-                if (launchCmd.isEmpty()) {
+                if (BuiltinAdbKeyManager.isPaired(appCtx)) {
+                    WgAdbConnectionManager.getInstance(appCtx).bootstrapSovereignShell(true);
                     return;
                 }
-                if (hasRootAccess()) {
-                    runRootCommand(launchCmd, 3000);
-                } else if (BuiltinAdbKeyManager.isPaired(appCtx)) {
-                    WgAdbConnectionManager.getInstance(appCtx).bootstrapSovereignShell(true);
-                }
+                String listenerComp = appCtx.getPackageName() + "/" + KeepaliveBridgeListenerService.class.getName();
+                bootstrapRootOncePerBoot(appCtx, targets, listenerComp, true);
             } catch (Throwable ignored) {
             }
         });
     }
 
-    public static ShellResult runShellCommand(Context context, String command, int timeoutMs) {
-        if (hasRootAccess()) {
-            ShellResult rootRes = runRootCommand(command, timeoutMs);
-            if (rootRes.ok) {
-                return rootRes;
-            }
+    /**
+     * Consolidates OS continuity exemptions + detached root daemon startup into a single
+     * {@code su -c} invocation at most once per device boot so Magisk does not show
+     * repeated superuser toasts on every app resume.
+     */
+    public static boolean bootstrapRootOncePerBoot(
+            Context context,
+            List<String> targetPackages,
+            String listenerComponent,
+            boolean grantListener
+    ) {
+        if (context == null) {
+            return false;
         }
+        Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        synchronized (ROOT_BOOTSTRAP_LOCK) {
+            if (isStandaloneDaemonAlive(appCtx)) {
+                if (!hasExemptionsAppliedThisBoot(appCtx)) {
+                    String resp = sendDaemonCommand(appCtx, "EXEMPT", 12000);
+                    if (resp != null && resp.startsWith("OK")) {
+                        markExemptionsAppliedThisBoot(appCtx);
+                    }
+                }
+                return true;
+            }
+            if (!hasRootAccess()) {
+                return false;
+            }
+            String launchCmd = buildDaemonLaunchCommand(appCtx, targetPackages);
+            StringBuilder combined = new StringBuilder();
+            if (!hasExemptionsAppliedThisBoot(appCtx) && targetPackages != null && !targetPackages.isEmpty()) {
+                combined.append(DaemonProcessHelper.buildDeepExemptionsShellScript(
+                        appCtx.getPackageName(),
+                        targetPackages,
+                        listenerComponent,
+                        grantListener
+                ));
+            }
+            if (!launchCmd.isEmpty()) {
+                combined.append(launchCmd);
+            }
+            if (combined.length() == 0) {
+                return true;
+            }
+            ShellResult res = runRootCommand(combined.toString(), 12000);
+            if (res.ok) {
+                int boot = getBootCount(appCtx);
+                SharedPreferences.Editor ed = cachePrefs(appCtx).edit();
+                if (boot >= 0) {
+                    ed.putInt(KEY_ROOT_GRANTED_BOOT, boot);
+                    ed.putInt(KEY_EXEMPTIONS_BOOT, boot);
+                }
+                ed.apply();
+                sLastDaemonLaunchMs = System.currentTimeMillis();
+                // Wait briefly for the detached root daemon to register on 127.0.0.1
+                for (int i = 0; i < 6; i++) {
+                    try {
+                        Thread.sleep(120L);
+                    } catch (InterruptedException ignored) {
+                        break;
+                    }
+                    if (isStandaloneDaemonAlive(appCtx)) {
+                        break;
+                    }
+                }
+                return true;
+            }
+            return false;
+        }
+    }
+
+    public static ShellResult runShellCommand(Context context, String command, int timeoutMs) {
+        // Always prefer active loopback daemon first (zero su spawns / zero Magisk toasts)
         if (context != null && isStandaloneDaemonAlive(context)) {
             ShellResult daemonRes = runCommandViaDaemon(context, command, timeoutMs);
             if (daemonRes != null) {
@@ -409,6 +551,12 @@ public final class PrivilegeBridge {
             } catch (Throwable ignored) {
             }
         }
+        if (hasRootAccess()) {
+            ShellResult rootRes = runRootCommand(command, timeoutMs);
+            if (rootRes.ok) {
+                return rootRes;
+            }
+        }
         return runLocalProcess(new String[]{"/system/bin/sh", "-c", command + " 2>&1"}, timeoutMs);
     }
 
@@ -416,30 +564,31 @@ public final class PrivilegeBridge {
         if (pid <= 0 || context == null) {
             return false;
         }
-        boolean rootBoosted = false;
-        if (hasRootAccess() && important) {
-            rootBoosted = applyRootKernelBoost(pid);
-        }
 
+        // Tier 1: Direct self-privilege Binder call using SET_PROCESS_LIMIT (zero su calls)
         IBinder activityBinder = resolveActivityManagerBinder();
         int txCode = resolveSetProcessImportantTxCode(context);
-
-        // Tier 1: Direct self-privilege Binder call using SET_PROCESS_LIMIT
+        boolean binderOk = false;
         if (hasSelfProcessLimitPermission(context) && activityBinder != null && txCode > 0) {
-            if (transactSetProcessImportant(activityBinder, txCode, pid, important)) {
-                return true;
-            }
+            binderOk = transactSetProcessImportant(activityBinder, txCode, pid, important);
         }
 
-        // Tier 2: Built-in standalone wgplus_daemon over authenticated loopback TCP
+        // Tier 2: Built-in standalone wgplus_daemon (applies BOTH setProcessImportant & oom_score_adj under uid=0)
         if (isStandaloneDaemonAlive(context)) {
             String resp = sendDaemonCommand(context, "IMP " + pid + " " + (important ? "1" : "0"), 1500);
             if (resp != null && resp.startsWith("OK")) {
                 return true;
             }
         }
+        if (binderOk) {
+            return true;
+        }
 
-        return rootBoosted;
+        // Tier 3: Fallback direct root boost ONLY when daemon is not alive yet
+        if (important && hasRootAccess()) {
+            return applyRootKernelBoost(pid);
+        }
+        return false;
     }
 
     private static boolean transactSetProcessImportant(
@@ -480,16 +629,20 @@ public final class PrivilegeBridge {
             return false;
         }
         boolean listenerOk = !grantListener || selfHealNotificationListener(context);
-        boolean root = hasRootAccess();
-        boolean daemon = !root && isStandaloneDaemonAlive(context);
-        boolean pairedAdb = !root && !daemon && BuiltinAdbKeyManager.isPaired(context);
-        if (!root && !daemon && !pairedAdb) {
-            return listenerOk;
+        boolean daemon = isStandaloneDaemonAlive(context);
+        if (daemon) {
+            if (hasExemptionsAppliedThisBoot(context)) {
+                return true;
+            }
+            String resp = sendDaemonCommand(context, "EXEMPT", 12000);
+            if (resp != null && resp.startsWith("OK")) {
+                markExemptionsAppliedThisBoot(context);
+                return true;
+            }
         }
 
-        if (!root && !daemon) {
-            // Let bootstrapSovereignShell launch wgplus_daemon cleanly in <1s; the daemon
-            // itself runs the full 70-command deep exemptions asynchronously under uid=2000.
+        boolean pairedAdb = BuiltinAdbKeyManager.isPaired(context);
+        if (pairedAdb) {
             boolean booted = false;
             try {
                 booted = WgAdbConnectionManager.getInstance(context).bootstrapSovereignShell(true);
@@ -499,25 +652,25 @@ public final class PrivilegeBridge {
             return booted || listenerOk || grantListener == KeepaliveBridgeListenerService.isNotificationListenerEnabled(context);
         }
 
-        String script = DaemonProcessHelper.buildDeepExemptionsShellScript(
-                context.getPackageName(),
-                targetPackages,
-                listenerComponent,
-                grantListener
-        );
-        ShellResult res = runRootOrDaemonCommand(context, script, 12000);
-        return (res != null && res.ok) || listenerOk || grantListener == KeepaliveBridgeListenerService.isNotificationListenerEnabled(context);
+        if (hasRootAccess()) {
+            return bootstrapRootOncePerBoot(context, targetPackages, listenerComponent, grantListener)
+                    || listenerOk;
+        }
+        return listenerOk;
     }
 
     private static ShellResult runRootOrDaemonCommand(Context context, String command, int timeoutMs) {
+        if (context != null && isStandaloneDaemonAlive(context)) {
+            ShellResult daemonRes = runCommandViaDaemon(context, command, timeoutMs);
+            if (daemonRes != null) {
+                return daemonRes;
+            }
+        }
         if (hasRootAccess()) {
             ShellResult rootRes = runRootCommand(command, timeoutMs);
             if (rootRes.ok) {
                 return rootRes;
             }
-        }
-        if (context != null && isStandaloneDaemonAlive(context)) {
-            return runCommandViaDaemon(context, command, timeoutMs);
         }
         return null;
     }

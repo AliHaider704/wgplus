@@ -87,14 +87,34 @@ final class UpdateGate {
         Release r = new Release();
         r.pageUrl = j.optString("html_url");
         r.apkUrl = r.pageUrl;
+        String tagVer = j.optString("tag_name", "").trim();
+        if (tagVer.startsWith("v") || tagVer.startsWith("V")) {
+            tagVer = tagVer.substring(1).trim();
+        }
+        String deviceAbi = (android.os.Build.SUPPORTED_ABIS != null && android.os.Build.SUPPORTED_ABIS.length > 0)
+                ? android.os.Build.SUPPORTED_ABIS[0] : "";
+        String abiApkUrl = null;
+        String universalApkUrl = null;
         JSONArray assets = j.optJSONArray("assets");
         for (int i = 0; assets != null && i < assets.length(); i++) {
             JSONObject a = assets.getJSONObject(i);
-            Matcher m = APK.matcher(a.optString("name"));
+            String assetName = a.optString("name");
+            String url = a.optString("browser_download_url", "");
+            Matcher m = APK.matcher(assetName);
             if (m.matches()) {
                 r.version = m.group(1);
-                r.apkUrl = a.optString("browser_download_url", r.pageUrl);
+                if (!url.isEmpty()) universalApkUrl = url;
+            } else if (!deviceAbi.isEmpty() && assetName.endsWith("-" + deviceAbi + ".apk")) {
+                if (!url.isEmpty()) abiApkUrl = url;
             }
+        }
+        if (r.version == null && !tagVer.isEmpty()) {
+            r.version = tagVer;
+        }
+        if (abiApkUrl != null) {
+            r.apkUrl = abiApkUrl;
+        } else if (universalApkUrl != null) {
+            r.apkUrl = universalApkUrl;
         }
         if (r.version == null) return null;
         boolean inAr = false;

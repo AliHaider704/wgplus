@@ -5,10 +5,15 @@ import android.os.Build;
 import android.system.Os;
 import android.util.Log;
 
+import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
+import java.io.FileReader;
 import java.io.InputStream;
+import java.io.OutputStreamWriter;
+import java.nio.charset.StandardCharsets;
 import java.util.Enumeration;
+import java.util.Locale;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 import java.util.zip.ZipInputStream;
@@ -19,11 +24,16 @@ import wgbridge.Wgbridge;
 public final class NativeBridgeLoader {
     private static final String TAG = "WGPlusNativeLoader";
     private static final String LIB_NAME = "libgojni.so";
+    private static final String META_NAME = "libgojni.meta";
 
     private static volatile boolean sLoaded = false;
     private static volatile Throwable sLoadFailure = null;
 
     private NativeBridgeLoader() {
+    }
+
+    public static boolean isLoaded() {
+        return sLoaded;
     }
 
     public static synchronized void ensureLoaded(Context hostContext, String moduleApkPath) {
@@ -50,12 +60,22 @@ public final class NativeBridgeLoader {
             Log.w(TAG, "Could not create wg_native directory: " + nativeDir);
         }
         File targetSo = new File(nativeDir, LIB_NAME);
+        File metaFile = new File(nativeDir, META_NAME);
+        File staleTmp = new File(nativeDir, LIB_NAME + ".tmp");
+        if (staleTmp.exists()) {
+            makeWritableForDelete(staleTmp);
+            staleTmp.delete();
+        }
 
         try {
-            boolean extracted = tryExtractFromCandidates(appCtx, moduleApkPath, targetSo);
+            boolean fastPathHit = isFastPathValid(appCtx, moduleApkPath, targetSo, metaFile);
+            boolean extracted = fastPathHit || tryExtractFromCandidates(appCtx, moduleApkPath, targetSo);
             if (extracted && targetSo.exists()) {
                 applyReadOnlyExecPermissions(targetSo);
                 System.load(targetSo.getAbsolutePath());
+                if (!fastPathHit) {
+                    writeFastPathMeta(appCtx, moduleApkPath, targetSo, metaFile);
+                }
             } else {
                 System.loadLibrary("gojni");
             }
@@ -66,14 +86,69 @@ public final class NativeBridgeLoader {
             Wgbridge.touch();
 
             sLoaded = true;
-            Log.i(TAG, "Successfully initialized libgojni.so and wgbridge JNI");
+            Log.i(TAG, "Successfully initialized libgojni.so and wgbridge JNI (fastPath=" + fastPathHit + ")");
         } catch (Throwable t) {
+            if (metaFile.exists()) {
+                metaFile.delete();
+            }
             sLoadFailure = t;
             Log.e(TAG, "Failed loading native WireGuard bridge", t);
             throw new IllegalStateException(
                     t.getClass().getSimpleName() + ": " + t.getMessage(),
                     t
             );
+        }
+    }
+
+    private static String computeHostFingerprint(Context appCtx, String moduleApkPath) {
+        String hostSourceDir = appCtx.getApplicationInfo() != null ? appCtx.getApplicationInfo().sourceDir : "";
+        File hostApk = (hostSourceDir != null && !hostSourceDir.isEmpty()) ? new File(hostSourceDir) : null;
+        long hostMod = hostApk != null && hostApk.exists() ? hostApk.lastModified() : 0L;
+        long hostLen = hostApk != null && hostApk.exists() ? hostApk.length() : 0L;
+        long modLen = 0L;
+        long modTime = 0L;
+        if (moduleApkPath != null && !moduleApkPath.isEmpty() && !moduleApkPath.contains("!/")) {
+            File mf = new File(moduleApkPath.trim());
+            if (mf.exists()) {
+                modLen = mf.length();
+                modTime = mf.lastModified();
+            }
+        }
+        String abi = (Build.SUPPORTED_ABIS != null && Build.SUPPORTED_ABIS.length > 0)
+                ? Build.SUPPORTED_ABIS[0]
+                : "unknown";
+        return BuildConfigSafeVersion() + "|" + abi + "|" + hostMod + "|" + hostLen + "|" + modTime + "|" + modLen;
+    }
+
+    private static String BuildConfigSafeVersion() {
+        return WgStrings.VERSION_LABEL;
+    }
+
+    private static boolean isFastPathValid(Context appCtx, String moduleApkPath, File targetSo, File metaFile) {
+        if (!targetSo.exists() || targetSo.length() <= 65536 || !metaFile.exists()) {
+            return false;
+        }
+        try (BufferedReader br = new BufferedReader(new FileReader(metaFile))) {
+            String stored = br.readLine();
+            if (stored == null) {
+                return false;
+            }
+            String expected = computeHostFingerprint(appCtx, moduleApkPath) + "|" + targetSo.length();
+            return expected.equals(stored.trim());
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void writeFastPathMeta(Context appCtx, String moduleApkPath, File targetSo, File metaFile) {
+        if (!targetSo.exists() || targetSo.length() <= 0) {
+            return;
+        }
+        String payload = computeHostFingerprint(appCtx, moduleApkPath) + "|" + targetSo.length();
+        try (OutputStreamWriter ow = new OutputStreamWriter(new FileOutputStream(metaFile, false), StandardCharsets.UTF_8)) {
+            ow.write(payload);
+            ow.flush();
+        } catch (Throwable ignored) {
         }
     }
 
@@ -113,17 +188,7 @@ public final class NativeBridgeLoader {
             }
         }
 
-        // 2. Check LSPatch cache / code_cache directories (.apk, .bin, .jar, .zip)
-        if (extractFromDirectoryArchives(appCtx.getCacheDir(), targetSo, 0)) {
-            return true;
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            if (extractFromDirectoryArchives(appCtx.getCodeCacheDir(), targetSo, 0)) {
-                return true;
-            }
-        }
-
-        // 3. Check host APK's assets/lspatch/modules/* (.apk or .bin in LSPatch Portable/Integrated mode)
+        // 2. Host APK and embedded LSPatch module payloads (fast direct Zip lookup, zero media scanning)
         String hostSourceDir = appCtx.getApplicationInfo() != null ? appCtx.getApplicationInfo().sourceDir : null;
         if (hostSourceDir != null) {
             File hostApk = new File(hostSourceDir);
@@ -135,11 +200,44 @@ public final class NativeBridgeLoader {
             }
         }
 
+        // 3. Targeted code_cache / LSPatch cache fallback (never scanning media directories)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            if (extractFromDirectoryArchives(appCtx.getCodeCacheDir(), targetSo, 0)) {
+                return true;
+            }
+        }
+        File lspatchCache = new File(appCtx.getCacheDir(), "lspatch");
+        if (lspatchCache.isDirectory() && extractFromDirectoryArchives(lspatchCache, targetSo, 0)) {
+            return true;
+        }
+        if (extractFromDirectoryArchives(appCtx.getCacheDir(), targetSo, 0)) {
+            return true;
+        }
+
         return targetSo.exists() && targetSo.length() > 0;
     }
 
+    private static boolean shouldSkipCacheScanDir(String dirName) {
+        if (dirName == null) {
+            return false;
+        }
+        String low = dirName.toLowerCase(Locale.ROOT);
+        return "images".equals(low)
+                || "video".equals(low)
+                || "audio".equals(low)
+                || "stickers".equals(low)
+                || "voice".equals(low)
+                || "documents".equals(low)
+                || "stories".equals(low)
+                || "thumbs".equals(low)
+                || "emoji".equals(low)
+                || "webview".equals(low)
+                || low.contains("chromium")
+                || low.contains("telegram images");
+    }
+
     private static boolean extractFromDirectoryArchives(File dir, File targetSo, int depth) {
-        if (dir == null || !dir.isDirectory() || depth > 5) {
+        if (dir == null || !dir.isDirectory() || depth > 3) {
             return false;
         }
         File[] children = dir.listFiles();
@@ -148,11 +246,14 @@ public final class NativeBridgeLoader {
         }
         for (File child : children) {
             if (child.isDirectory()) {
+                if (shouldSkipCacheScanDir(child.getName())) {
+                    continue;
+                }
                 if (extractFromDirectoryArchives(child, targetSo, depth + 1)) {
                     return true;
                 }
             } else if (child.length() > 65536) {
-                String lower = child.getName().toLowerCase();
+                String lower = child.getName().toLowerCase(Locale.ROOT);
                 if (lower.endsWith(".apk") || lower.endsWith(".bin") || lower.endsWith(".jar") || lower.endsWith(".zip")) {
                     if (extractFromZipFile(child, targetSo)) {
                         return true;
@@ -229,6 +330,10 @@ public final class NativeBridgeLoader {
                 String entryName = ze.getName();
                 for (String wanted : candidatePaths) {
                     if (wanted.equals(entryName)) {
+                        long expectedSize = ze.getSize();
+                        if (expectedSize > 0 && targetSo.exists() && targetSo.length() == expectedSize) {
+                            return true;
+                        }
                         writeStreamAtomically(zis, targetSo);
                         return true;
                     }

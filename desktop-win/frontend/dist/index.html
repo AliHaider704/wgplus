@@ -18,7 +18,7 @@
       </div>
       <div class="topbar-actions">
         <button id="btn-hide-tray" class="btn btn-subtle" type="button"></button>
-        <button id="btn-lang-toggle" class="btn btn-subtle" type="button">AR</button>
+        <button id="btn-lang-toggle" class="btn btn-subtle" type="button">العربية</button>
         <button id="btn-theme-toggle" class="btn btn-subtle" type="button"></button>
       </div>
     </header>
@@ -28,7 +28,28 @@
       <button id="btn-dismiss-error" class="btn btn-mini" type="button"></button>
     </div>
 
-    <main class="main-grid">
+    <!-- Zero-State First-Run Onboarding Card (shown automatically when 0 servers exist) -->
+    <section id="onboarding-card" class="onboarding-wrap hidden" aria-labelledby="lbl-onboard-title">
+      <article class="card onboarding-card">
+        <div class="onboarding-copy">
+          <h2 id="lbl-onboard-title" class="onboarding-title"></h2>
+          <p id="lbl-onboard-desc" class="card-desc"></p>
+        </div>
+        <div class="onboarding-primary-row">
+          <button id="btn-onboard-warp" class="btn btn-primary btn-lg" type="button"></button>
+        </div>
+        <div class="onboarding-secondary-row">
+          <button id="btn-onboard-conf" class="btn btn-secondary" type="button"></button>
+          <button id="btn-onboard-qr" class="btn btn-secondary" type="button"></button>
+          <button id="btn-onboard-paste" class="btn btn-secondary" type="button"></button>
+        </div>
+        <div class="onboarding-foot">
+          <button id="btn-onboard-show-full" class="btn btn-link" type="button"></button>
+        </div>
+      </article>
+    </section>
+
+    <main id="main-grid" class="main-grid">
       <section class="col-left">
         <!-- Focal Status & Primary Action Card -->
         <article class="card card-focal">
@@ -46,9 +67,24 @@
             </div>
           </div>
 
-          <div class="quick-warp-bar">
-            <button id="btn-quick-warp" class="btn btn-warp" type="button"></button>
+          <div id="quick-warp-bar" class="quick-warp-bar hidden">
+            <button id="btn-quick-warp" class="btn btn-secondary" type="button"></button>
             <span id="lbl-quick-warp-hint" class="quick-warp-hint"></span>
+          </div>
+
+          <!-- Stalled / Unresponsive Handshake Recovery Strip -->
+          <div id="recovery-banner" class="recovery-banner hidden" role="status">
+            <div id="lbl-recovery-hint" class="recovery-copy"></div>
+            <div class="toolbar-row">
+              <button id="btn-recovery-awg" class="btn btn-secondary" type="button"></button>
+              <button id="btn-recovery-warp" class="btn btn-subtle" type="button"></button>
+            </div>
+          </div>
+
+          <!-- Contextual Active Telegram Quick-Bind Strip -->
+          <div id="telegram-quick-bind" class="quick-bind-bar hidden">
+            <span id="lbl-quick-bind" class="quick-bind-copy"></span>
+            <button id="btn-quick-apply-tg" class="btn btn-subtle" type="button"></button>
           </div>
 
           <div class="telemetry-strip">
@@ -125,7 +161,7 @@
       </section>
 
       <section class="col-right">
-        <!-- Servers & AmneziaWG Card -->
+        <!-- Servers & DPI Bypass Card -->
         <article class="card">
           <div class="card-head">
             <div>
@@ -145,7 +181,7 @@
           <div id="profiles-list" class="list-stack"></div>
         </article>
 
-        <!-- Armor, Routing & Continuity Card -->
+        <!-- Daily Settings & Collapsed Advanced Options Card -->
         <article class="card">
           <div class="card-head">
             <div>
@@ -154,44 +190,15 @@
             </div>
           </div>
 
+          <!-- 4 Daily Essential Controls -->
           <div class="settings-grid">
             <label class="setting-row">
               <div class="setting-copy">
-                <span id="lbl-killswitch" class="setting-name"></span>
-                <span id="desc-killswitch" class="setting-hint"></span>
+                <span id="lbl-autostart" class="setting-name"></span>
+                <span id="desc-autostart" class="setting-hint"></span>
               </div>
-              <input id="set-killswitch" type="checkbox" class="toggle" />
+              <input id="set-autostart" type="checkbox" class="toggle" />
             </label>
-
-            <div class="setting-row">
-              <div class="setting-copy">
-                <span id="lbl-guard-mode" class="setting-name"></span>
-                <span id="desc-guard-mode" class="setting-hint"></span>
-              </div>
-              <select id="set-guard-mode" class="select-input">
-                <option value="strict"></option>
-                <option value="log_only"></option>
-              </select>
-            </div>
-
-            <div class="setting-row">
-              <div class="setting-copy">
-                <span id="lbl-socks-auth" class="setting-name"></span>
-                <span id="desc-socks-auth" class="setting-hint mono"></span>
-              </div>
-              <div class="inline-controls">
-                <button id="btn-rotate-creds" class="btn btn-mini" type="button"></button>
-                <input id="set-socks-auth" type="checkbox" class="toggle" />
-              </div>
-            </div>
-
-            <div class="setting-row">
-              <div class="setting-copy">
-                <span id="lbl-socks-port" class="setting-name"></span>
-                <span id="desc-socks-port" class="setting-hint"></span>
-              </div>
-              <input id="set-socks-port" type="number" min="1024" max="65535" class="num-input mono" />
-            </div>
 
             <label class="setting-row">
               <div class="setting-copy">
@@ -203,61 +210,10 @@
 
             <label class="setting-row">
               <div class="setting-copy">
-                <span id="lbl-autodisconnect-tg" class="setting-name"></span>
-                <span id="desc-autodisconnect-tg" class="setting-hint"></span>
+                <span id="lbl-killswitch" class="setting-name"></span>
+                <span id="desc-killswitch" class="setting-hint"></span>
               </div>
-              <input id="set-autodisconnect-tg" type="checkbox" class="toggle" />
-            </label>
-
-            <label class="setting-row">
-              <div class="setting-copy">
-                <span id="lbl-autofailover" class="setting-name"></span>
-                <span id="desc-autofailover" class="setting-hint"></span>
-              </div>
-              <input id="set-autofailover" type="checkbox" class="toggle" />
-            </label>
-
-            <label class="setting-row">
-              <div class="setting-copy">
-                <span id="lbl-block-ipv6" class="setting-name"></span>
-                <span id="desc-block-ipv6" class="setting-hint"></span>
-              </div>
-              <input id="set-block-ipv6" type="checkbox" class="toggle" />
-            </label>
-
-            <label class="setting-row">
-              <div class="setting-copy">
-                <span id="lbl-doh" class="setting-name"></span>
-                <span id="desc-doh" class="setting-hint"></span>
-              </div>
-              <input id="set-doh" type="checkbox" class="toggle" />
-            </label>
-
-            <div class="setting-row">
-              <div class="setting-copy">
-                <span id="lbl-http-proxy" class="setting-name"></span>
-                <span id="desc-http-proxy" class="setting-hint"></span>
-              </div>
-              <div class="inline-controls">
-                <input id="set-http-port" type="number" min="1024" max="65535" class="num-input mono" />
-                <input id="set-http-proxy" type="checkbox" class="toggle" />
-              </div>
-            </div>
-
-            <label class="setting-row">
-              <div class="setting-copy">
-                <span id="lbl-autostart" class="setting-name"></span>
-                <span id="desc-autostart" class="setting-hint"></span>
-              </div>
-              <input id="set-autostart" type="checkbox" class="toggle" />
-            </label>
-
-            <label class="setting-row">
-              <div class="setting-copy">
-                <span id="lbl-autoconnect-launch" class="setting-name"></span>
-                <span id="desc-autoconnect-launch" class="setting-hint"></span>
-              </div>
-              <input id="set-autoconnect-launch" type="checkbox" class="toggle" />
+              <input id="set-killswitch" type="checkbox" class="toggle" />
             </label>
 
             <label class="setting-row">
@@ -269,45 +225,132 @@
             </label>
           </div>
 
-          <details class="disclosure">
-            <summary id="lbl-custom-doh-summary" class="disclosure-summary"></summary>
+          <!-- Collapsed Technical & Power-User Options -->
+          <details id="advanced-settings-details" class="disclosure">
+            <summary id="lbl-advanced-settings-summary" class="disclosure-summary"></summary>
             <div class="disclosure-body form-stack">
-              <label class="field">
-                <span id="lbl-custom-doh-url"></span>
-                <input id="set-custom-doh-url" type="text" class="text-input mono" placeholder="https://dns.adguard-dns.com/dns-query" />
-              </label>
-              <div class="split-2">
-                <label class="field">
-                  <span id="lbl-custom-doh-sni"></span>
-                  <input id="set-custom-doh-sni" type="text" class="text-input mono" placeholder="dns.adguard-dns.com" />
-                </label>
-                <label class="field">
-                  <span id="lbl-custom-doh-ip"></span>
-                  <input id="set-custom-doh-ip" type="text" class="text-input mono" placeholder="94.140.14.14:443" />
-                </label>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <span id="lbl-guard-mode" class="setting-name"></span>
+                  <span id="desc-guard-mode" class="setting-hint"></span>
+                </div>
+                <select id="set-guard-mode" class="select-input">
+                  <option value="strict"></option>
+                  <option value="log_only"></option>
+                </select>
               </div>
-              <button id="btn-save-custom-doh" class="btn btn-subtle" type="button"></button>
-            </div>
-          </details>
 
-          <details class="disclosure">
-            <summary id="lbl-guard-log-summary" class="disclosure-summary"></summary>
-            <div class="disclosure-body">
-              <div id="guard-events-list" class="guard-log mono"></div>
-            </div>
-          </details>
-
-          <details class="disclosure">
-            <summary id="lbl-backup-summary" class="disclosure-summary"></summary>
-            <div class="disclosure-body form-stack">
-              <label class="field">
-                <span id="lbl-backup-pass"></span>
-                <input id="input-backup-pass" type="password" class="text-input" autocomplete="off" />
-              </label>
-              <div class="toolbar-row">
-                <button id="btn-export-backup" class="btn btn-subtle" type="button"></button>
-                <button id="btn-import-backup" class="btn btn-subtle" type="button"></button>
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <span id="lbl-socks-auth" class="setting-name"></span>
+                  <span id="desc-socks-auth" class="setting-hint mono"></span>
+                </div>
+                <div class="inline-controls">
+                  <button id="btn-rotate-creds" class="btn btn-mini" type="button"></button>
+                  <input id="set-socks-auth" type="checkbox" class="toggle" />
+                </div>
               </div>
+
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <span id="lbl-socks-port" class="setting-name"></span>
+                  <span id="desc-socks-port" class="setting-hint"></span>
+                </div>
+                <input id="set-socks-port" type="number" min="1024" max="65535" class="num-input mono" />
+              </div>
+
+              <label class="setting-row">
+                <div class="setting-copy">
+                  <span id="lbl-autoconnect-launch" class="setting-name"></span>
+                  <span id="desc-autoconnect-launch" class="setting-hint"></span>
+                </div>
+                <input id="set-autoconnect-launch" type="checkbox" class="toggle" />
+              </label>
+
+              <label class="setting-row">
+                <div class="setting-copy">
+                  <span id="lbl-autodisconnect-tg" class="setting-name"></span>
+                  <span id="desc-autodisconnect-tg" class="setting-hint"></span>
+                </div>
+                <input id="set-autodisconnect-tg" type="checkbox" class="toggle" />
+              </label>
+
+              <label class="setting-row">
+                <div class="setting-copy">
+                  <span id="lbl-autofailover" class="setting-name"></span>
+                  <span id="desc-autofailover" class="setting-hint"></span>
+                </div>
+                <input id="set-autofailover" type="checkbox" class="toggle" />
+              </label>
+
+              <label class="setting-row">
+                <div class="setting-copy">
+                  <span id="lbl-block-ipv6" class="setting-name"></span>
+                  <span id="desc-block-ipv6" class="setting-hint"></span>
+                </div>
+                <input id="set-block-ipv6" type="checkbox" class="toggle" />
+              </label>
+
+              <label class="setting-row">
+                <div class="setting-copy">
+                  <span id="lbl-doh" class="setting-name"></span>
+                  <span id="desc-doh" class="setting-hint"></span>
+                </div>
+                <input id="set-doh" type="checkbox" class="toggle" />
+              </label>
+
+              <div class="setting-row">
+                <div class="setting-copy">
+                  <span id="lbl-http-proxy" class="setting-name"></span>
+                  <span id="desc-http-proxy" class="setting-hint"></span>
+                </div>
+                <div class="inline-controls">
+                  <input id="set-http-port" type="number" min="1024" max="65535" class="num-input mono" />
+                  <input id="set-http-proxy" type="checkbox" class="toggle" />
+                </div>
+              </div>
+
+              <details class="disclosure">
+                <summary id="lbl-custom-doh-summary" class="disclosure-summary"></summary>
+                <div class="disclosure-body form-stack">
+                  <label class="field">
+                    <span id="lbl-custom-doh-url"></span>
+                    <input id="set-custom-doh-url" type="text" class="text-input mono" placeholder="https://dns.adguard-dns.com/dns-query" />
+                  </label>
+                  <div class="split-2">
+                    <label class="field">
+                      <span id="lbl-custom-doh-sni"></span>
+                      <input id="set-custom-doh-sni" type="text" class="text-input mono" placeholder="dns.adguard-dns.com" />
+                    </label>
+                    <label class="field">
+                      <span id="lbl-custom-doh-ip"></span>
+                      <input id="set-custom-doh-ip" type="text" class="text-input mono" placeholder="94.140.14.14:443" />
+                    </label>
+                  </div>
+                  <button id="btn-save-custom-doh" class="btn btn-subtle" type="button"></button>
+                </div>
+              </details>
+
+              <details class="disclosure">
+                <summary id="lbl-guard-log-summary" class="disclosure-summary"></summary>
+                <div class="disclosure-body">
+                  <div id="guard-events-list" class="guard-log mono"></div>
+                </div>
+              </details>
+
+              <details class="disclosure">
+                <summary id="lbl-backup-summary" class="disclosure-summary"></summary>
+                <div class="disclosure-body form-stack">
+                  <label class="field">
+                    <span id="lbl-backup-pass"></span>
+                    <input id="input-backup-pass" type="password" class="text-input" autocomplete="off" />
+                  </label>
+                  <div class="toolbar-row">
+                    <button id="btn-export-backup" class="btn btn-subtle" type="button"></button>
+                    <button id="btn-import-backup" class="btn btn-subtle" type="button"></button>
+                  </div>
+                </div>
+              </details>
             </div>
           </details>
         </article>
@@ -379,10 +422,12 @@
                 <button id="btn-awg-junk" class="btn btn-mini" type="button"></button>
                 <button id="btn-awg-quic15" class="btn btn-mini" type="button"></button>
               </div>
-              <label class="field">
-                <span id="lbl-ed-awg-raw"></span>
-                <textarea id="ed-awg-raw" rows="4" class="textarea-input mono" placeholder="Jc=4;Jmin=40;Jmax=120;I1=<b 0xc70000000108>..."></textarea>
-              </label>
+              <details id="awg-raw-details" class="disclosure">
+                <summary id="lbl-ed-awg-raw" class="disclosure-summary"></summary>
+                <div class="disclosure-body">
+                  <textarea id="ed-awg-raw" rows="4" class="textarea-input mono" placeholder="Jc=4;Jmin=40;Jmax=120;I1=<b 0xc70000000108>..."></textarea>
+                </div>
+              </details>
             </div>
           </details>
 
@@ -418,7 +463,7 @@
       </div>
     </div>
 
-    <!-- High-Contrast QR Export Modal -->
+    <!-- High-Contrast Cross-Device QR Transfer Modal -->
     <div id="modal-qr" class="modal-backdrop hidden" role="dialog" aria-modal="true">
       <div class="modal-card modal-compact qr-modal">
         <div class="modal-head">

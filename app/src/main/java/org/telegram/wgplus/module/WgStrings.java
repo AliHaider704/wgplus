@@ -12,7 +12,7 @@ public final class WgStrings {
 
     public static final String LANG_AR = "ar";
     public static final String LANG_EN = "en";
-    public static final String VERSION_LABEL = "1.7.2";
+    public static final String VERSION_LABEL = "1.7.3";
 
     private static final Map<String, String> AR_COUNTRIES = new HashMap<>();
 
@@ -289,14 +289,57 @@ public final class WgStrings {
 
     public static String statusKillSwitchSubline(boolean ar) {
         return ar
-                ? "جميع اتصالات ومكالمات تليجرام موقوفة مؤقتًا لمنع كشف عنوانك الحقيقي حتى يتصل النفق."
+                ? "جميع اتصالات ومكالمات تيليجرام موقوفة مؤقتًا لمنع كشف عنوانك الحقيقي حتى يتصل النفق."
                 : "All Telegram traffic and calls are held locally so your real IP cannot leak while disconnected.";
     }
 
     public static String statusEmptyHint(boolean ar) {
         return ar
-                ? "استورد ملف إعدادات أو صورة رمز مربع أو الصق من الحافظة، ثم اضغط اتصال."
-                : "Import a file, scan a QR screenshot, or paste from clipboard, then tap Connect.";
+                ? ("اضغط الاتصال الفوري بـ " + ltr("WARP") + " للبدء بضغطة واحدة، أو استورد ملف إعدادات أو رمزًا مربعًا.")
+                : "Tap 1-Tap Free WARP to begin immediately, or import a config file or QR image.";
+    }
+
+    public static String statusAwaitingHandshakeWithProfile(boolean ar, String profileName) {
+        String cleanName = localizeProfileName(profileName, ar);
+        if (cleanName.isEmpty()) {
+            return ar ? "جارٍ إتمام المصافحة..." : "Establishing handshake...";
+        }
+        return ar ? ("جارٍ إتمام المصافحة...  •  " + cleanName) : ("Establishing handshake...  •  " + cleanName);
+    }
+
+    public static String statusStalledWithProfile(boolean ar, String profileName) {
+        String cleanName = localizeProfileName(profileName, ar);
+        if (cleanName.isEmpty()) {
+            return ar ? "الخادم لا يستجيب (احتمال تقييد الشبكة)" : "Server unresponsive (possible restriction)";
+        }
+        return ar
+                ? ("الخادم لا يستجيب (احتمال تقييد الشبكة)  •  " + cleanName)
+                : ("Server unresponsive (possible restriction)  •  " + cleanName);
+    }
+
+    public static String statusStalledHint(boolean ar) {
+        return ar
+                ? "لم تصل استجابة من الخادم حتى الآن. جرّب تفعيل التمويه المتقدم أو التبديل إلى نفق بديل."
+                : "No handshake response received yet. Try enabling strong DPI bypass or switching to Free WARP.";
+    }
+
+    public static String recoverAwgBtn(boolean ar) {
+        return ar
+                ? ("تفعيل التمويه المتقدم (" + ltr("AWG 1.5") + ") وإعادة الاتصال")
+                : "Enable strong DPI bypass (AWG 1.5) & reconnect";
+    }
+
+    public static String recoverWarpBtn(boolean ar) {
+        return ar
+                ? ("التبديل إلى " + ltr("WARP") + " المجاني")
+                : "Switch to Free WARP";
+    }
+
+    public static String toastAwgRecovered(boolean ar, int port) {
+        String addr = ltr("127.0.0.1:" + port);
+        return ar
+                ? ("تم تفعيل التمويه المتقدم وإعادة الاتصال عبر " + addr)
+                : ("Strong DPI bypass enabled and reconnected on " + addr);
     }
 
     public static String liveStatsLine(boolean ar, long rxBytes, long txBytes, long lastHandshakeSec) {
@@ -356,13 +399,13 @@ public final class WgStrings {
 
     public static String autoStartLabel(boolean ar) {
         return ar
-                ? "الاتصال التلقائي عند تشغيل تليجرام"
+                ? "الاتصال التلقائي عند تشغيل تيليجرام"
                 : "Connect automatically on launch";
     }
 
     public static String killSwitchLabel(boolean ar) {
         return ar
-                ? "مانع تسريب صارم (حجب تليجرام بدون نفق)"
+                ? "مانع تسريب صارم (حجب تيليجرام بدون نفق)"
                 : "Strict kill switch (block Telegram without tunnel)";
     }
 
@@ -387,7 +430,7 @@ public final class WgStrings {
 
     public static String smartKeepaliveLabel(boolean ar) {
         return ar
-                ? "توفير البطارية في الخلفية عند سكون تليجرام"
+                ? "توفير البطارية في الخلفية عند سكون تيليجرام"
                 : "Smart idle keepalive saver in background";
     }
 
@@ -421,7 +464,7 @@ public final class WgStrings {
 
     public static String verifyLoadingBody(boolean ar) {
         return ar
-                ? "جارٍ اختبار العنوان الخارجي وخوادم تليجرام ومسار المكالمات..."
+                ? "جارٍ اختبار العنوان الخارجي وخوادم تيليجرام ومسار المكالمات..."
                 : "Checking exit IP, Telegram datacenter, and UDP call relay...";
     }
 
@@ -444,7 +487,7 @@ public final class WgStrings {
     }
 
     public static String verifyTelegramDcLabel(boolean ar) {
-        return ar ? "خوادم تليجرام" : "Telegram DC";
+        return ar ? "خوادم تيليجرام" : "Telegram DC";
     }
 
     public static String verifyVoipUdpLabel(boolean ar) {
@@ -715,7 +758,18 @@ public final class WgStrings {
     }
 
     public static String awgPresetQuic15Btn(boolean ar) {
-        return ar ? ("محاكاة " + ltr("AWG 1.5 QUIC")) : "AWG 1.5 QUIC";
+        return ar ? ("تجاوز تقييد متقدم (" + ltr("AWG 1.5") + ")") : "Strong DPI bypass (AWG 1.5)";
+    }
+
+    public static String awgPresetOffBtn(boolean ar) {
+        return ar ? "عادي (بدون تمويه)" : "Standard (none)";
+    }
+
+    public static String awgRawToggleLabel(boolean ar, boolean expanded) {
+        if (ar) {
+            return expanded ? "إخفاء المعاملات الرقمية المتقدمة" : "إظهار المعاملات الرقمية المتقدمة (للخبراء)";
+        }
+        return expanded ? "Hide raw protocol parameters" : "Show raw parameters (advanced)";
     }
 
     public static String labelAwgI1(boolean ar) {
@@ -727,11 +781,11 @@ public final class WgStrings {
     }
 
     public static String awgPresetVanillaBtn(boolean ar) {
-        return ar ? "تعبئة تمويه متوافق مع كل الخوادم" : "Apply universal junk preset";
+        return ar ? "تجاوز تقييد قياسي" : "Standard DPI bypass";
     }
 
     public static String awgClearBtn(boolean ar) {
-        return ar ? "مسح التمويه" : "Clear";
+        return ar ? "إلغاء التمويه" : "Clear";
     }
 
     public static String labelAwgJc(boolean ar) {
@@ -783,21 +837,21 @@ public final class WgStrings {
     }
 
     public static String showQrBtn(boolean ar) {
-        return ar ? "عرض الرمز المربع" : "Show QR code";
+        return ar ? ("نقل بالرمز المربع (" + ltr("QR") + ")") : "Transfer via QR";
     }
 
     public static String qrModalTitle(boolean ar, String profileName) {
         String clean = localizeProfileName(profileName, ar);
         if (clean.isEmpty()) {
-            return ar ? "الرمز المربع لإعدادات الخادم" : "Server configuration QR code";
+            return ar ? "نقل الخادم عبر الرمز المربع" : "Transfer server QR code";
         }
-        return ar ? ("الرمز المربع: " + clean) : ("QR code: " + clean);
+        return ar ? ("نقل الخادم: " + clean) : ("Transfer QR: " + clean);
     }
 
     public static String qrModalHint(boolean ar) {
         return ar
-                ? "امسح هذا الرمز من جهاز آخر أو التقط صورة للشاشة للاحتفاظ بنسخة سريعة."
-                : "Scan this code from another device or take a screenshot for offline backup.";
+                ? ("امسح هذا الرمز من " + appTitle(true) + " على ويندوز أو هاتف آخر لنقل الخادم فورًا.")
+                : "Scan or paste this code in WireGuard Plus on Windows or another phone to transfer this server.";
     }
 
     public static String deleteProfileBtn(boolean ar) {
@@ -901,6 +955,12 @@ public final class WgStrings {
         return ar ? ("تم الاتصال عبر " + addr) : ("Connected on " + addr);
     }
 
+    public static String channelInviteNotice(boolean ar) {
+        return ar
+                ? "تم الاتصال بنجاح. ندعوك بلطف للاشتراك في قناة تيليجرام الرسمية لمتابعة التحديثات والإصدارات الجديدة."
+                : "Connected successfully. We warmly invite you to join our official Telegram channel for updates and new releases.";
+    }
+
     public static String toastDisconnected(boolean ar) {
         return ar ? "تم قطع الاتصال" : "Tunnel disconnected";
     }
@@ -910,22 +970,22 @@ public final class WgStrings {
     }
 
     public static String launcherGuideHeading(boolean ar) {
-        return ar ? "طريقة التشغيل داخل تليجرام" : "How to use inside Telegram";
+        return ar ? "طريقة التشغيل داخل تيليجرام" : "How to use inside Telegram";
     }
 
     public static String[] launcherSteps(boolean ar) {
         if (ar) {
             return new String[]{
-                    "١. فعّل هذه الإضافة على تليجرام بلس أو تليجرام الرسمي من أداة الدمج جنبًا إلى جنب مع إضافاتك الحالية.",
-                    "٢. افتح تليجرام ثم ادخل إلى الإعدادات ثم البيانات والتخزين ثم إعدادات البروكسي.",
-                    "٣. اضغط زر نفق وايرجارد أسفل الشاشة لاستيراد ملف أو صورة رمز مربع وتفعيل تمويه الحزم والمكالمات.",
+                    "١. فعّل هذه الإضافة على تيليجرام أو تيليجرام بلس أو تليجراف أو " + ltr("AyuGram") + " أو " + ltr("Telegram X") + " من أداة الدمج.",
+                    "٢. افتح تيليجرام ثم ادخل إلى الإعدادات ثم البيانات والتخزين ثم إعدادات البروكسي.",
+                    "٣. اضغط زر نفق وايرجارد أسفل الشاشة لاستيراد ملف أو صورة رمز مربع أو تشغيل " + ltr("WARP") + " بضغطة واحدة.",
                     "٤. اضغط فحص المسار والمكالمات للتأكد من تغيّر العنوان الخارجي وجاهزية المكالمات."
             };
         }
         return new String[]{
-                "1. Enable this module for Telegram Plus or official Telegram in LSPatch or LSPosed alongside your other modules.",
+                "1. Enable this module for Telegram, Plus Messenger, Telegraph, AyuGram, Web, or Telegram X in LSPosed or LSPatch.",
                 "2. Open Telegram and go to Settings, Data and Storage, then Proxy Settings.",
-                "3. Tap the WireGuard button at the bottom corner to import a file or QR screenshot, enable DPI obfuscation, and route calls.",
+                "3. Tap the WireGuard button at the bottom corner to start 1-Tap Free WARP, import a config file, or enable DPI bypass.",
                 "4. Run Verify route & calls to confirm your exit IP and voice/video call relay readiness."
         };
     }
@@ -934,8 +994,87 @@ public final class WgStrings {
         return ar ? "إدارة الخوادم وفحص النفق" : "Manage profiles & test tunnel";
     }
 
+    public static String launcherManageSecondaryBtn(boolean ar) {
+        return ar ? "إدارة الخوادم أو استيراد ملف" : "Manage profiles or import file";
+    }
+
+    public static String readinessHeading(boolean ar) {
+        return ar ? "حالة الجاهزية والتشغيل" : "Readiness & setup status";
+    }
+
+    public static String readinessItemServer(boolean ar, boolean configured) {
+        if (ar) {
+            return configured ? "١. الخادم: مُعدّ وجاهز" : "١. الخادم: غير مُعدّ بعد";
+        }
+        return configured ? "1. Server profile: Configured" : "1. Server profile: Not configured";
+    }
+
+    public static String readinessItemHook(boolean ar, String hookedPkg) {
+        boolean hasPkg = hookedPkg != null && !hookedPkg.trim().isEmpty();
+        if (ar) {
+            return hasPkg
+                    ? ("٢. التكامل مع تيليجرام: مفعّل (" + ltr(hookedPkg.trim()) + ")")
+                    : "٢. التكامل مع تيليجرام: بانتظار التفعيل من أداة الدمج";
+        }
+        return hasPkg
+                ? ("2. Telegram integration: Active (" + hookedPkg.trim() + ")")
+                : "2. Telegram integration: Enable in LSPosed or LSPatch";
+    }
+
+    public static String readinessItemHandshake(boolean ar, int stateCode) {
+        switch (stateCode) {
+            case 2:
+                return ar ? "٣. حالة المصافحة: متصل ومُتحقّق" : "3. Tunnel state: Connected & verified";
+            case 1:
+                return ar ? "٣. حالة المصافحة: جارٍ إتمام المصافحة..." : "3. Tunnel state: Establishing handshake...";
+            case 3:
+                return ar ? "٣. حالة المصافحة: الخادم لا يستجيب" : "3. Tunnel state: Server unresponsive";
+            default:
+                return ar ? "٣. حالة المصافحة: متوقف" : "3. Tunnel state: Disconnected";
+        }
+    }
+
+    public static String launcherStepsToggleBtn(boolean ar, boolean expanded) {
+        if (ar) {
+            return expanded ? "إخفاء خطوات التفعيل" : "عرض خطوات التفعيل";
+        }
+        return expanded ? "Hide setup guide" : "Show setup guide";
+    }
+
+    public static String cleanCacheBtn(boolean ar, boolean busy) {
+        if (busy) {
+            return ar ? "جارٍ تحسين الأداء وتنظيف المؤقتات..." : "Optimizing & cleaning cache...";
+        }
+        return ar ? "تحسين الأداء وتنظيف الملفات المؤقتة" : "Optimize & clean temporary cache";
+    }
+
+    public static String toastCacheCleaned(boolean ar, long freedBytes, int filesDeleted) {
+        if (freedBytes > 0L) {
+            String sz = formatBytes(ar, freedBytes);
+            return ar
+                    ? ("تم تحرير " + sz + " وتفريغ الذاكرة المؤقتة لتيليجرام")
+                    : ("Freed " + sz + " and trimmed Telegram memory caches");
+        }
+        return ar
+                ? "تم تفريغ الذاكرة المؤقتة (التخزين نظيف بالفعل)"
+                : "Memory caches trimmed (temporary storage already clean)";
+    }
+
     public static String hybridHeading(boolean ar) {
-        return ar ? "الحماية الصامتة بالخلفية" : "Silent Background Protection";
+        return ar ? "تحسين الاستقرار بالخلفية (اختياري)" : "Background stability (optional)";
+    }
+
+    public static String hybridToggleCardBtn(boolean ar, boolean expanded) {
+        if (ar) {
+            return expanded ? "إخفاء خيارات الاستقرار المتقدمة" : "إعدادات الاستقرار المتقدمة (اختياري - يعمل بدونها)";
+        }
+        return expanded ? "Hide advanced stability options" : "Advanced stability options (optional)";
+    }
+
+    public static String hybridOptionalNote(boolean ar) {
+        return ar
+                ? "اختياري للمتقدمين: التطبيق يعمل بشكل كامل بدون تفعيل هذا القسم."
+                : "Optional setting: the app works fully without enabling this section.";
     }
 
     public static String hybridTierLabel(boolean ar, ContinuityBridgeManager.ContinuityTier tier) {
@@ -1234,7 +1373,7 @@ public final class WgStrings {
             case NATIVE_BRIDGE_FAILED:
             default:
                 return ar
-                        ? "تعذّر تشغيل المحرك الأصلي داخل التطبيق. أعد فتح تليجرام وحاول مجددًا."
+                        ? "تعذّر تشغيل المحرك الأصلي داخل التطبيق. أعد فتح تيليجرام وحاول مجددًا."
                         : ("Native tunnel engine failed to initialize" + (detail.isEmpty() ? "." : (": " + detail)));
         }
     }

@@ -26,15 +26,16 @@
 
 <div dir="rtl">
 
-## التحميل (`v1.7.2`)
+## التحميل (`v1.7.3`)
 
 | المنصة | رابط التحميل | المتطلبات | الملاحظات |
 |--------|--------------|-----------|-----------|
 | **ويندوز (ملف `.exe` مفرد)** | [`WireGuardPlus-Windows-x64.exe`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64.exe) | ويندوز 10/11 (x64)، بدون مسؤول | تشغيل مباشر، تشفير DPAPI، أيقونة شريط النظام |
 | **ويندوز المحمول (`.zip`)** | [`WireGuardPlus-Windows-x64-Portable.zip`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64-Portable.zip) | ويندوز 10/11 (x64)، فلاش/مجلد | يحتوي `portable.flag`، حفظ محلي كامل بدون AppData |
-| **أندرويد (LSPatch / LSPosed)** | [`WireGuardPlus-1.7.2.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.2.apk) | أندرويد 5.0+ (11+ للتفعيل الصامت) | بدون روت عبر LSPatch أو بالروت عبر LSPosed |
+| **أندرويد ARM64 (`5.08 MB` - موصى به)** | [`WireGuardPlus-1.7.3-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.3-arm64-v8a.apk) | أندرويد 5.0+ (arm64-v8a) | بدون روت عبر LSPatch أو بالروت عبر LSPosed |
+| **أندرويد الشاملة (`11.26 MB`)** | [`WireGuardPlus-1.7.3.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.3.apk) | أندرويد 5.0+ (arm64 + armv7a) | نسخة شاملة متوافقة مع التحديثات التلقائية |
 
-تحقق من تطابق الملفات عبر [`SHA256SUMS.txt`](https://github.com/AliHaider704/wgplus/releases/latest/download/SHA256SUMS.txt) أو شاهد [فيديو الشرح العملي لويندوز (`MP4`)](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-Walkthrough.mp4).
+تحقق من تطابق الملفات عبر [`SHA256SUMS.txt`](https://github.com/AliHaider704/wgplus/releases/latest/download/SHA256SUMS.txt)، أو شاهد [فيديو الشرح بدقة 8K (`MP4`)](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-Walkthrough.mp4)، أو انضم إلى [قناة تيليجرام الرسمية](https://t.me/wgplus_official).
 
 ---
 
@@ -148,7 +149,7 @@ flowchart LR
 
 يتطلب **أندرويد 5.0+** (**أندرويد 11+** للتفعيل الصامت عبر التصحيح اللاسلكي).
 
-1. حمّل [`WireGuardPlus-1.7.2.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.2.apk).
+1. حمّل [`WireGuardPlus-1.7.3-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.3-arm64-v8a.apk) (`5.08 MB`) أو [`WireGuardPlus-1.7.3.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.3.apk) (الشاملة).
 2. **بدون روت (LSPatch):** ادمج **تليجرام بلس** (`org.telegram.plus`) أو **تليجرام الرسمي** (`org.telegram.messenger`) عبر [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch) بوضع **Portable** أو **Local**، ثم ثبّت تليجرام وافتح تطبيق **نفق وايرجارد بلس** لإكمال ربط التصحيح اللاسلكي ذي الـ 6 أرقام لمرة واحدة.
    - **مع روت (LSPosed):** فعّل **WireGuard Plus** في **LSPosed -> Modules** وحدد تليجرام ثم امنح الروت داخل التطبيق لحماية صامتة.
 3. داخل تليجرام افتح **الإعدادات -> البيانات والتخزين -> إعدادات البروكسي -> نفق وايرجارد** وأضف ملفك واتصل.

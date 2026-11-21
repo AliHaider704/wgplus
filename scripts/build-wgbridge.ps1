@@ -17,13 +17,27 @@ if ([string]::IsNullOrWhiteSpace($GoRoot)) {
     $cmdGo = Get-Command go -ErrorAction SilentlyContinue
     if ($cmdGo) {
         $GoRoot = Split-Path -Parent (Split-Path -Parent $cmdGo.Source)
+    } elseif (Test-Path (Join-Path $env:LOCALAPPDATA "Programs\Go\bin\go.exe")) {
+        $GoRoot = Join-Path $env:LOCALAPPDATA "Programs\Go"
     } else {
         throw "Go toolchain not found on PATH. Install Go or pass -GoRoot explicitly."
     }
 }
+if ([string]::IsNullOrWhiteSpace($GoPath)) {
+    $GoPath = if (-not [string]::IsNullOrWhiteSpace($env:GOPATH)) { $env:GOPATH } else { Join-Path $env:USERPROFILE "go" }
+}
+if ([string]::IsNullOrWhiteSpace($JavaHome) -and (Test-Path "C:\PROGRA~1\Android\openjdk\JDK-21~1.8")) {
+    $JavaHome = "C:\PROGRA~1\Android\openjdk\JDK-21~1.8"
+}
+if ([string]::IsNullOrWhiteSpace($AndroidHome) -and (Test-Path "C:\PROGRA~2\Android\ANDROI~1")) {
+    $AndroidHome = "C:\PROGRA~2\Android\ANDROI~1"
+}
+if ([string]::IsNullOrWhiteSpace($AndroidNdkHome) -and (Test-Path "C:\PROGRA~2\Android\ANDROI~2\ANDROI~1")) {
+    $AndroidNdkHome = "C:\PROGRA~2\Android\ANDROI~2\ANDROI~1"
+}
 
 $env:GOROOT = $GoRoot
-if (-not [string]::IsNullOrWhiteSpace($GoPath)) { $env:GOPATH = $GoPath }
+$env:GOPATH = $GoPath
 if (-not [string]::IsNullOrWhiteSpace($GoCache)) { $env:GOCACHE = $GoCache }
 $env:JAVA_HOME = $JavaHome
 $env:ANDROID_HOME = $AndroidHome
@@ -44,7 +58,7 @@ try {
 
     Write-Host "[2/4] Building wgbridge.aar for arm64-v8a and armeabi-v7a (minSdk 21)..."
     New-Item -ItemType Directory -Force -Path (Split-Path -Parent $OutputAar) | Out-Null
-    & gomobile bind "-target=android/arm64,android/arm" -androidapi 21 -o $OutputAar .
+    & gomobile bind "-target=android/arm64,android/arm" -androidapi 21 -trimpath "-ldflags=-s -w -buildid=" -o $OutputAar .
     if ($LASTEXITCODE -ne 0) { throw "gomobile bind failed with exit code $LASTEXITCODE" }
 } finally {
     Pop-Location
@@ -98,6 +112,19 @@ try {
     Remove-Item -Force $OutputSourcesJar
     & $jarExe cf $OutputSourcesJar .
     Pop-Location
+
+    $llvmStrip = Join-Path $AndroidNdkHome "toolchains\llvm\prebuilt\windows-x86_64\bin\llvm-strip.exe"
+    if (Test-Path $llvmStrip) {
+        Get-ChildItem -Path (Join-Path $aarUnpack "jni") -Recurse -Filter "*.so" | ForEach-Object {
+            $beforeSz = $_.Length
+            & $llvmStrip --strip-unneeded $_.FullName
+            if ($LASTEXITCODE -ne 0) { throw "llvm-strip failed on $($_.FullName) with exit code $LASTEXITCODE" }
+            $_.Refresh()
+            Write-Host ("Stripped {0}: {1} -> {2} bytes" -f $_.FullName.Replace($aarUnpack + "\", ""), $beforeSz, $_.Length)
+        }
+    } else {
+        Write-Warning "llvm-strip.exe not found at $llvmStrip; keeping unstripped .so sections"
+    }
 
     Remove-Item -Force $OutputAar
     & $jarExe cf $OutputAar -C $aarUnpack .

@@ -96,15 +96,24 @@ New-Item -ItemType Directory -Force -Path $DistDir | Out-Null
 $outExeName = "WireGuardPlus-Windows-x64.exe"
 $distExe = Join-Path $DistDir $outExeName
 
+$verifyExe = $distExe
 Push-Location $DesktopDir
 try {
-    & wails build -clean -platform windows/amd64 -ldflags "-s -w" -o $outExeName
+    & wails build -clean -platform windows/amd64 -trimpath -ldflags "-s -w -buildid=" -o $outExeName
     if ($LASTEXITCODE -ne 0) { throw "wails build failed with exit code $LASTEXITCODE" }
     $builtExe = Join-Path $DesktopDir "build\bin\$outExeName"
     if (-not (Test-Path $builtExe)) {
         throw "Expected Wails output missing at $builtExe"
     }
-    Copy-Item -Force $builtExe $distExe
+    try {
+        Copy-Item -Force $builtExe $distExe
+        $verifyExe = $distExe
+    } catch [System.IO.IOException] {
+        $stagedExe = Join-Path $DistDir "WireGuardPlus-Windows-x64-new.exe"
+        Copy-Item -Force $builtExe $stagedExe
+        Write-Warning "dist\$outExeName is currently running; staged new build at dist\WireGuardPlus-Windows-x64-new.exe"
+        $verifyExe = $stagedExe
+    }
 } finally {
     Pop-Location
 }
@@ -114,7 +123,7 @@ $stageDir = Join-Path ([System.IO.Path]::GetTempPath()) ("wgplus_portable_" + [G
 New-Item -ItemType Directory -Force -Path $stageDir | Out-Null
 $distZip = Join-Path $DistDir "WireGuardPlus-Windows-x64-Portable.zip"
 try {
-    Copy-Item -Force $distExe (Join-Path $stageDir "WireGuardPlus.exe")
+    Copy-Item -Force $verifyExe (Join-Path $stageDir "WireGuardPlus.exe")
     [System.IO.File]::WriteAllText((Join-Path $stageDir "portable.flag"), "1`n", [System.Text.UTF8Encoding]::new($false))
     $readme = @(
         "WireGuard Plus for Windows - Portable Edition",
@@ -138,7 +147,7 @@ try {
 Write-Host "[5/5] Running headless --self-check smoke verification..."
 $selfOutFile = Join-Path ([System.IO.Path]::GetTempPath()) ("wgplus_selfcheck_" + [Guid]::NewGuid().ToString("N") + ".json")
 try {
-    $proc = Start-Process -FilePath $distExe -ArgumentList "--self-check" -RedirectStandardOutput $selfOutFile -Wait -PassThru -NoNewWindow
+    $proc = Start-Process -FilePath $verifyExe -ArgumentList "--self-check" -RedirectStandardOutput $selfOutFile -Wait -PassThru -NoNewWindow
     if ($proc.ExitCode -ne 0) {
         throw "Built binary --self-check exited with code $($proc.ExitCode)"
     }
@@ -154,7 +163,7 @@ try {
 
 Write-Host ""
 Write-Host "Build artifacts ready:"
-Get-Item $distExe, $distZip | ForEach-Object {
+Get-Item $verifyExe, $distZip | ForEach-Object {
     $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     Write-Host ("  {0} ({1} bytes) SHA-256: {2}" -f $_.Name, $_.Length, $hash)
 }
