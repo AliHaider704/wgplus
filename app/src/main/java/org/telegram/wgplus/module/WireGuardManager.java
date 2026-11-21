@@ -131,11 +131,24 @@ public final class WireGuardManager {
                 } catch (Throwable ignored) {
                 }
             };
-            if (!(ctx instanceof android.app.Activity) || ((android.app.Activity) ctx).isFinishing()) {
+            android.app.Activity resolvedAct = null;
+            Context cur = ctx;
+            for (int depth = 0; depth < 8 && cur != null; depth++) {
+                if (cur instanceof android.app.Activity) {
+                    resolvedAct = (android.app.Activity) cur;
+                    break;
+                }
+                if (cur instanceof android.content.ContextWrapper) {
+                    cur = ((android.content.ContextWrapper) cur).getBaseContext();
+                } else {
+                    break;
+                }
+            }
+            if (resolvedAct == null || resolvedAct.isFinishing()) {
                 openChannel.run();
                 return;
             }
-            final android.app.Activity act = (android.app.Activity) ctx;
+            final android.app.Activity act = resolvedAct;
             final WgTheme th = WgTheme.of(isDarkTheme(ctx));
             final android.app.Dialog d = new android.app.Dialog(act);
             d.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);

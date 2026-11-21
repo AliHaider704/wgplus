@@ -3,6 +3,7 @@ package org.telegram.wgplus.module;
 import android.app.Activity;
 import android.app.Dialog;
 import android.content.Context;
+import android.content.ContextWrapper;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Typeface;
@@ -59,7 +60,22 @@ final class UpdateGate {
             }
         } catch (Throwable ignored) {
         }
-        return "1.7.4";
+        return "1.7.5";
+    }
+
+    private static Activity unwrapActivity(Context ctx) {
+        Context cur = ctx;
+        for (int i = 0; i < 8 && cur != null; i++) {
+            if (cur instanceof Activity) {
+                return (Activity) cur;
+            }
+            if (cur instanceof ContextWrapper) {
+                cur = ((ContextWrapper) cur).getBaseContext();
+            } else {
+                break;
+            }
+        }
+        return null;
     }
 
     private static Release fetchCached() throws Exception {
@@ -111,8 +127,8 @@ final class UpdateGate {
     }
 
     static void checkInModule(final Context ctx, final Dialog hostDialog) {
-        if (!(ctx instanceof Activity)) return;
-        final Activity act = (Activity) ctx;
+        final Activity act = unwrapActivity(ctx);
+        if (act == null) return;
         if (sUpdateBlocked && sCachedRelease != null) {
             final Release cached = sCachedRelease;
             new Handler(Looper.getMainLooper()).post(() -> {
