@@ -32,10 +32,10 @@ import (
 )
 
 const (
-	mobileTunQueueDepth  = 2048
-	mobileTunBatchSize   = 64
-	desktopTunQueueDepth = 8192
-	desktopTunBatchSize  = 128
+	mobileTunQueueDepth  = 1024
+	mobileTunBatchSize   = 32
+	desktopTunQueueDepth = 1024
+	desktopTunBatchSize  = 32
 
 	minTunnelDnsCacheTTL = 15 * time.Second
 	maxTunnelDnsCacheTTL = 300 * time.Second
@@ -72,10 +72,10 @@ func desktopNetstackProfile() netstackProfile {
 	return netstackProfile{
 		queueDepth: desktopTunQueueDepth,
 		batchSize:  desktopTunBatchSize,
-		txDefault:  1048576,
-		txMax:      16777216,
-		rxDefault:  1048576,
-		rxMax:      16777216,
+		txDefault:  262144,
+		txMax:      1048576,
+		rxDefault:  524288,
+		rxMax:      4194304,
 		blockIPv6:  blockIPv6Flag.Load(),
 	}
 }

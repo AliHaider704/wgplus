@@ -27,7 +27,7 @@ const (
 	maxUdpSessionsCap        = 64
 	desktopMaxUdpSessionsCap = 256
 	tcpCopyBufSize           = 64 * 1024
-	desktopTcpCopyBufSize    = 256 * 1024
+	desktopTcpCopyBufSize    = 64 * 1024
 	udpSocketBufSize         = 1024 * 1024
 	desktopUdpSocketBufSize  = 4 * 1024 * 1024
 )

@@ -50,7 +50,7 @@ func TestDesktopTuningAndBlockIPv6(t *testing.T) {
 	SetBlockIPv6(true)
 
 	prof := activeNetstackProfile()
-	if prof.queueDepth != desktopTunQueueDepth || prof.batchSize != desktopTunBatchSize || prof.txMax != 16777216 || !prof.blockIPv6 {
+	if prof.queueDepth != desktopTunQueueDepth || prof.batchSize != desktopTunBatchSize || prof.txMax != 1048576 || !prof.blockIPv6 {
 		t.Fatalf("unexpected desktop netstack profile: %+v", prof)
 	}
 
