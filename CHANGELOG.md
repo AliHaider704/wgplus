@@ -2,6 +2,14 @@
 
 All notable changes to **WireGuard Plus** (`Windows Desktop` & `Android org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [1.7.8] - 2026-11-22
+
+### Fixed
+- **Upload Throughput Breakthrough (`wgbridge-go/fast_netstack.go`)**: Switched the userspace gVisor TCP congestion controller from `CUBIC` + `TCPRACKLossDetection` to `NewReno` (retaining `SACK` and `TCPDelayEnabled(false)`) and replaced silent outbound TUN packet drops in `WriteNotify` with `closeCh`-guarded backpressure, eliminating false loss-recovery `cwnd` collapses and restoring full upload speed across Windows and Android.
+- **Tunnel Stability & Handshake Recovery (`wgbridge-go/bridge.go`)**: Updated `tunnelWatchdogLoop` so initial warmup and routine `>135s` rekeying use soft handshakes on the same UDP socket instead of wiping the WireGuard Noise session (`replace_peers=true`) mid-flight, preventing `2000-5000ms` TCP stalls.
+- **Android Multi-Client Shared Tunnel Hub (`KeepaliveStatusProvider`, `WireGuardManager`)**: Added a shared local SOCKS5 hub across simultaneously running Telegram clients (`Telegram`, `Plus`, `AyuGram`, `Telegram Gold`, `Telegraph`, etc.) so all clients reuse one active WireGuard session with zero `PrivateKey` collisions.
+- **Standalone Launcher Stability (`ModuleLauncherActivity`)**: Eliminated redundant full-screen `2.5s` `setContentView` rebuilds while connected.
+
 ## [1.7.3] - 2026-11-21
 
 ### Added
