@@ -1985,6 +1985,7 @@ public final class WireGuardDialog {
                         Toast.makeText(ctx, WgStrings.toastAwgRecovered(isAr, port), Toast.LENGTH_SHORT).show();
                         rebuildUi.run();
                         triggerVerification.run();
+                        WireGuardManager.maybeInviteToOfficialChannel(ctx, isAr);
                     });
                 } catch (final Throwable err) {
                     mainHandler.post(() -> {

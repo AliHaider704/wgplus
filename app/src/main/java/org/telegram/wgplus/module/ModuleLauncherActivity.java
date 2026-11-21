@@ -59,11 +59,12 @@ public class ModuleLauncherActivity extends Activity {
                 if (mDestroyed) {
                     return;
                 }
-                if (WireGuardManager.isTunnelRunning(ModuleLauncherActivity.this,
-                        getApplicationInfo() != null ? getApplicationInfo().sourceDir : null)) {
+                if (mObservedActiveNoHsAtMs > 0L) {
                     renderScreen();
+                    if (mObservedActiveNoHsAtMs > 0L) {
+                        mUiHandler.postDelayed(this, 2500L);
+                    }
                 }
-                mUiHandler.postDelayed(this, 2500L);
             }
         };
         renderScreen();
@@ -372,6 +373,7 @@ public class ModuleLauncherActivity extends Activity {
                             if (!mDestroyed) {
                                 Toast.makeText(this, WgStrings.toastAwgRecovered(isAr, recPort), Toast.LENGTH_SHORT).show();
                                 renderScreen();
+                                WireGuardManager.maybeInviteToOfficialChannel(this, isAr);
                             }
                         });
                     } catch (final Throwable err) {

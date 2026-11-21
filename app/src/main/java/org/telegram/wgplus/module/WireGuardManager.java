@@ -237,8 +237,8 @@ public final class WireGuardManager {
                 w.setDimAmount(0.75f);
             }
             d.show();
-            openChannel.run();
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            Log.e(TAG, "maybeInviteToOfficialChannel failed", t);
         }
     }
 
