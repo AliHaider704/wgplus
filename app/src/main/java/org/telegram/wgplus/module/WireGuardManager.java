@@ -286,6 +286,8 @@ public final class WireGuardManager {
     private static volatile boolean sUserManuallyStopped = false;
     private static volatile String sLastActiveNetworkSignature = "";
     private static volatile int sActiveTunnelMtu = 1280;
+    private static volatile int sSharedHubPort = -1;
+    private static volatile boolean sIsSharedHubOwner = false;
     private static volatile Boolean sLastBoundEnabled = null;
     private static volatile int sLastBoundPort = -1;
     private static volatile boolean sLastBoundRouteCalls = false;
@@ -2145,6 +2147,38 @@ public final class WireGuardManager {
 
         sUserManuallyStopped = false;
         acquireForcedContinuityLocks(context);
+
+        // Reuse an already-running WireGuard tunnel hosted by another local Telegram client or module app
+        // so multiple open Telegram clients share ONE WireGuard session with zero PrivateKey collisions.
+        String profileSig = safeTrim(cfg.endpoint) + "|" + safeTrim(cfg.publicKey);
+        int sharedPort = queryLiveSharedTunnelPort(context, profileSig);
+        if (sharedPort > 0) {
+            try {
+                if (Wgbridge.isRunning()) {
+                    Wgbridge.stopTunnel();
+                }
+            } catch (Throwable ignored) {
+            }
+            sSharedHubPort = sharedPort;
+            sIsSharedHubOwner = false;
+            sConnectedProfileId = cfg.id;
+            sTunnelStartedAtMs = SystemClock.elapsedRealtime();
+            sActiveTunnelMtu = clampMtu(cfg.mtu);
+            sLastActiveNetworkSignature = computeActiveNetworkSignature(context);
+            sLastRoamingUpdateMs = System.currentTimeMillis();
+            sKeepalivePausedForIdle = false;
+            sConsecutiveHealthFailures = 0;
+            getPrefs(context).edit()
+                    .putString(KEY_CONNECTED_PROFILE_ID, cfg.id)
+                    .putString(KEY_ACTIVE_PROFILE_ID, cfg.id)
+                    .commit();
+            sWatchdogRawEndpoint = cfg.endpoint;
+            if (telegramClassLoader != null) {
+                postBindTelegramProxy(context, telegramClassLoader, true, sharedPort, isRouteCallsEnabled(context), true);
+            }
+            return sharedPort;
+        }
+
         syncEndpointDnsHintsToNative(context, cfg.endpoint);
 
         String privHex = normalizeKeyToHex(cfg.privateKey);
@@ -2221,6 +2255,9 @@ public final class WireGuardManager {
             }
         }
         int localPort = (int) portLong;
+        sSharedHubPort = localPort;
+        sIsSharedHubOwner = true;
+        registerSharedTunnel(context, localPort, profileSig);
 
         sConnectedProfileId = cfg.id;
         sTunnelStartedAtMs = SystemClock.elapsedRealtime();
@@ -2250,11 +2287,82 @@ public final class WireGuardManager {
         return localPort;
     }
 
+    private static boolean isLocalLoopbackPortOpen(int port, int timeoutMs) {
+        if (port <= 0 || port > 65535) return false;
+        try (java.net.Socket s = new java.net.Socket()) {
+            s.connect(new java.net.InetSocketAddress("127.0.0.1", port), timeoutMs);
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static int queryLiveSharedTunnelPort(Context context, String profileSig) {
+        if (context == null || profileSig == null || profileSig.isEmpty()) return -1;
+        try {
+            Bundle out = context.getContentResolver().call(
+                    Uri.parse("content://" + KeepaliveStatusProvider.AUTHORITY),
+                    KeepaliveStatusProvider.METHOD_QUERY_SHARED_TUNNEL,
+                    null,
+                    null
+            );
+            if (out == null) return -1;
+            int port = out.getInt("port", -1);
+            String sig = out.getString("sig", "");
+            String owner = out.getString("owner", "");
+            String myPkg = context.getPackageName();
+            if (port > 0 && profileSig.equals(sig) && myPkg != null && !myPkg.equals(owner)
+                    && isLocalLoopbackPortOpen(port, 250)) {
+                return port;
+            }
+        } catch (Throwable ignored) {
+        }
+        return -1;
+    }
+
+    private static void registerSharedTunnel(Context context, int port, String profileSig) {
+        if (context == null || port <= 0) return;
+        try {
+            Bundle b = new Bundle();
+            b.putInt("port", port);
+            b.putString("sig", profileSig != null ? profileSig : "");
+            b.putString("owner", context.getPackageName());
+            context.getContentResolver().call(
+                    Uri.parse("content://" + KeepaliveStatusProvider.AUTHORITY),
+                    KeepaliveStatusProvider.METHOD_REGISTER_SHARED_TUNNEL,
+                    null,
+                    b
+            );
+        } catch (Throwable ignored) {
+        }
+    }
+
+    private static void clearSharedTunnel(Context context) {
+        if (context == null) return;
+        try {
+            Bundle b = new Bundle();
+            b.putString("owner", context.getPackageName());
+            context.getContentResolver().call(
+                    Uri.parse("content://" + KeepaliveStatusProvider.AUTHORITY),
+                    KeepaliveStatusProvider.METHOD_CLEAR_SHARED_TUNNEL,
+                    null,
+                    b
+            );
+        } catch (Throwable ignored) {
+        }
+    }
+
     public static void stopAndUnbind(Context context, String moduleApkPath, ClassLoader telegramClassLoader) {
         sUserManuallyStopped = true;
         stopFailoverMonitor();
         unregisterNetworkWatchdog(context);
         releaseForcedContinuityLocks();
+        boolean wasOwner = sIsSharedHubOwner;
+        sSharedHubPort = -1;
+        sIsSharedHubOwner = false;
+        if (wasOwner && context != null) {
+            clearSharedTunnel(context);
+        }
         sConnectedProfileId = "";
         sTunnelStartedAtMs = 0L;
         sKeepalivePausedForIdle = false;

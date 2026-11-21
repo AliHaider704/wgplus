@@ -39,6 +39,9 @@ public class KeepaliveStatusProvider extends ContentProvider {
     // Cross-client shared config/state sync APIs (companion + hooked Telegram packages)
     public static final String METHOD_SYNC_PULL_STATE = "sync_pull_shared_state";
     public static final String METHOD_SYNC_PUSH_STATE = "sync_push_shared_state";
+    public static final String METHOD_REGISTER_SHARED_TUNNEL = "register_shared_tunnel";
+    public static final String METHOD_QUERY_SHARED_TUNNEL = "query_shared_tunnel";
+    public static final String METHOD_CLEAR_SHARED_TUNNEL = "clear_shared_tunnel";
     public static final String EXTRA_JSON = "json";
 
     public static final String EXTRA_PID = "pid";
@@ -203,6 +206,49 @@ public class KeepaliveStatusProvider extends ContentProvider {
             Bundle out = new Bundle();
             out.putBoolean("ok", rev >= 0);
             out.putLong("stateRev", rev);
+            return out;
+        }
+        if (METHOD_REGISTER_SHARED_TUNNEL.equals(method)) {
+            if (!isTrustedSyncCaller(ctx)) {
+                return null;
+            }
+            int port = extras != null ? extras.getInt("port", -1) : -1;
+            String sig = extras != null ? extras.getString("sig", "") : "";
+            String owner = extras != null ? extras.getString("owner", safePkg) : safePkg;
+            ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE).edit()
+                    .putInt("port", port)
+                    .putString("sig", sig != null ? sig : "")
+                    .putString("owner", owner != null ? owner : "")
+                    .putLong("updatedAt", System.currentTimeMillis())
+                    .commit();
+            Bundle out = new Bundle();
+            out.putBoolean("ok", true);
+            return out;
+        }
+        if (METHOD_QUERY_SHARED_TUNNEL.equals(method)) {
+            if (!isTrustedSyncCaller(ctx)) {
+                return null;
+            }
+            android.content.SharedPreferences sp = ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
+            Bundle out = new Bundle();
+            out.putInt("port", sp.getInt("port", -1));
+            out.putString("sig", sp.getString("sig", ""));
+            out.putString("owner", sp.getString("owner", ""));
+            out.putLong("updatedAt", sp.getLong("updatedAt", 0L));
+            return out;
+        }
+        if (METHOD_CLEAR_SHARED_TUNNEL.equals(method)) {
+            if (!isTrustedSyncCaller(ctx)) {
+                return null;
+            }
+            String callerOwner = extras != null ? extras.getString("owner", safePkg) : safePkg;
+            android.content.SharedPreferences sp = ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
+            String curOwner = sp.getString("owner", "");
+            if (curOwner.isEmpty() || curOwner.equals(callerOwner)) {
+                sp.edit().clear().commit();
+            }
+            Bundle out = new Bundle();
+            out.putBoolean("ok", true);
             return out;
         }
         if (METHOD_AUTOMATION_STATUS.equals(method)) {

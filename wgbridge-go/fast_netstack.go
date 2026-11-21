@@ -98,6 +98,8 @@ type fastNetTun struct {
 	events         chan tun.Event
 	notifyHandle   *channel.NotificationHandle
 	incomingPacket chan *buffer.View
+	closeCh        chan struct{}
+	closeOnce      sync.Once
 	mtu            int
 	batchSize      int
 	blockIPv6      atomic.Bool
@@ -145,6 +147,7 @@ func createFastNetTUNWithProfile(localAddresses, dnsServers []netip.Addr, mtu in
 		stack:          stack.New(opts),
 		events:         make(chan tun.Event, 16),
 		incomingPacket: make(chan *buffer.View, prof.queueDepth),
+		closeCh:        make(chan struct{}),
 		dnsServers:     dnsServers,
 		dnsCache:       make(map[string]tunnelDnsEntry),
 		mtu:            mtu,
@@ -235,8 +238,14 @@ func (tun *fastNetTun) Events() <-chan tun.Event {
 }
 
 func (tun *fastNetTun) Read(buf [][]byte, sizes []int, offset int) (int, error) {
-	view, ok := <-tun.incomingPacket
-	if !ok {
+	var view *buffer.View
+	select {
+	case v, ok := <-tun.incomingPacket:
+		if !ok {
+			return 0, os.ErrClosed
+		}
+		view = v
+	case <-tun.closeCh:
 		return 0, os.ErrClosed
 	}
 
@@ -301,24 +310,25 @@ func (tun *fastNetTun) WriteNotify() {
 		pkt.DecRef()
 		select {
 		case tun.incomingPacket <- view:
-		default:
+		case <-tun.closeCh:
 			view.Release()
+			return
 		}
 	}
 }
 
 func (tun *fastNetTun) Close() error {
-	tun.stack.RemoveNIC(1)
-	tun.stack.Close()
-	tun.ep.RemoveNotify(tun.notifyHandle)
-	tun.ep.Close()
+	tun.closeOnce.Do(func() {
+		close(tun.closeCh)
+		tun.stack.RemoveNIC(1)
+		tun.stack.Close()
+		tun.ep.RemoveNotify(tun.notifyHandle)
+		tun.ep.Close()
 
-	if tun.events != nil {
-		close(tun.events)
-	}
-	if tun.incomingPacket != nil {
-		close(tun.incomingPacket)
-	}
+		if tun.events != nil {
+			close(tun.events)
+		}
+	})
 	return nil
 }
 
