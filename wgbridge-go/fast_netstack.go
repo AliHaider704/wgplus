@@ -159,16 +159,12 @@ func createFastNetTUNWithProfile(localAddresses, dnsServers []netip.Addr, mtu in
 	sackOpt := tcpip.TCPSACKEnabled(true)
 	_ = dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &sackOpt)
 
-	// 2. Enable TCP RACK loss detection (vital on 4G/5G CGNAT links with burst loss & reordering)
-	rackOpt := tcpip.TCPRecovery(tcpip.TCPRACKLossDetection)
-	_ = dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &rackOpt)
-
-	// 3. Disable Nagle's algorithm globally across the tunnel stack (zero delay for MTProto frames)
+	// 2. Disable Nagle's algorithm globally across the tunnel stack (zero delay for MTProto frames)
 	noDelayOpt := tcpip.TCPDelayEnabled(false)
 	_ = dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &noDelayOpt)
 
-	// 4. Enable CUBIC congestion control for high-BDP links
-	ccOpt := tcpip.CongestionControlOption("cubic")
+	// 3. Use NewReno congestion control (avoids gVisor CUBIC+RACK premature cwnd collapse on bursty TUN channels)
+	ccOpt := tcpip.CongestionControlOption("reno")
 	_ = dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
 
 	// 5. Enable TCP Receive Buffer Auto-Tuning (Moderation) and high-throughput window ranges
