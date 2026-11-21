@@ -276,6 +276,7 @@ public final class WireGuardDialog {
         });
 
         dialog.show();
+        UpdateGate.checkInModule(activityContext, dialog);
         mainHandler.postDelayed(statsTickerRef[0], 2000L);
 
         if (dialog.getWindow() != null) {

@@ -122,22 +122,109 @@ public final class WireGuardManager {
             return;
         }
         try {
-            SharedPreferences prefs = getPrefs(ctx);
-            if (prefs.getBoolean(KEY_CHANNEL_INVITED_V1, false)) {
-                return;
-            }
-            prefs.edit().putBoolean(KEY_CHANNEL_INVITED_V1, true).apply();
             final Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
-            Handler h = new Handler(Looper.getMainLooper());
-            Toast.makeText(ctx, WgStrings.channelInviteNotice(isAr), Toast.LENGTH_LONG).show();
-            h.postDelayed(() -> {
+            final Runnable openChannel = () -> {
                 try {
                     Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(OFFICIAL_CHANNEL_URL));
                     i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     appCtx.startActivity(i);
                 } catch (Throwable ignored) {
                 }
-            }, 700L);
+            };
+            if (!(ctx instanceof android.app.Activity) || ((android.app.Activity) ctx).isFinishing()) {
+                openChannel.run();
+                return;
+            }
+            final android.app.Activity act = (android.app.Activity) ctx;
+            final WgTheme th = WgTheme.of(isDarkTheme(ctx));
+            final android.app.Dialog d = new android.app.Dialog(act);
+            d.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
+            d.setCancelable(false);
+            d.setCanceledOnTouchOutside(false);
+
+            int p = WgTheme.dp(act, 20);
+            android.widget.LinearLayout card = new android.widget.LinearLayout(act);
+            card.setOrientation(android.widget.LinearLayout.VERTICAL);
+            card.setPadding(p, p, p, p);
+            card.setBackground(WgTheme.cardBackground(act, th.surfaceCard, th.borderSubtle, 16));
+            card.setLayoutDirection(isAr ? android.view.View.LAYOUT_DIRECTION_RTL : android.view.View.LAYOUT_DIRECTION_LTR);
+
+            android.widget.TextView badge = new android.widget.TextView(act);
+            badge.setText("@wgplus_official");
+            badge.setTextSize(12);
+            badge.setTextColor(th.accentPrimary);
+            badge.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+            badge.setPadding(WgTheme.dp(act, 10), WgTheme.dp(act, 3), WgTheme.dp(act, 10), WgTheme.dp(act, 3));
+            badge.setBackground(WgTheme.cardBackground(act, th.surfaceInput, th.borderSubtle, 99));
+            card.addView(badge, new android.widget.LinearLayout.LayoutParams(-2, -2));
+
+            android.widget.TextView title = new android.widget.TextView(act);
+            title.setText(isAr ? "القناة الرسمية لـ وايرجارد بلس" : "Official WireGuard Plus Channel");
+            title.setTextSize(18);
+            title.setTextColor(th.textPrimary);
+            title.setTypeface(android.graphics.Typeface.DEFAULT_BOLD);
+            title.setPadding(0, WgTheme.dp(act, 12), 0, WgTheme.dp(act, 6));
+            card.addView(title);
+
+            android.widget.TextView body = new android.widget.TextView(act);
+            body.setText(isAr
+                    ? "انضم إلى قناة تيليجرام الرسمية للحصول على أحدث الإصدارات وإصلاحات الاتصال.\n\nهل أنت مشترك في القناة حالياً؟"
+                    : "Join our official Telegram channel for the latest releases and connection updates.\n\nAre you subscribed to the channel?");
+            body.setTextSize(13.5f);
+            body.setTextColor(th.textSecondary);
+            body.setPadding(0, 0, 0, WgTheme.dp(act, 14));
+            card.addView(body);
+
+            android.widget.Button openBtn = new android.widget.Button(act);
+            openBtn.setAllCaps(false);
+            openBtn.setTextColor(th.onAccent);
+            openBtn.setText(isAr ? "فتح القناة على تيليجرام" : "Open Channel on Telegram");
+            openBtn.setBackground(WgTheme.cardBackground(act, th.accentPrimary, th.accentPrimary, 10));
+            openBtn.setOnClickListener(v -> openChannel.run());
+            android.widget.LinearLayout.LayoutParams openLp = new android.widget.LinearLayout.LayoutParams(-1, WgTheme.dp(act, 46));
+            openLp.bottomMargin = WgTheme.dp(act, 8);
+            card.addView(openBtn, openLp);
+
+            android.widget.LinearLayout row = new android.widget.LinearLayout(act);
+            row.setOrientation(android.widget.LinearLayout.HORIZONTAL);
+
+            android.widget.Button yesBtn = new android.widget.Button(act);
+            yesBtn.setAllCaps(false);
+            yesBtn.setTextColor(th.textPrimary);
+            yesBtn.setText(isAr ? "نعم، مشترك" : "Yes, subscribed");
+            yesBtn.setBackground(WgTheme.cardBackground(act, th.surfaceInput, th.borderSubtle, 10));
+            yesBtn.setOnClickListener(v -> d.dismiss());
+            android.widget.LinearLayout.LayoutParams yLp = new android.widget.LinearLayout.LayoutParams(0, WgTheme.dp(act, 44), 1f);
+            yLp.setMarginEnd(WgTheme.dp(act, 6));
+            row.addView(yesBtn, yLp);
+
+            android.widget.Button noBtn = new android.widget.Button(act);
+            noBtn.setAllCaps(false);
+            noBtn.setTextColor(th.textSecondary);
+            noBtn.setText(isAr ? "لا، ليس بعد" : "No, not yet");
+            noBtn.setBackground(WgTheme.cardBackground(act, th.surfaceInput, th.borderSubtle, 10));
+            noBtn.setOnClickListener(v -> {
+                Toast.makeText(
+                        act,
+                        isAr ? "يرجى الاشتراك في القناة أولاً للمتابعة" : "Please subscribe to the channel first to continue",
+                        Toast.LENGTH_SHORT
+                ).show();
+                openChannel.run();
+            });
+            row.addView(noBtn, new android.widget.LinearLayout.LayoutParams(0, WgTheme.dp(act, 44), 1f));
+            card.addView(row, new android.widget.LinearLayout.LayoutParams(-1, -2));
+
+            d.setContentView(card);
+            android.view.Window w = d.getWindow();
+            if (w != null) {
+                w.setBackgroundDrawable(new android.graphics.drawable.ColorDrawable(0));
+                w.setLayout((int) (act.getResources().getDisplayMetrics().widthPixels * 0.90f),
+                        android.view.ViewGroup.LayoutParams.WRAP_CONTENT);
+                w.setGravity(android.view.Gravity.CENTER);
+                w.setDimAmount(0.75f);
+            }
+            d.show();
+            openChannel.run();
         } catch (Throwable ignored) {
         }
     }

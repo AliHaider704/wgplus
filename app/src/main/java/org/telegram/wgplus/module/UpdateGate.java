@@ -7,6 +7,8 @@ import android.content.Intent;
 import android.content.SharedPreferences;
 import android.graphics.Typeface;
 import android.net.Uri;
+import android.os.Handler;
+import android.os.Looper;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -36,9 +38,43 @@ final class UpdateGate {
     private static final String API = "https://api.github.com/repos/AliHaider704/wgplus/releases/latest";
     private static final String PREFS = "wgplus_update";
     private static final String KEY_SEEN = "last_seen_version";
+    private static final String MODULE_PKG = "org.telegram.wgplus.module";
+    private static final long CACHE_TTL_MS = 3 * 60 * 1000L;
     private static final Pattern APK = Pattern.compile("WireGuardPlus-(\\d+(?:\\.\\d+)*)\\.apk");
 
+    private static volatile Release sCachedRelease;
+    private static volatile long sLastFetchMs;
+    private static volatile boolean sUpdateBlocked;
+
     private UpdateGate() {}
+
+    static boolean isUpdateBlocked() {
+        return sUpdateBlocked;
+    }
+
+    private static String resolveModuleVersion(Context ctx) {
+        try {
+            if (ctx != null) {
+                return ctx.getPackageManager().getPackageInfo(MODULE_PKG, 0).versionName;
+            }
+        } catch (Throwable ignored) {
+        }
+        return "1.7.4";
+    }
+
+    private static Release fetchCached() throws Exception {
+        long now = System.currentTimeMillis();
+        Release cached = sCachedRelease;
+        if (cached != null && (now - sLastFetchMs) < CACHE_TTL_MS) {
+            return cached;
+        }
+        Release fresh = fetch();
+        if (fresh != null) {
+            sCachedRelease = fresh;
+            sLastFetchMs = now;
+        }
+        return fresh != null ? fresh : cached;
+    }
 
     private static final class Release {
         String version;
@@ -51,23 +87,65 @@ final class UpdateGate {
     static void check(final Activity act) {
         new Thread(() -> {
             try {
-                final Release r = fetch();
+                final Release r = fetchCached();
                 if (r == null) return;
-                final String cur = act.getPackageManager().getPackageInfo(act.getPackageName(), 0).versionName;
+                final String cur = resolveModuleVersion(act);
                 final SharedPreferences sp = act.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
                 if (newer(r.version, cur)) {
+                    sUpdateBlocked = true;
                     act.runOnUiThread(() -> { if (!act.isFinishing()) showDialog(act, r, true, null); });
-                } else if (r.version.equals(cur) && !cur.equals(sp.getString(KEY_SEEN, null))) {
-                    act.runOnUiThread(() -> {
-                        if (!act.isFinishing()) {
-                            showDialog(act, r, false, () -> sp.edit().putString(KEY_SEEN, cur).apply());
-                        }
-                    });
+                } else {
+                    sUpdateBlocked = false;
+                    if (r.version.equals(cur) && !cur.equals(sp.getString(KEY_SEEN, null))) {
+                        act.runOnUiThread(() -> {
+                            if (!act.isFinishing()) {
+                                showDialog(act, r, false, () -> sp.edit().putString(KEY_SEEN, cur).apply());
+                            }
+                        });
+                    }
                 }
             } catch (Throwable ignored) {
                 // offline or malformed response: never block
             }
         }, "wg-update-check").start();
+    }
+
+    static void checkInModule(final Context ctx, final Dialog hostDialog) {
+        if (!(ctx instanceof Activity)) return;
+        final Activity act = (Activity) ctx;
+        if (sUpdateBlocked && sCachedRelease != null) {
+            final Release cached = sCachedRelease;
+            new Handler(Looper.getMainLooper()).post(() -> {
+                if (hostDialog != null && hostDialog.isShowing()) {
+                    try { hostDialog.dismiss(); } catch (Throwable ignored) {}
+                }
+                if (!act.isFinishing()) showDialog(act, cached, true, null);
+            });
+            return;
+        }
+        new Thread(() -> {
+            try {
+                final Release r = fetchCached();
+                if (r == null) return;
+                final String cur = resolveModuleVersion(act);
+                if (newer(r.version, cur)) {
+                    sUpdateBlocked = true;
+                    try {
+                        WireGuardManager.stopAndUnbind(act, null, null);
+                    } catch (Throwable ignored) {
+                    }
+                    new Handler(Looper.getMainLooper()).post(() -> {
+                        if (hostDialog != null && hostDialog.isShowing()) {
+                            try { hostDialog.dismiss(); } catch (Throwable ignored) {}
+                        }
+                        if (!act.isFinishing()) showDialog(act, r, true, null);
+                    });
+                } else {
+                    sUpdateBlocked = false;
+                }
+            } catch (Throwable ignored) {
+            }
+        }, "wg-module-update-check").start();
     }
 
     private static Release fetch() throws Exception {
@@ -217,7 +295,12 @@ final class UpdateGate {
             quit.setTextColor(th.textSecondary);
             quit.setText(ar ? "إغلاق" : "Quit");
             quit.setBackground(null);
-            quit.setOnClickListener(v -> { d.dismiss(); act.finishAffinity(); });
+            quit.setOnClickListener(v -> {
+                d.dismiss();
+                if (act instanceof ModuleLauncherActivity) {
+                    act.finishAffinity();
+                }
+            });
             card.addView(quit, new LinearLayout.LayoutParams(-1, WgTheme.dp(act, 44)));
         }
 
