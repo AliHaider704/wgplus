@@ -595,9 +595,10 @@ func StartTunnelAdvanced(
 // 2. Continuously monitors RX/TX progress (ignoring small 32B keepalive packets) and handshake freshness,
 //    automatically hopping ports and re-handshaking whenever a mobile CGNAT pinhole collapses or stalls.
 func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) {
-	// Phase 1: Aggressive initial handshake warmup with real ephemeral port hops & RekeyTimeout bypass
-	retryDelays := []time.Duration{480 * time.Millisecond, 700 * time.Millisecond, 950 * time.Millisecond}
-	for _, wait := range retryDelays {
+	// Phase 1: Initial handshake warmup. Prefer soft retries on the same UDP socket first so
+	// 100-250ms RTT servers are not aborted mid-handshake by port hopping / replace_peers=true.
+	retryDelays := []time.Duration{900 * time.Millisecond, 1400 * time.Millisecond, 2000 * time.Millisecond}
+	for idx, wait := range retryDelays {
 		if hasCompletedHandshake(dev) || !isActiveDevice(dev) {
 			break
 		}
@@ -609,7 +610,11 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 		if hasCompletedHandshake(dev) || !isActiveDevice(dev) {
 			break
 		}
-		hopActivePeer(true, true)
+		if idx < len(retryDelays)-1 {
+			triggerPeerHandshakeDirect(dev, pubHex, true)
+		} else {
+			hopActivePeer(true, true)
+		}
 	}
 
 	// Phase 2: 24/7 continuous health & CGNAT pinhole guardian
@@ -618,6 +623,8 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 
 	lastRx, lastTx, _ := readActiveTotals(dev)
 	var stalledTicks int
+	var noHandshakeTicks int
+	var lastHardHopAt time.Time
 
 	for {
 		select {
@@ -635,25 +642,48 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 		if rx < lastRx || tx < lastTx {
 			lastRx, lastTx = rx, tx
 			stalledTicks = 0
+			noHandshakeTicks = 0
 			continue
 		}
 
 		txDelta := tx - lastTx
+		canHardHop := lastHardHopAt.IsZero() || time.Since(lastHardHopAt) >= 60*time.Second
 
-		// Case A: Handshake missing, expired past 195s, or >135s stale while real data is queued
-		if hsSec <= 0 || (nowSec-hsSec) > 195 || (txDelta >= 128 && (nowSec-hsSec) > 135) {
-			hopActivePeer(true, true)
+		// Case A1: Never completed a handshake; nudge softly first, hard-hop only after 24s.
+		if hsSec <= 0 {
+			noHandshakeTicks++
+			if noHandshakeTicks >= 3 && canHardHop {
+				hopActivePeer(true, true)
+				lastHardHopAt = time.Now()
+				noHandshakeTicks = 0
+				stalledTicks = 0
+				lastRx, lastTx, _ = readActiveTotals(dev)
+				continue
+			}
+			triggerPeerHandshakeDirect(dev, pubHex, false)
+			lastRx, lastTx = rx, tx
+			continue
+		}
+		noHandshakeTicks = 0
+
+		// Case A2: Handshake aging (>135s while real traffic is flowing).
+		// Soft-rehandshake ONLY — never wipe the live peer session or hop UDP port here,
+		// otherwise active Telegram TCP sockets stall for 2-5 seconds on retransmission.
+		hsAge := nowSec - hsSec
+		if hsAge > 135 && txDelta >= 128 && rx > lastRx {
+			triggerPeerHandshakeDirect(dev, pubHex, false)
 			stalledTicks = 0
-			lastRx, lastTx, _ = readActiveTotals(dev)
+			lastRx, lastTx = rx, tx
 			continue
 		}
 
-		// Case B: Significant outbound payload (>= 128B, ignoring 32B empty keepalive probes)
-		// with zero inbound RX across 2 consecutive 8s intervals -> CGNAT pinhole collapsed or silent IP change.
-		if txDelta >= 128 && rx == lastRx {
+		// Case B: Significant outbound payload (>= 256B, ignoring small keepalives) with zero
+		// inbound RX across 3 consecutive 8s intervals (24s) OR expired handshake (>220s) with no RX.
+		if (txDelta >= 256 && rx == lastRx) || (hsAge > 220 && txDelta >= 128 && rx == lastRx) {
 			stalledTicks++
-			if stalledTicks >= 2 {
+			if stalledTicks >= 3 && canHardHop {
 				hopActivePeer(true, true)
+				lastHardHopAt = time.Now()
 				stalledTicks = 0
 				lastRx, lastTx, _ = readActiveTotals(dev)
 				continue

@@ -3195,7 +3195,7 @@ public final class WireGuardManager {
 
         long now = System.currentTimeMillis();
         boolean sigChanged = !currentSig.equals(sLastActiveNetworkSignature);
-        if (!sigChanged && (!forceRecovery || (now - sLastRoamingUpdateMs < 5000L))) {
+        if (!sigChanged && (!forceRecovery || (now - sLastRoamingUpdateMs < 15000L))) {
             return;
         }
         sLastActiveNetworkSignature = currentSig;
