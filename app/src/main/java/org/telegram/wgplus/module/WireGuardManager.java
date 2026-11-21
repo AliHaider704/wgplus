@@ -123,14 +123,6 @@ public final class WireGuardManager {
         }
         try {
             final Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
-            final Runnable openChannel = () -> {
-                try {
-                    Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(OFFICIAL_CHANNEL_URL));
-                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                    appCtx.startActivity(i);
-                } catch (Throwable ignored) {
-                }
-            };
             android.app.Activity resolvedAct = null;
             Context cur = ctx;
             for (int depth = 0; depth < 8 && cur != null; depth++) {
@@ -145,10 +137,41 @@ public final class WireGuardManager {
                 }
             }
             if (resolvedAct == null || resolvedAct.isFinishing()) {
-                openChannel.run();
+                try {
+                    Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(OFFICIAL_CHANNEL_URL));
+                    i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    appCtx.startActivity(i);
+                } catch (Throwable ignored) {
+                }
                 return;
             }
             final android.app.Activity act = resolvedAct;
+            final Runnable openChannel = () -> {
+                String pkg = act.getPackageName();
+                boolean inModuleApp = "org.telegram.wgplus.module".equals(pkg);
+                String[] uris = new String[] {
+                        "tg://resolve?domain=wgplus_official",
+                        OFFICIAL_CHANNEL_URL
+                };
+                for (String uriStr : uris) {
+                    try {
+                        Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(uriStr));
+                        if (!inModuleApp && pkg != null && !pkg.isEmpty()) {
+                            i.setPackage(pkg);
+                        }
+                        act.startActivity(i);
+                        return;
+                    } catch (Throwable ignored) {
+                    }
+                }
+                try {
+                    Intent fallback = new Intent(Intent.ACTION_VIEW, Uri.parse(OFFICIAL_CHANNEL_URL));
+                    fallback.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    appCtx.startActivity(fallback);
+                } catch (Throwable t) {
+                    Log.e(TAG, "openChannel fallback failed", t);
+                }
+            };
             final WgTheme th = WgTheme.of(isDarkTheme(ctx));
             final android.app.Dialog d = new android.app.Dialog(act);
             d.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE);
@@ -193,7 +216,10 @@ public final class WireGuardManager {
             openBtn.setTextColor(th.onAccent);
             openBtn.setText(isAr ? "فتح القناة على تيليجرام" : "Open Channel on Telegram");
             openBtn.setBackground(WgTheme.cardBackground(act, th.accentPrimary, th.accentPrimary, 10));
-            openBtn.setOnClickListener(v -> openChannel.run());
+            openBtn.setOnClickListener(v -> {
+                d.dismiss();
+                openChannel.run();
+            });
             android.widget.LinearLayout.LayoutParams openLp = new android.widget.LinearLayout.LayoutParams(-1, WgTheme.dp(act, 46));
             openLp.bottomMargin = WgTheme.dp(act, 8);
             card.addView(openBtn, openLp);
