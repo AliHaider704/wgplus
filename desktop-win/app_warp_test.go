@@ -93,23 +93,41 @@ func TestSelectProfileWhileDisconnectedAndNoBrowserChannelURI(t *testing.T) {
 }
 
 func TestFetchReleaseAndRedirectFallback(t *testing.T) {
-	nAPI, err := fetchRelease("latest")
+	apiSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"tag_name": "v1.8.0",
+			"html_url": "https://github.com/AliHaider704/wgplus/releases/tag/v1.8.0",
+			"body": "- Fix A\n### [AR]\n- إصلاح أ",
+			"assets": [
+				{"name": "WireGuardPlus-Windows-x64.exe", "browser_download_url": "https://github.com/AliHaider704/wgplus/releases/download/v1.8.0/WireGuardPlus-Windows-x64.exe"}
+			]
+		}`))
+	}))
+	defer apiSrv.Close()
+
+	nAPI, err := fetchReleaseFromURL(&http.Client{Timeout: 5 * time.Second}, apiSrv.URL)
 	if err != nil {
-		t.Fatalf("fetchRelease(latest) failed: %v", err)
+		t.Fatalf("fetchReleaseFromURL failed: %v", err)
 	}
-	if nAPI.Version != "1.7.9" {
-		t.Fatalf("expected API Version 1.7.9, got %q", nAPI.Version)
+	if nAPI.Version != "1.8.0" {
+		t.Fatalf("expected API Version 1.8.0, got %q", nAPI.Version)
 	}
 	if !strings.Contains(nAPI.Download, "WireGuardPlus-Windows-x64.exe") {
 		t.Fatalf("expected API Download URL to contain WireGuardPlus-Windows-x64.exe, got %q", nAPI.Download)
 	}
 
-	nRedir, err := fetchLatestViaRedirect(&http.Client{Timeout: 8 * time.Second})
+	redirSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "https://github.com/AliHaider704/wgplus/releases/tag/v1.8.0", http.StatusFound)
+	}))
+	defer redirSrv.Close()
+
+	nRedir, err := fetchLatestViaRedirectURL(&http.Client{Timeout: 5 * time.Second}, redirSrv.URL)
 	if err != nil {
-		t.Fatalf("fetchLatestViaRedirect failed: %v", err)
+		t.Fatalf("fetchLatestViaRedirectURL failed: %v", err)
 	}
-	if nRedir.Version != "1.7.9" {
-		t.Fatalf("expected Redirect Version 1.7.9, got %q", nRedir.Version)
+	if nRedir.Version != "1.8.0" {
+		t.Fatalf("expected Redirect Version 1.8.0, got %q", nRedir.Version)
 	}
 	if !strings.Contains(nRedir.Download, "WireGuardPlus-Windows-x64.exe") {
 		t.Fatalf("expected Redirect Download URL to contain WireGuardPlus-Windows-x64.exe, got %q", nRedir.Download)

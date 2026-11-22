@@ -75,7 +75,11 @@ func (a *App) buildUpdaterHTTPClients() []*http.Client {
 }
 
 func fetchReleaseWithClient(c *http.Client, path string) (*ReleaseNotes, error) {
-	req, _ := http.NewRequest("GET", releasesAPI+path, nil)
+	return fetchReleaseFromURL(c, releasesAPI+path)
+}
+
+func fetchReleaseFromURL(c *http.Client, fullURL string) (*ReleaseNotes, error) {
+	req, _ := http.NewRequest("GET", fullURL, nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "WireGuardPlus/"+AppVersion)
 	resp, err := c.Do(req)
@@ -109,6 +113,10 @@ func fetchReleaseWithClient(c *http.Client, path string) (*ReleaseNotes, error) 
 }
 
 func fetchLatestViaRedirect(c *http.Client) (*ReleaseNotes, error) {
+	return fetchLatestViaRedirectURL(c, "https://github.com/AliHaider704/wgplus/releases/latest")
+}
+
+func fetchLatestViaRedirectURL(c *http.Client, latestURL string) (*ReleaseNotes, error) {
 	noRedirectClient := &http.Client{
 		Timeout:   c.Timeout,
 		Transport: c.Transport,
@@ -116,7 +124,7 @@ func fetchLatestViaRedirect(c *http.Client) (*ReleaseNotes, error) {
 			return http.ErrUseLastResponse
 		},
 	}
-	req, _ := http.NewRequest("GET", "https://github.com/AliHaider704/wgplus/releases/latest", nil)
+	req, _ := http.NewRequest("GET", latestURL, nil)
 	req.Header.Set("User-Agent", "WireGuardPlus/"+AppVersion)
 	resp, err := noRedirectClient.Do(req)
 	if err != nil {
