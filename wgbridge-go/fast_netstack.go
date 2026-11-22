@@ -32,9 +32,9 @@ import (
 )
 
 const (
-	mobileTunQueueDepth  = 1024
+	mobileTunQueueDepth  = 2048
 	mobileTunBatchSize   = 32
-	desktopTunQueueDepth = 1024
+	desktopTunQueueDepth = 4096
 	desktopTunBatchSize  = 32
 
 	minTunnelDnsCacheTTL = 15 * time.Second
@@ -61,9 +61,9 @@ func mobileNetstackProfile() netstackProfile {
 		queueDepth: mobileTunQueueDepth,
 		batchSize:  mobileTunBatchSize,
 		txDefault:  262144,
-		txMax:      4194304,
-		rxDefault:  524288,
-		rxMax:      4194304,
+		txMax:      1048576,
+		rxDefault:  1048576,
+		rxMax:      8388608,
 		blockIPv6:  blockIPv6Flag.Load(),
 	}
 }
@@ -74,8 +74,8 @@ func desktopNetstackProfile() netstackProfile {
 		batchSize:  desktopTunBatchSize,
 		txDefault:  262144,
 		txMax:      1048576,
-		rxDefault:  524288,
-		rxMax:      4194304,
+		rxDefault:  1048576,
+		rxMax:      16777216,
 		blockIPv6:  blockIPv6Flag.Load(),
 	}
 }
@@ -163,8 +163,8 @@ func createFastNetTUNWithProfile(localAddresses, dnsServers []netip.Addr, mtu in
 	noDelayOpt := tcpip.TCPDelayEnabled(false)
 	_ = dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &noDelayOpt)
 
-	// 3. Use NewReno congestion control (avoids gVisor CUBIC+RACK premature cwnd collapse on bursty TUN channels)
-	ccOpt := tcpip.CongestionControlOption("reno")
+	// 3. Use CUBIC with batchSize=32 & txMax=1MB (no outbound UDP burst loss) + rxMax=16MB/8MB for full download.
+	ccOpt := tcpip.CongestionControlOption("cubic")
 	_ = dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
 
 	// 5. Enable TCP Receive Buffer Auto-Tuning (Moderation) and high-throughput window ranges

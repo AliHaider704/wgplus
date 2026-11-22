@@ -436,6 +436,9 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                 boolean forceAwake = !stopRequested
                                         && WireGuardManager.shouldForceTelegramAlwaysAwake(service, MODULE_PATH);
                                 if (!forceAwake) {
+                                    if (expectFgPromote) {
+                                        promoteNotificationsServiceToForeground(service);
+                                    }
                                     WireGuardManager.queryAndSyncStealthContinuity(service, false, false);
                                     demoteNotificationsService(service, stopRequested);
                                     return;

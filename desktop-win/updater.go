@@ -12,7 +12,12 @@ import (
 )
 
 // AppVersion must match the release tag (without "v") of this build.
-const AppVersion = "1.7.8"
+const AppVersion = "1.7.9"
+
+// GetAppVersion returns the running desktop app version string.
+func (a *App) GetAppVersion() string {
+	return AppVersion
+}
 
 const (
 	releasesAPI    = "https://api.github.com/repos/AliHaider704/wgplus/releases/"

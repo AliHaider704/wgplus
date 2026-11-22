@@ -1174,6 +1174,23 @@ public final class WireGuardDialog {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
         ));
+        String dlgVer = "1.7.9";
+        try {
+            dlgVer = ctx.getPackageManager().getPackageInfo("org.telegram.wgplus.module", 0).versionName;
+        } catch (Throwable ignored) {
+        }
+        TextView dlgVerView = new TextView(ctx);
+        dlgVerView.setText("WireGuard Plus \u00B7 v" + dlgVer);
+        dlgVerView.setTextColor(theme.textSecondary);
+        dlgVerView.setTextSize(11f);
+        dlgVerView.setTypeface(Typeface.MONOSPACE);
+        dlgVerView.setAlpha(0.65f);
+        dlgVerView.setGravity(Gravity.CENTER);
+        dlgVerView.setPadding(0, WgTheme.dp(ctx, 8), 0, 0);
+        footer.addView(dlgVerView, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
         root.addView(footer);
 
         // Live status + UAPI telemetry renderer

@@ -790,6 +790,22 @@ textarea:focus-visible {
   color: var(--text-primary);
 }
 
+.app-footer {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  padding: 6px 0 2px;
+}
+
+.app-version-label {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  opacity: 0.65;
+  user-select: none;
+}
+
 .recovery-banner {
   background-color: var(--surface-input);
   border: 1px solid var(--dot-warn);

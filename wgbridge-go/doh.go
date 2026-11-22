@@ -490,7 +490,7 @@ func ResolveEndpointDoH(rawEndpoint string, useDoH bool) (string, error) {
 	}
 
 	if useDoH {
-		if addr, dohErr := resolveHostViaParallelDoH(host, 2200*time.Millisecond); dohErr == nil && addr.IsValid() {
+		if addr, dohErr := resolveHostViaParallelDoH(host, 1200*time.Millisecond); dohErr == nil && addr.IsValid() {
 			ipStr := addr.String()
 			putCachedDoH(host, ipStr)
 			return net.JoinHostPort(ipStr, strconv.Itoa(portNum)), nil
@@ -510,7 +510,7 @@ func ResolveEndpointDoH(rawEndpoint string, useDoH bool) (string, error) {
 }
 
 func resolveEndpointFastFallback(host string, portNum int) (string, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1800*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), 1000*time.Millisecond)
 	defer cancel()
 
 	resCh := make(chan string, len(directUdpDnsServers)+1)

@@ -2,6 +2,21 @@
 
 All notable changes to **WireGuard Plus** (`Windows Desktop` & `Android org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [1.7.9] - 2026-11-22
+
+### Added
+- **Minimal Version Footer (Windows & Android)**: Added a subtle `WireGuard Plus · v1.7.9` footer at the bottom of the Windows desktop UI, Android companion launcher (`ModuleLauncherActivity`), and in-Telegram settings dialog (`WireGuardDialog`).
+
+### Fixed
+- **Download & Upload Balance (`wgbridge-go/fast_netstack.go`, `bridge.go`)**: Tuned asymmetric RX/TX buffers (`rxMax=16MB` desktop / `8MB` mobile, `txMax=1MB`, `batchSize=32`, `CUBIC`) to restore full multi-hundred-Mbps download throughput (`149–265 Mbps` desktop, `145 Mbps` mobile) without outbound UDP burst loss.
+- **Fast Initial Connect, Wakeup & Wi-Fi/LTE Roaming (`bridge.go`, `doh.go`, `WireGuardManager.java`)**:
+  - Reduced DoH/fallback timeouts (`1200ms`/`1000ms`), accelerated initial handshake escalation (`250ms -> 450ms -> 800ms`), and sped up Phase 2 stall recovery (`3s` ticks -> `6s` hop).
+  - Updated `EnsureTunnelAlive` to actively verify handshakes older than `15s` and `UpdatePeerEndpoint` to still hop/re-handshake on the active endpoint if DNS/DoH fails mid-handoff between Wi-Fi and Mobile Data.
+- **Android Multi-Client Stability & Fork Compatibility (`WireGuardManager.java`, `XposedInit.java`, `KeepaliveBridgeListenerService.java`)**:
+  - Integrated `isUsingSharedHub()` across `isTunnelRunning`, `getActivePort`, `enforceKillSwitchIfDisconnected`, `onAppForegroundChanged`, `runFailoverCheck`, and `handleRoamingEvent`.
+  - Fixed `ForegroundServiceDidNotStartInTimeException`, `NoSuchMethodError` on `ConnectionsManager.setProxySettings` in AyuGram, and self-binding `KeepaliveBridgeListenerService` warnings.
+- **Windows Official Channel Deep-Link (`desktop-win/frontend/dist/app.js`)**: Switched the channel invite link to `tg://resolve?domain=wgplus_official` so it opens Telegram Desktop directly instead of the browser.
+
 ## [1.7.8] - 2026-11-22
 
 ### Fixed

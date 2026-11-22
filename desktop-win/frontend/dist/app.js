@@ -699,7 +699,7 @@ function maybeInviteToOfficialChannel() {
     showToast(t().channelInviteToast);
     setTimeout(() => {
       try {
-        wailsRuntime()?.BrowserOpenURL("https://t.me/wgplus_official");
+        wailsRuntime()?.BrowserOpenURL("tg://resolve?domain=wgplus_official");
       } catch {}
     }, 700);
   } catch {}
@@ -1123,6 +1123,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   wireEvents();
   subscribeRuntimeEvents();
   await refreshBootstrap();
+  try {
+    const ver = await api()?.GetAppVersion?.();
+    const verEl = el("app-version-label");
+    if (verEl && ver) verEl.textContent = `WireGuard Plus · v${ver}`;
+  } catch {}
   runUpdateFlow();
 });
 

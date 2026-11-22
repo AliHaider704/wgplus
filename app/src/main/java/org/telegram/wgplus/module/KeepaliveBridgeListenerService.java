@@ -200,8 +200,9 @@ public class KeepaliveBridgeListenerService extends NotificationListenerService 
                 : BIND_FLAGS_LEGACY;
 
         boolean anyBound = false;
+        String selfPkg = getPackageName();
         for (String pkg : wanted) {
-            if (!ContinuityBridgeManager.isPackageInstalled(this, pkg)) {
+            if (pkg == null || pkg.equals(selfPkg) || !ContinuityBridgeManager.isPackageInstalled(this, pkg)) {
                 continue;
             }
             BridgeConnection conn = mConnections.get(pkg);

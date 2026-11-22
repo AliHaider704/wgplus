@@ -457,6 +457,24 @@ public class ModuleLauncherActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT
         ));
 
+        String verName = "1.7.9";
+        try {
+            verName = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Throwable ignored) {
+        }
+        TextView versionFooter = new TextView(this);
+        versionFooter.setText("WireGuard Plus \u00B7 v" + verName);
+        versionFooter.setTextColor(theme.textSecondary);
+        versionFooter.setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f);
+        versionFooter.setTypeface(Typeface.MONOSPACE);
+        versionFooter.setAlpha(0.65f);
+        versionFooter.setGravity(Gravity.CENTER);
+        versionFooter.setPadding(0, WgTheme.dp(this, 16), 0, WgTheme.dp(this, 6));
+        content.addView(versionFooter, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
         setContentView(screenRoot);
         if (prevScrollY > 0) {
             scrollView.post(() -> scrollView.scrollTo(0, prevScrollY));
