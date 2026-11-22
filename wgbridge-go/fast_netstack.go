@@ -163,8 +163,9 @@ func createFastNetTUNWithProfile(localAddresses, dnsServers []netip.Addr, mtu in
 	noDelayOpt := tcpip.TCPDelayEnabled(false)
 	_ = dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &noDelayOpt)
 
-	// 3. Use CUBIC with batchSize=32 & txMax=1MB (no outbound UDP burst loss) + rxMax=16MB/8MB for full download.
-	ccOpt := tcpip.CongestionControlOption("cubic")
+	// 3. Use NewReno with batchSize=32 & txMax=1MB (avoids CUBIC cwnd collapse to ~1.2 Mbps on upload)
+	// while keeping rxMax=16MB/8MB for full download throughput.
+	ccOpt := tcpip.CongestionControlOption("reno")
 	_ = dev.stack.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
 
 	// 5. Enable TCP Receive Buffer Auto-Tuning (Moderation) and high-throughput window ranges
