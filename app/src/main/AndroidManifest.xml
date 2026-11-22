@@ -30,6 +30,7 @@
         <package android:name="ir.p2021.telegraph" />
         <package android:name="com.radolyn.ayugram" />
         <package android:name="org.thunderdog.challegram" />
+        <package android:name="xyz.nextalone.nagram" />
     </queries>
 
     <application
@@ -48,7 +49,10 @@
             android:value="@string/xposed_desc" />
         <meta-data
             android:name="xposedminversion"
-            android:value="82" />
+            android:value="93" />
+        <meta-data
+            android:name="xposedsharedprefs"
+            android:value="true" />
         <meta-data
             android:name="xposedscope"
             android:resource="@array/xposed_scope" />

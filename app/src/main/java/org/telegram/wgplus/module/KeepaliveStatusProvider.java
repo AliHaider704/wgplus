@@ -124,6 +124,7 @@ public class KeepaliveStatusProvider extends ContentProvider {
         Context ctx = getContext();
         if (ctx != null) {
             ContinuityBridgeManager.registerPassiveWifiRecovery(ctx);
+            WireGuardManager.publishWorldReadableSyncBundle(ctx);
         }
         return true;
     }
@@ -215,10 +216,14 @@ public class KeepaliveStatusProvider extends ContentProvider {
             int port = extras != null ? extras.getInt("port", -1) : -1;
             String sig = extras != null ? extras.getString("sig", "") : "";
             String owner = extras != null ? extras.getString("owner", safePkg) : safePkg;
+            String profileId = extras != null ? extras.getString("profileId", "") : "";
+            String profileName = extras != null ? extras.getString("profileName", "") : "";
             ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE).edit()
                     .putInt("port", port)
                     .putString("sig", sig != null ? sig : "")
                     .putString("owner", owner != null ? owner : "")
+                    .putString("profileId", profileId != null ? profileId : "")
+                    .putString("profileName", profileName != null ? profileName : "")
                     .putLong("updatedAt", System.currentTimeMillis())
                     .commit();
             Bundle out = new Bundle();
@@ -234,6 +239,8 @@ public class KeepaliveStatusProvider extends ContentProvider {
             out.putInt("port", sp.getInt("port", -1));
             out.putString("sig", sp.getString("sig", ""));
             out.putString("owner", sp.getString("owner", ""));
+            out.putString("profileId", sp.getString("profileId", ""));
+            out.putString("profileName", sp.getString("profileName", ""));
             out.putLong("updatedAt", sp.getLong("updatedAt", 0L));
             return out;
         }

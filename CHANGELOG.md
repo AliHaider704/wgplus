@@ -2,6 +2,20 @@
 
 All notable changes to **WireGuard Plus** (`Windows Desktop` & `Android org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [1.8.0] - 2026-11-23
+
+### Added
+- **Full Nagram & Vector (LSPosed Fork) Compatibility (`XposedInit.java`, `WireGuardManager.java`, `ContinuityBridgeManager.java`, `AndroidManifest.xml`)**: Added `xyz.nextalone.nagram` to scope/queries/targets, `xposedsharedprefs`, and local mirror sync fallback for `targetSdk 36` clients without `<queries>`.
+- **Multi-Client Shared Tunnel UI Sync (`WireGuardManager.java`, `KeepaliveStatusProvider.java`, `ModuleLauncherActivity.java`, `WireGuardDialog.java`)**: Companion app and secondary Telegram clients now display live **Connected** status and active port when another client owns the shared tunnel.
+- **Adaptive & Monochrome App Icon (One UI / Material You)**: Replaced `<shape>` adaptive-icon background with `@color/ic_launcher_background`, added `<monochrome>` silhouette assets across all mipmap densities, and passed the launcher icon in `TaskDescription`.
+- **Resilient Windows Auto-Updater (`desktop-win/updater.go`, `app.js`)**: Added local SOCKS5 tunnel transport, `github.com/.../releases/latest` redirect fallback, and automatic retry once the tunnel connects.
+
+### Fixed
+- **Nagram `NotificationsService` Crash**: Prevented synchronous `stopForeground()` inside `onStartCommand()` that triggered `RemoteServiceException: Context.startForegroundService() did not then call Service.startForeground()`.
+- **Mobile UI & Arabic RTL Polish (`WireGuardDialog.java`, `WgStrings.java`)**: Hid the Disconnect button when disconnected, balanced Connect/Reconnect/Disconnect button sizing (`48dp`, single-line, equal `50/50` split in EN & AR), redesigned the Route & Calls verification table with clean RTL alignment and subtle dividers, and shortened verbose copy.
+- **Windows Single-Click Server Switching (`desktop-win/app.go`, `app.js`)**: Added `SelectProfile()` for instant 1-click switching while disconnected, prevented 1-second telemetry polls from rebuilding `#profiles-list` mid-click, and fixed `ReferenceError: currentLang is not defined`.
+- **Windows Kill Switch Guard on Switch Failure (`desktop-win/app.go`)**: Engaged `StartKillSwitchGuard()` if `Connect()` fails while Kill Switch is enabled.
+
 ## [1.7.9] - 2026-11-22
 
 ### Added

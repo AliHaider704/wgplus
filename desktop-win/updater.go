@@ -1,18 +1,23 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	"golang.org/x/net/proxy"
+	"wgbridge"
 )
 
 // AppVersion must match the release tag (without "v") of this build.
-const AppVersion = "1.7.9"
+const AppVersion = "1.8.0"
 
 // GetAppVersion returns the running desktop app version string.
 func (a *App) GetAppVersion() string {
@@ -38,11 +43,38 @@ type ReleaseNotes struct {
 // UpdateInfo is returned to the frontend. Available=false when up to date or offline.
 type UpdateInfo struct {
 	Available bool `json:"available"`
+	CheckedOk bool `json:"checkedOk"`
 	ReleaseNotes
 }
 
-func fetchRelease(path string) (*ReleaseNotes, error) {
-	c := &http.Client{Timeout: 8 * time.Second}
+func (a *App) buildUpdaterHTTPClients() []*http.Client {
+	clients := []*http.Client{{Timeout: 8 * time.Second}}
+	if wgbridge.IsRunning() {
+		port := wgbridge.GetActivePort()
+		if port > 0 {
+			a.mu.Lock()
+			auth := a.state.Settings.SocksAuthEnabled
+			user := a.state.Settings.SocksUser
+			pass := a.state.Settings.SocksPass
+			a.mu.Unlock()
+			var authCfg *proxy.Auth
+			if auth && strings.TrimSpace(user) != "" {
+				authCfg = &proxy.Auth{User: user, Password: pass}
+			}
+			if dialer, err := proxy.SOCKS5("tcp", fmt.Sprintf("127.0.0.1:%d", port), authCfg, proxy.Direct); err == nil {
+				tr := &http.Transport{
+					DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+						return dialer.Dial(network, addr)
+					},
+				}
+				clients = append(clients, &http.Client{Timeout: 10 * time.Second, Transport: tr})
+			}
+		}
+	}
+	return clients
+}
+
+func fetchReleaseWithClient(c *http.Client, path string) (*ReleaseNotes, error) {
 	req, _ := http.NewRequest("GET", releasesAPI+path, nil)
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "WireGuardPlus/"+AppVersion)
@@ -74,6 +106,61 @@ func fetchRelease(path string) (*ReleaseNotes, error) {
 	}
 	n.NotesEN, n.NotesAR = parseNotes(r.Body)
 	return n, nil
+}
+
+func fetchLatestViaRedirect(c *http.Client) (*ReleaseNotes, error) {
+	noRedirectClient := &http.Client{
+		Timeout:   c.Timeout,
+		Transport: c.Transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	req, _ := http.NewRequest("GET", "https://github.com/AliHaider704/wgplus/releases/latest", nil)
+	req.Header.Set("User-Agent", "WireGuardPlus/"+AppVersion)
+	resp, err := noRedirectClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	loc := resp.Header.Get("Location")
+	idx := strings.LastIndex(loc, "/tag/v")
+	if idx < 0 {
+		return nil, fmt.Errorf("no tag redirect (status %d)", resp.StatusCode)
+	}
+	ver := strings.TrimSpace(strings.TrimPrefix(loc[idx+len("/tag/v"):], "v"))
+	if ver == "" {
+		return nil, fmt.Errorf("empty version in redirect")
+	}
+	return &ReleaseNotes{
+		Version:  ver,
+		Page:     "https://github.com/AliHaider704/wgplus/releases/tag/v" + ver,
+		Download: "https://github.com/AliHaider704/wgplus/releases/download/v" + ver + "/" + windowsAssetNm,
+	}, nil
+}
+
+func fetchRelease(path string, clients ...*http.Client) (*ReleaseNotes, error) {
+	if len(clients) == 0 {
+		clients = []*http.Client{{Timeout: 8 * time.Second}}
+	}
+	var lastErr error
+	for _, c := range clients {
+		if n, err := fetchReleaseWithClient(c, path); err == nil {
+			return n, nil
+		} else {
+			lastErr = err
+		}
+	}
+	if path == "latest" {
+		for _, c := range clients {
+			if n, err := fetchLatestViaRedirect(c); err == nil {
+				return n, nil
+			} else {
+				lastErr = err
+			}
+		}
+	}
+	return nil, lastErr
 }
 
 func parseNotes(body string) (en, ar []string) {
@@ -118,11 +205,14 @@ func versionNewer(a, b string) bool {
 
 // CheckForUpdate fetches the latest release. Fails open (Available=false) when offline.
 func (a *App) CheckForUpdate() UpdateInfo {
-	n, err := fetchRelease("latest")
-	if err != nil || !versionNewer(n.Version, AppVersion) {
+	n, err := fetchRelease("latest", a.buildUpdaterHTTPClients()...)
+	if err != nil {
 		return UpdateInfo{}
 	}
-	return UpdateInfo{Available: true, ReleaseNotes: *n}
+	if !versionNewer(n.Version, AppVersion) {
+		return UpdateInfo{Available: false, CheckedOk: true}
+	}
+	return UpdateInfo{Available: true, CheckedOk: true, ReleaseNotes: *n}
 }
 
 // GetWhatsNew returns notes for the running version once after each update, else nil.
@@ -131,7 +221,7 @@ func (a *App) GetWhatsNew() *ReleaseNotes {
 	if b, err := os.ReadFile(p); err == nil && strings.TrimSpace(string(b)) == AppVersion {
 		return nil
 	}
-	n, err := fetchRelease("tags/v" + AppVersion)
+	n, err := fetchRelease("tags/v"+AppVersion, a.buildUpdaterHTTPClients()...)
 	if err != nil {
 		return nil // retry next launch
 	}

@@ -49,7 +49,8 @@ public final class ContinuityBridgeManager {
             "ir.ilmili.telegraph",
             "ir.p2021.telegraph",
             "com.radolyn.ayugram",
-            "org.thunderdog.challegram"
+            "org.thunderdog.challegram",
+            "xyz.nextalone.nagram"
     );
 
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor();

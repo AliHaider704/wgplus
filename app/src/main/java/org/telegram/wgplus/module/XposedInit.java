@@ -53,7 +53,8 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
             "org.telegram.gold",
             "ir.ilmili.telegraph",
             "ir.p2021.telegraph",
-            "com.radolyn.ayugram"
+            "com.radolyn.ayugram",
+            "xyz.nextalone.nagram"
     ));
     private static final String FAB_TAG = "wg_plus_floating_trigger";
 
@@ -436,11 +437,19 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                 boolean forceAwake = !stopRequested
                                         && WireGuardManager.shouldForceTelegramAlwaysAwake(service, MODULE_PATH);
                                 if (!forceAwake) {
+                                    WireGuardManager.queryAndSyncStealthContinuity(service, false, false);
                                     if (expectFgPromote) {
                                         promoteNotificationsServiceToForeground(service);
+                                        new Handler(Looper.getMainLooper()).post(
+                                                () -> demoteNotificationsService(service, stopRequested)
+                                        );
+                                    } else if (stopRequested) {
+                                        new Handler(Looper.getMainLooper()).post(
+                                                () -> demoteNotificationsService(service, true)
+                                        );
+                                    } else {
+                                        cancelOwnForegroundNotification(service);
                                     }
-                                    WireGuardManager.queryAndSyncStealthContinuity(service, false, false);
-                                    demoteNotificationsService(service, stopRequested);
                                     return;
                                 }
                                 boolean stealth = WireGuardManager.queryAndSyncStealthContinuity(
@@ -454,8 +463,12 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                         new Handler(Looper.getMainLooper()).post(
                                                 () -> demoteNotificationsService(service, false)
                                         );
+                                    } else if (syncAction) {
+                                        new Handler(Looper.getMainLooper()).post(
+                                                () -> demoteNotificationsService(service, false)
+                                        );
                                     } else {
-                                        demoteNotificationsService(service, false);
+                                        cancelOwnForegroundNotification(service);
                                     }
                                     param.setResult(Service.START_NOT_STICKY);
                                 } else {
@@ -534,6 +547,19 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
             );
         } else {
             service.startForeground(WireGuardManager.FG_NOTIFICATION_ID, notification);
+        }
+    }
+
+    private static void cancelOwnForegroundNotification(Service service) {
+        if (service == null) {
+            return;
+        }
+        try {
+            NotificationManager nm = (NotificationManager) service.getSystemService(Context.NOTIFICATION_SERVICE);
+            if (nm != null) {
+                nm.cancel(WireGuardManager.FG_NOTIFICATION_ID);
+            }
+        } catch (Throwable ignored) {
         }
     }
 

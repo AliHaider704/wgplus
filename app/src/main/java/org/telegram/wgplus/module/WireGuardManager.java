@@ -623,16 +623,25 @@ public final class WireGuardManager {
         sLastSyncPullMs = now;
         try {
             Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
-            Bundle res = appCtx.getContentResolver().call(
-                    STATUS_PROVIDER_URI,
-                    KeepaliveStatusProvider.METHOD_SYNC_PULL_STATE,
-                    appCtx.getPackageName(),
-                    null
-            );
-            if (res == null) {
-                return false;
+            String json = null;
+            try {
+                Bundle res = appCtx.getContentResolver().call(
+                        STATUS_PROVIDER_URI,
+                        KeepaliveStatusProvider.METHOD_SYNC_PULL_STATE,
+                        appCtx.getPackageName(),
+                        null
+                );
+                if (res != null) {
+                    json = res.getString(KeepaliveStatusProvider.RESULT_JSON, "");
+                }
+            } catch (Throwable ignored) {
             }
-            String json = res.getString(KeepaliveStatusProvider.RESULT_JSON, "");
+            if (json == null || json.isEmpty()) {
+                json = readSyncBundleFromXSharedPrefs();
+            }
+            if (json == null || json.isEmpty()) {
+                json = readSyncBundleFromLocalMirrorFile(appCtx);
+            }
             if (json == null || json.isEmpty()) {
                 return false;
             }
@@ -676,6 +685,7 @@ public final class WireGuardManager {
         long nextRev = prefs.getLong(KEY_SHARED_STATE_REV, 0L) + 1L;
         prefs.edit().putLong(KEY_SHARED_STATE_REV, nextRev).apply();
         if ("org.telegram.wgplus.module".equals(appCtx.getPackageName())) {
+            publishWorldReadableSyncBundle(appCtx);
             return;
         }
         SYNC_EXEC.execute(() -> {
@@ -691,6 +701,108 @@ public final class WireGuardManager {
             } catch (Throwable ignored) {
             }
         });
+    }
+
+    @SuppressWarnings("deprecation")
+    public static void publishWorldReadableSyncBundle(Context appCtx) {
+        if (appCtx == null) {
+            return;
+        }
+        final String json = exportSharedSyncBundleJson(appCtx);
+        try {
+            SharedPreferences sp = appCtx.getSharedPreferences("wg_plus_xshared_sync", Context.MODE_WORLD_READABLE);
+            sp.edit().putString("bundle_json", json).apply();
+        } catch (SecurityException ignored) {
+            // MODE_WORLD_READABLE is only allowed when LSPosed/Vector hooks ContextImpl for this module
+        } catch (Throwable ignored) {
+        }
+        mirrorSyncBundleToClientsAsync(appCtx, json);
+    }
+
+    private static void mirrorSyncBundleToClientsAsync(final Context appCtx, final String json) {
+        if (appCtx == null || json == null || json.isEmpty()) {
+            return;
+        }
+        SYNC_EXEC.execute(() -> {
+            try {
+                if (!PrivilegeBridge.hasRootAccess()) {
+                    return;
+                }
+                List<String> targets = ContinuityBridgeManager.getInstalledTargetPackages(appCtx);
+                if (targets == null || targets.isEmpty()) {
+                    return;
+                }
+                String b64 = android.util.Base64.encodeToString(
+                        json.getBytes(StandardCharsets.UTF_8),
+                        android.util.Base64.NO_WRAP
+                );
+                StringBuilder cmd = new StringBuilder();
+                for (String pkg : targets) {
+                    if (pkg == null || !pkg.matches("[a-zA-Z0-9._]+") || "org.telegram.wgplus.module".equals(pkg)) {
+                        continue;
+                    }
+                    int uid;
+                    try {
+                        uid = appCtx.getPackageManager().getPackageUid(pkg, 0);
+                    } catch (Throwable ignored) {
+                        continue;
+                    }
+                    String dir = "/data/data/" + pkg + "/files";
+                    String path = dir + "/wg_plus_sync_mirror.json";
+                    cmd.append("mkdir -p ").append(dir)
+                            .append(" && printf '%s' '").append(b64).append("' | base64 -d > ").append(path)
+                            .append(" && chown ").append(uid).append(':').append(uid).append(' ').append(path)
+                            .append(" && chmod 600 ").append(path).append("; ");
+                }
+                if (cmd.length() > 0) {
+                    PrivilegeBridge.runRootCommand(cmd.toString(), 4000);
+                }
+            } catch (Throwable ignored) {
+            }
+        });
+    }
+
+    private static String readSyncBundleFromLocalMirrorFile(Context appCtx) {
+        if (appCtx == null) {
+            return "";
+        }
+        try {
+            java.io.File file = new java.io.File(appCtx.getFilesDir(), "wg_plus_sync_mirror.json");
+            if (!file.isFile() || file.length() <= 0 || file.length() > 1_048_576L) {
+                return "";
+            }
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            try (java.io.FileInputStream in = new java.io.FileInputStream(file)) {
+                byte[] buf = new byte[4096];
+                int n;
+                while ((n = in.read(buf)) > 0) {
+                    out.write(buf, 0, n);
+                }
+            }
+            return out.toString(StandardCharsets.UTF_8.name());
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static String readSyncBundleFromXSharedPrefs() {
+        try {
+            ClassLoader xposedCl = de.robv.android.xposed.XposedBridge.class.getClassLoader();
+            Class<?> xspClass = xposedCl != null
+                    ? xposedCl.loadClass("de.robv.android.xposed.XSharedPreferences")
+                    : Class.forName("de.robv.android.xposed.XSharedPreferences");
+            Object xsp = xspClass.getConstructor(String.class, String.class)
+                    .newInstance("org.telegram.wgplus.module", "wg_plus_xshared_sync");
+            try {
+                xspClass.getMethod("reload").invoke(xsp);
+            } catch (Throwable ignored) {
+            }
+            Object val = xspClass.getMethod("getString", String.class, String.class)
+                    .invoke(xsp, "bundle_json", "");
+            return val instanceof String ? (String) val : "";
+        } catch (Throwable ignored) {
+            return "";
+        }
     }
 
     public static Integer getCachedPingMs(String profileId) {
@@ -2257,7 +2369,7 @@ public final class WireGuardManager {
         int localPort = (int) portLong;
         sSharedHubPort = localPort;
         sIsSharedHubOwner = true;
-        registerSharedTunnel(context, localPort, profileSig);
+        registerSharedTunnel(context, localPort, profileSig, cfg.id, cfg.name);
 
         sConnectedProfileId = cfg.id;
         sTunnelStartedAtMs = SystemClock.elapsedRealtime();
@@ -2287,8 +2399,109 @@ public final class WireGuardManager {
         return localPort;
     }
 
+    private static volatile long sLastSharedHubCheckMs = 0L;
+    private static volatile int sCachedExternalSharedPort = -1;
+    private static volatile boolean sSharedHubProbeInFlight = false;
+
     private static boolean isUsingSharedHub() {
-        return !sIsSharedHubOwner && sSharedHubPort > 0 && isLocalLoopbackPortOpen(sSharedHubPort, 120);
+        if (sIsSharedHubOwner || sSharedHubPort <= 0) {
+            return false;
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return true;
+        }
+        return isLocalLoopbackPortOpen(sSharedHubPort, 120);
+    }
+
+    public static int queryAnyLiveSharedTunnelPort(Context context) {
+        if (context == null) {
+            return isUsingSharedHub() ? sSharedHubPort : -1;
+        }
+        if (sIsSharedHubOwner) {
+            return -1;
+        }
+        long now = SystemClock.elapsedRealtime();
+        boolean onMain = (Looper.myLooper() == Looper.getMainLooper());
+        if (now - sLastSharedHubCheckMs < 2000L && sCachedExternalSharedPort > 0) {
+            if (onMain || isLocalLoopbackPortOpen(sCachedExternalSharedPort, 120)) {
+                return sCachedExternalSharedPort;
+            }
+        }
+        try {
+            int port = -1;
+            String owner = "";
+            long updatedAt = 0L;
+            String myPkg = context.getPackageName();
+            if ("org.telegram.wgplus.module".equals(myPkg)) {
+                SharedPreferences sp = context.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
+                port = sp.getInt("port", -1);
+                owner = sp.getString("owner", "");
+                updatedAt = sp.getLong("updatedAt", 0L);
+            } else {
+                Bundle out = context.getContentResolver().call(
+                        Uri.parse("content://" + KeepaliveStatusProvider.AUTHORITY),
+                        KeepaliveStatusProvider.METHOD_QUERY_SHARED_TUNNEL,
+                        null,
+                        null
+                );
+                if (out != null) {
+                    port = out.getInt("port", -1);
+                    owner = out.getString("owner", "");
+                    updatedAt = out.getLong("updatedAt", 0L);
+                }
+            }
+            if (port > 0 && (myPkg == null || !myPkg.equals(owner))) {
+                if (onMain) {
+                    // Never open a Socket on the main UI thread (NetworkOnMainThreadException).
+                    // Trust recent registration and asynchronously probe loopback port on background thread.
+                    boolean recent = updatedAt <= 0L || Math.abs(System.currentTimeMillis() - updatedAt) < 300_000L;
+                    if (recent && !sSharedHubProbeInFlight) {
+                        final int probePort = port;
+                        sSharedHubProbeInFlight = true;
+                        SYNC_EXEC.execute(() -> {
+                            try {
+                                boolean open = isLocalLoopbackPortOpen(probePort, 160);
+                                sLastSharedHubCheckMs = SystemClock.elapsedRealtime();
+                                if (open) {
+                                    sSharedHubPort = probePort;
+                                    sCachedExternalSharedPort = probePort;
+                                } else {
+                                    sCachedExternalSharedPort = -1;
+                                }
+                            } finally {
+                                sSharedHubProbeInFlight = false;
+                            }
+                        });
+                    }
+                    if (sCachedExternalSharedPort == port || recent) {
+                        sSharedHubPort = port;
+                        sCachedExternalSharedPort = port;
+                        sLastSharedHubCheckMs = now;
+                        return port;
+                    }
+                } else if (isLocalLoopbackPortOpen(port, 160)) {
+                    sSharedHubPort = port;
+                    sCachedExternalSharedPort = port;
+                    sLastSharedHubCheckMs = now;
+                    return port;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        sLastSharedHubCheckMs = now;
+        sCachedExternalSharedPort = -1;
+        return -1;
+    }
+
+    public static boolean isSharedTunnelObserved(Context context, String moduleApkPath) {
+        try {
+            NativeBridgeLoader.ensureLoaded(context, moduleApkPath);
+            if (Wgbridge.isRunning()) {
+                return false;
+            }
+        } catch (Throwable ignored) {
+        }
+        return queryAnyLiveSharedTunnelPort(context) > 0;
     }
 
     private static boolean isLocalLoopbackPortOpen(int port, int timeoutMs) {
@@ -2325,12 +2538,24 @@ public final class WireGuardManager {
     }
 
     private static void registerSharedTunnel(Context context, int port, String profileSig) {
+        registerSharedTunnel(context, port, profileSig, "", "");
+    }
+
+    private static void registerSharedTunnel(
+            Context context,
+            int port,
+            String profileSig,
+            String profileId,
+            String profileName
+    ) {
         if (context == null || port <= 0) return;
         try {
             Bundle b = new Bundle();
             b.putInt("port", port);
             b.putString("sig", profileSig != null ? profileSig : "");
             b.putString("owner", context.getPackageName());
+            b.putString("profileId", profileId != null ? profileId : "");
+            b.putString("profileName", profileName != null ? profileName : "");
             context.getContentResolver().call(
                     Uri.parse("content://" + KeepaliveStatusProvider.AUTHORITY),
                     KeepaliveStatusProvider.METHOD_REGISTER_SHARED_TUNNEL,
@@ -3202,9 +3427,9 @@ public final class WireGuardManager {
             if (Wgbridge.isRunning()) {
                 return true;
             }
-            return isUsingSharedHub();
+            return isUsingSharedHub() || queryAnyLiveSharedTunnelPort(context) > 0;
         } catch (Throwable t) {
-            return isUsingSharedHub();
+            return isUsingSharedHub() || queryAnyLiveSharedTunnelPort(context) > 0;
         }
     }
 
@@ -3217,9 +3442,14 @@ public final class WireGuardManager {
             if (isUsingSharedHub()) {
                 return sSharedHubPort;
             }
-            return 0;
+            int extPort = queryAnyLiveSharedTunnelPort(context);
+            return extPort > 0 ? extPort : 0;
         } catch (Throwable t) {
-            return isUsingSharedHub() ? sSharedHubPort : 0;
+            if (isUsingSharedHub()) {
+                return sSharedHubPort;
+            }
+            int extPort = queryAnyLiveSharedTunnelPort(context);
+            return extPort > 0 ? extPort : 0;
         }
     }
 
@@ -3559,10 +3789,13 @@ public final class WireGuardManager {
 
     private static final class XposedProxyReflector {
         static void apply(ClassLoader classLoader, boolean enabled, int localPort, boolean forceNudge) {
-            Class<?> connectionsManagerClass = XposedHelpers.findClass(
+            Class<?> connectionsManagerClass = XposedHelpers.findClassIfExists(
                     "org.telegram.tgnet.ConnectionsManager",
                     classLoader
             );
+            if (connectionsManagerClass == null) {
+                return;
+            }
             try {
                 XposedHelpers.callStaticMethod(
                         connectionsManagerClass,

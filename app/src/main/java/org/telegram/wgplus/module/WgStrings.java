@@ -280,23 +280,30 @@ public final class WgStrings {
     public static String statusKillSwitchGuarded(boolean ar, String profileName) {
         String cleanName = localizeProfileName(profileName, ar);
         if (cleanName.isEmpty()) {
-            return ar ? "مانع التسريب نشط (الاتصال المباشر محجوب)" : "Kill switch active (direct traffic blocked)";
+            return ar ? "مانع التسريب نشط" : "Kill switch active";
         }
         return ar
-                ? ("مانع التسريب نشط  •  " + cleanName)
-                : ("Kill switch active  •  " + cleanName);
+                ? ("مانع التسريب  •  " + cleanName)
+                : ("Kill switch  •  " + cleanName);
     }
 
     public static String statusKillSwitchSubline(boolean ar) {
         return ar
-                ? "جميع اتصالات ومكالمات تيليجرام موقوفة مؤقتًا لمنع كشف عنوانك الحقيقي حتى يتصل النفق."
-                : "All Telegram traffic and calls are held locally so your real IP cannot leak while disconnected.";
+                ? "الاتصال المباشر محجوب مؤقتًا حتى يتصل النفق."
+                : "Direct traffic is held until the tunnel connects.";
     }
 
     public static String statusEmptyHint(boolean ar) {
         return ar
-                ? ("اضغط الاتصال الفوري بـ " + ltr("WARP") + " للبدء بضغطة واحدة، أو استورد ملف إعدادات أو رمزًا مربعًا.")
-                : "Tap 1-Tap Free WARP to begin immediately, or import a config file or QR image.";
+                ? ("اضغط " + ltr("WARP") + " للاتصال الفوري، أو استورد ملفًا أو رمزًا مربعًا.")
+                : "Tap Free WARP for instant setup, or import a config or QR.";
+    }
+
+    public static String sharedTunnelActiveSubline(boolean ar, int port) {
+        String addr = ltr("127.0.0.1:" + port);
+        return ar
+                ? ("نفق مشترك نشط بين تطبيقات تيليجرام · " + addr)
+                : ("Shared tunnel active across Telegram apps · " + addr);
     }
 
     public static String statusAwaitingHandshakeWithProfile(boolean ar, String profileName) {
@@ -393,26 +400,26 @@ public final class WgStrings {
 
     public static String routeCallsLabel(boolean ar) {
         return ar
-                ? "تمرير المكالمات الصوتية والمرئية عبر النفق"
-                : "Route voice and video calls through tunnel";
+                ? "تمرير المكالمات عبر النفق"
+                : "Route voice & video calls";
     }
 
     public static String autoStartLabel(boolean ar) {
         return ar
                 ? "الاتصال التلقائي عند تشغيل تيليجرام"
-                : "Connect automatically on launch";
+                : "Auto-connect on launch";
     }
 
     public static String killSwitchLabel(boolean ar) {
         return ar
-                ? "مانع تسريب صارم (حجب تيليجرام بدون نفق)"
-                : "Strict kill switch (block Telegram without tunnel)";
+                ? "مانع تسريب صارم (حجب عند الانقطاع)"
+                : "Strict kill switch (block on drop)";
     }
 
     public static String autoFailoverLabel(boolean ar) {
         return ar
-                ? "التبديل التلقائي لخادم بديل عند انقطاع النفق"
-                : "Auto-failover to backup server on drop";
+                ? "التبديل التلقائي عند الانقطاع"
+                : "Auto-failover on drop";
     }
 
     public static String networkBatteryToggleBtn(boolean ar, boolean expanded) {
@@ -439,11 +446,11 @@ public final class WgStrings {
     }
 
     public static String reconnectPrimaryBtn(boolean ar) {
-        return ar ? "تحديث الاتصال" : "Apply and reconnect";
+        return ar ? "تحديث الاتصال" : "Reconnect";
     }
 
     public static String switchToProfileBtn(boolean ar) {
-        return ar ? "التحويل إلى هذا الخادم" : "Switch to this server";
+        return ar ? "تحويل لهذا الخادم" : "Switch";
     }
 
     public static String connectingBtn(boolean ar) {
@@ -464,14 +471,14 @@ public final class WgStrings {
 
     public static String verifyLoadingBody(boolean ar) {
         return ar
-                ? "جارٍ اختبار العنوان الخارجي وخوادم تيليجرام ومسار المكالمات..."
-                : "Checking exit IP, Telegram datacenter, and UDP call relay...";
+                ? "جارٍ فحص العنوان الخارجي وخوادم تيليجرام والمكالمات..."
+                : "Testing exit IP, Telegram DC, and UDP calls...";
     }
 
     public static String verifySuccessTitle(boolean ar) {
         return ar
-                ? "تم التحقق من مرور البيانات عبر النفق المشفّر"
-                : "Verified encrypted tunnel routing";
+                ? "المسار المشفّر يعمل بنجاح"
+                : "Encrypted tunnel verified";
     }
 
     public static String verifyExitIpLabel(boolean ar) {
@@ -483,7 +490,7 @@ public final class WgStrings {
     }
 
     public static String verifyLatencyLabel(boolean ar) {
-        return ar ? "زمن الاستجابة" : "Tunnel latency";
+        return ar ? "زمن الاستجابة" : "Latency";
     }
 
     public static String verifyTelegramDcLabel(boolean ar) {
@@ -491,28 +498,28 @@ public final class WgStrings {
     }
 
     public static String verifyVoipUdpLabel(boolean ar) {
-        return ar ? "مسار المكالمات" : "Voice & video calls";
+        return ar ? "مسار المكالمات" : "Calls (UDP)";
     }
 
     public static String formatLatency(boolean ar, long ms) {
-        return ar ? (ms + " مللي ثانية") : (ms + " ms");
+        return ltr(ms + " ms");
     }
 
     public static String formatTelegramDcStatus(boolean ar, boolean reachable, long ms) {
         if (reachable) {
-            return ar ? ("متصل (" + ms + " مللي ثانية)") : ("Reachable (" + ms + " ms)");
+            return ar ? ("متصل · " + ltr(ms + " ms")) : ("Reachable · " + ms + " ms");
         }
         return ar ? "تعذّر الوصول" : "Unreachable";
     }
 
     public static String formatVoipUdpStatus(boolean ar, boolean ready, long ms, boolean routeCallsEnabled) {
         if (!routeCallsEnabled) {
-            return ar ? "معطّل من الخيارات" : "Disabled in options";
+            return ar ? "معطّل" : "Disabled";
         }
         if (ready) {
-            return ar ? ("جاهز (" + ms + " مللي ثانية)") : ("Ready (" + ms + " ms)");
+            return ar ? ("جاهز · " + ltr(ms + " ms")) : ("Ready · " + ms + " ms");
         }
-        return ar ? "استجابة محدودة (يعمل عبر المسار البديل)" : "TCP fallback only (UDP blocked on peer)";
+        return ar ? "مسار بديل (TCP)" : "TCP fallback";
     }
 
     public static String verifyFailedTitle(boolean ar) {
@@ -536,8 +543,8 @@ public final class WgStrings {
 
     public static String profileTapHint(boolean ar) {
         return ar
-                ? "اضغط على أي خادم للتبديل إليه فورًا، أو قِس السرعة لاختيار الأقل زمنًا."
-                : "Tap any server to switch immediately, or ping all to pick the lowest latency.";
+                ? "اضغط على أي خادم للتبديل فورًا."
+                : "Tap any server to switch immediately.";
     }
 
     public static String profileConnectedTag(boolean ar) {
@@ -767,9 +774,9 @@ public final class WgStrings {
 
     public static String awgRawToggleLabel(boolean ar, boolean expanded) {
         if (ar) {
-            return expanded ? "إخفاء المعاملات الرقمية المتقدمة" : "إظهار المعاملات الرقمية المتقدمة (للخبراء)";
+            return expanded ? "إخفاء المعاملات المتقدمة" : "المعاملات المتقدمة (للخبراء)";
         }
-        return expanded ? "Hide raw protocol parameters" : "Show raw parameters (advanced)";
+        return expanded ? "Hide raw parameters" : "Advanced parameters";
     }
 
     public static String labelAwgI1(boolean ar) {
@@ -1043,9 +1050,9 @@ public final class WgStrings {
 
     public static String cleanCacheBtn(boolean ar, boolean busy) {
         if (busy) {
-            return ar ? "جارٍ تحسين الأداء وتنظيف المؤقتات..." : "Optimizing & cleaning cache...";
+            return ar ? "جارٍ تنظيف المؤقتات..." : "Cleaning cache...";
         }
-        return ar ? "تحسين الأداء وتنظيف الملفات المؤقتة" : "Optimize & clean temporary cache";
+        return ar ? "تنظيف الملفات المؤقتة" : "Clean temporary cache";
     }
 
     public static String toastCacheCleaned(boolean ar, long freedBytes, int filesDeleted) {
@@ -1066,9 +1073,9 @@ public final class WgStrings {
 
     public static String hybridToggleCardBtn(boolean ar, boolean expanded) {
         if (ar) {
-            return expanded ? "إخفاء خيارات الاستقرار المتقدمة" : "إعدادات الاستقرار المتقدمة (اختياري - يعمل بدونها)";
+            return expanded ? "إخفاء خيارات الاستقرار المتقدمة" : "إعدادات الاستقرار المتقدمة";
         }
-        return expanded ? "Hide advanced stability options" : "Advanced stability options (optional)";
+        return expanded ? "Hide advanced stability options" : "Advanced stability options";
     }
 
     public static String hybridOptionalNote(boolean ar) {

@@ -413,9 +413,10 @@ public final class WireGuardDialog {
         final Button disconnectBtn = createDisconnectButton(ctx, WgStrings.disconnectBtn(isAr), theme);
         disconnectBtn.setContentDescription("wgplus_dlg_btn_disconnect");
 
-        LinearLayout.LayoutParams connLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.3f);
-        setMarginEndCompat(connLp, WgTheme.dp(ctx, 8), isAr);
-        LinearLayout.LayoutParams discLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.95f);
+        final LinearLayout.LayoutParams connLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        setMarginEndCompat(connLp, 0, isAr);
+        final LinearLayout.LayoutParams discLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        disconnectBtn.setVisibility(View.GONE);
 
         actionRow.addView(connectBtn, connLp);
         actionRow.addView(disconnectBtn, discLp);
@@ -1174,7 +1175,7 @@ public final class WireGuardDialog {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
         ));
-        String dlgVer = "1.7.9";
+        String dlgVer = "1.8.0";
         try {
             dlgVer = ctx.getPackageManager().getPackageInfo("org.telegram.wgplus.module", 0).versionName;
         } catch (Throwable ignored) {
@@ -1196,6 +1197,7 @@ public final class WireGuardDialog {
         // Live status + UAPI telemetry renderer
         final Runnable refreshStatusVisuals = () -> {
             boolean active = WireGuardManager.isTunnelRunning(ctx, moduleApkPath);
+            boolean sharedObserved = active && WireGuardManager.isSharedTunnelObserved(ctx, moduleApkPath);
             boolean guarded = !active && WireGuardManager.isKillSwitchGuardActiveNow(ctx, moduleApkPath);
             int port = active ? WireGuardManager.getActivePort(ctx, moduleApkPath) : 0;
             WireGuardManager.TunnelConfig connectedCfg = active
@@ -1208,6 +1210,8 @@ public final class WireGuardDialog {
                     && connectedCfg != null
                     && !connectedCfg.id.equals(state.draft.id);
 
+            boolean showDisconnect = false;
+
             if (state.generatingWarp) {
                 statusDot.setBackground(WgTheme.statusDot(ctx, theme.pendingDot));
                 statusHeadline.setText(WgStrings.statusGeneratingWarp(isAr));
@@ -1217,7 +1221,6 @@ public final class WireGuardDialog {
                 connectBtn.setEnabled(false);
                 quickWarpBtn.setEnabled(false);
                 quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, true));
-                disconnectBtn.setEnabled(false);
             } else if (state.connecting) {
                 statusDot.setBackground(WgTheme.statusDot(ctx, theme.pendingDot));
                 statusHeadline.setText(!state.switchingTargetName.isEmpty()
@@ -1230,40 +1233,49 @@ public final class WireGuardDialog {
                 connectBtn.setText(WgStrings.connectingBtn(isAr));
                 quickWarpBtn.setEnabled(false);
                 quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, false));
-                disconnectBtn.setEnabled(false);
             } else if (active && port > 0) {
-                WireGuardManager.TunnelStats stats = WireGuardManager.getLiveStats(ctx, moduleApkPath);
-                long nowEpoch = System.currentTimeMillis() / 1000L;
-                boolean recentHs = stats.lastHandshakeSec > 0
-                        && Math.max(0L, nowEpoch - stats.lastHandshakeSec) < 150L;
-                if (recentHs) {
+                showDisconnect = true;
+                if (sharedObserved) {
                     state.observedActiveNoHsAtMs = 0L;
                     statusDot.setBackground(WgTheme.statusDot(ctx, theme.activeDot));
                     statusHeadline.setText(WgStrings.statusActiveWithProfile(isAr, connectedName, port));
                     statusHeadline.setTextColor(theme.activeText);
-                    statusSubline.setText(WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec));
+                    statusSubline.setText(WgStrings.sharedTunnelActiveSubline(isAr, port));
                     recoveryBox.setVisibility(View.GONE);
                 } else {
-                    long startedMs = WireGuardManager.getTunnelStartedAtMs();
-                    if (startedMs <= 0L) {
-                        if (state.observedActiveNoHsAtMs <= 0L) {
-                            state.observedActiveNoHsAtMs = SystemClock.elapsedRealtime();
+                    WireGuardManager.TunnelStats stats = WireGuardManager.getLiveStats(ctx, moduleApkPath);
+                    long nowEpoch = System.currentTimeMillis() / 1000L;
+                    boolean recentHs = stats.lastHandshakeSec > 0
+                            && Math.max(0L, nowEpoch - stats.lastHandshakeSec) < 150L;
+                    if (recentHs) {
+                        state.observedActiveNoHsAtMs = 0L;
+                        statusDot.setBackground(WgTheme.statusDot(ctx, theme.activeDot));
+                        statusHeadline.setText(WgStrings.statusActiveWithProfile(isAr, connectedName, port));
+                        statusHeadline.setTextColor(theme.activeText);
+                        statusSubline.setText(WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec));
+                        recoveryBox.setVisibility(View.GONE);
+                    } else {
+                        long startedMs = WireGuardManager.getTunnelStartedAtMs();
+                        if (startedMs <= 0L) {
+                            if (state.observedActiveNoHsAtMs <= 0L) {
+                                state.observedActiveNoHsAtMs = SystemClock.elapsedRealtime();
+                            }
+                            startedMs = state.observedActiveNoHsAtMs;
                         }
-                        startedMs = state.observedActiveNoHsAtMs;
-                    }
-                    long elapsedMs = Math.max(0L, SystemClock.elapsedRealtime() - startedMs);
-                    boolean staleOldHs = stats.lastHandshakeSec > 0 && (nowEpoch - stats.lastHandshakeSec) >= 150L;
-                    boolean stalled = elapsedMs >= 10_000L || staleOldHs;
+                        long elapsedMs = Math.max(0L, SystemClock.elapsedRealtime() - startedMs);
+                        boolean staleOldHs = stats.lastHandshakeSec > 0 && (nowEpoch - stats.lastHandshakeSec) >= 150L;
+                        boolean stalled = elapsedMs >= 10_000L || staleOldHs;
 
-                    statusDot.setBackground(WgTheme.statusDot(ctx, theme.pendingDot));
-                    statusHeadline.setText(stalled
-                            ? WgStrings.statusStalledWithProfile(isAr, connectedName)
-                            : WgStrings.statusAwaitingHandshakeWithProfile(isAr, connectedName));
-                    statusHeadline.setTextColor(theme.pendingText);
-                    statusSubline.setText(stalled
-                            ? WgStrings.statusStalledHint(isAr)
-                            : WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec));
-                    recoveryBox.setVisibility(stalled ? View.VISIBLE : View.GONE);
+                        statusDot.setBackground(WgTheme.statusDot(ctx, theme.pendingDot));
+                        statusHeadline.setText(stalled
+                                ? WgStrings.statusStalledWithProfile(isAr, connectedName)
+                                : WgStrings.statusAwaitingHandshakeWithProfile(isAr, connectedName));
+                        statusHeadline.setTextColor(theme.pendingText);
+                        statusSubline.setText(stalled
+                                ? WgStrings.statusStalledHint(isAr)
+                                : WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec));
+                        recoveryBox.setVisibility(stalled ? View.VISIBLE : View.GONE);
+                    }
                 }
                 connectBtn.setEnabled(true);
                 connectBtn.setText(viewingDifferentFromConnected
@@ -1271,7 +1283,6 @@ public final class WireGuardDialog {
                         : WgStrings.reconnectPrimaryBtn(isAr));
                 quickWarpBtn.setEnabled(true);
                 quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, false));
-                disconnectBtn.setEnabled(true);
             } else if (guarded) {
                 state.observedActiveNoHsAtMs = 0L;
                 statusDot.setBackground(WgTheme.statusDot(ctx, theme.pendingDot));
@@ -1283,7 +1294,6 @@ public final class WireGuardDialog {
                 connectBtn.setText(WgStrings.connectPrimaryBtn(isAr));
                 quickWarpBtn.setEnabled(true);
                 quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, false));
-                disconnectBtn.setEnabled(false);
             } else {
                 state.observedActiveNoHsAtMs = 0L;
                 statusDot.setBackground(WgTheme.statusDot(ctx, theme.stoppedDot));
@@ -1295,8 +1305,19 @@ public final class WireGuardDialog {
                 connectBtn.setText(WgStrings.connectPrimaryBtn(isAr));
                 quickWarpBtn.setEnabled(true);
                 quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, false));
-                disconnectBtn.setEnabled(false);
             }
+
+            if (showDisconnect) {
+                disconnectBtn.setVisibility(View.VISIBLE);
+                disconnectBtn.setEnabled(true);
+                setMarginEndCompat(connLp, WgTheme.dp(ctx, 8), isAr);
+            } else {
+                disconnectBtn.setVisibility(View.GONE);
+                disconnectBtn.setEnabled(false);
+                setMarginEndCompat(connLp, 0, isAr);
+            }
+            connectBtn.setLayoutParams(connLp);
+            disconnectBtn.setLayoutParams(discLp);
 
             renderTelemetryBox(ctx, telemetryBox, verifyBtn, state, routeCallsSwitch.isChecked(), isAr, theme);
         };
@@ -2273,19 +2294,35 @@ public final class WireGuardDialog {
             boolean isAr,
             WgTheme theme
     ) {
+        if (parent.getChildCount() > 1) {
+            View divider = new View(ctx);
+            divider.setBackgroundColor(theme.borderSubtle);
+            divider.setAlpha(0.45f);
+            LinearLayout.LayoutParams divLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    Math.max(1, WgTheme.dp(ctx, 1))
+            );
+            parent.addView(divider, divLp);
+        }
+
         LinearLayout row = new LinearLayout(ctx);
         row.setOrientation(LinearLayout.HORIZONTAL);
         row.setGravity(Gravity.CENTER_VERTICAL);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+            row.setLayoutDirection(isAr ? View.LAYOUT_DIRECTION_RTL : View.LAYOUT_DIRECTION_LTR);
+        }
+        row.setPadding(0, WgTheme.dp(ctx, 7), 0, WgTheme.dp(ctx, 7));
         LinearLayout.LayoutParams rowLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
         );
-        rowLp.topMargin = WgTheme.dp(ctx, 3);
 
         TextView kView = new TextView(ctx);
         applyProseTextStyle(kView, isAr, theme.textSecondary, 12.5f, false);
         kView.setText(keyLabel);
-        row.addView(kView, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f));
+        LinearLayout.LayoutParams kLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 0.9f);
+        setMarginEndCompat(kLp, WgTheme.dp(ctx, 10), isAr);
+        row.addView(kView, kLp);
 
         TextView vView = new TextView(ctx);
         applyProseTextStyle(vView, isAr, theme.textPrimary, 12.5f, true);
@@ -2294,6 +2331,8 @@ public final class WireGuardDialog {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
                 vView.setTextDirection(View.TEXT_DIRECTION_LTR);
             }
+        } else if (isAr && Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+            vView.setTextDirection(View.TEXT_DIRECTION_RTL);
         }
         vView.setGravity(isAr ? Gravity.LEFT : Gravity.RIGHT);
         vView.setText(valueText);
@@ -2597,7 +2636,7 @@ public final class WireGuardDialog {
     }
 
     private static Button createPrimaryAccentButton(Context ctx, String text, WgTheme theme) {
-        Button btn = baseButton(ctx, text, theme.onAccent, 46);
+        Button btn = baseButton(ctx, text, theme.onAccent, 48);
         btn.setBackground(WgTheme.interactiveBackground(
                 ctx,
                 theme.accentPrimary,
@@ -2610,7 +2649,7 @@ public final class WireGuardDialog {
     }
 
     private static Button createDisconnectButton(Context ctx, String text, WgTheme theme) {
-        Button btn = baseButton(ctx, text, theme.stoppedText, 46);
+        Button btn = baseButton(ctx, text, theme.stoppedText, 48);
         btn.setBackground(WgTheme.interactiveBackground(
                 ctx,
                 theme.stoppedBg,
@@ -2623,7 +2662,7 @@ public final class WireGuardDialog {
     }
 
     private static Button createSecondaryButton(Context ctx, String text, WgTheme theme) {
-        Button btn = baseButton(ctx, text, theme.textPrimary, 44);
+        Button btn = baseButton(ctx, text, theme.textPrimary, 48);
         btn.setBackground(WgTheme.interactiveBackground(
                 ctx,
                 theme.surfaceSecondaryBtn,
@@ -2700,7 +2739,10 @@ public final class WireGuardDialog {
         btn.setTextColor(textColor);
         btn.setTextSize(TypedValue.COMPLEX_UNIT_SP, 13.5f);
         btn.setTypeface(Typeface.DEFAULT, Typeface.BOLD);
-        btn.setLineSpacing(WgTheme.dp(ctx, 2), 1.06f);
+        btn.setSingleLine(true);
+        btn.setMaxLines(1);
+        btn.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        btn.setGravity(Gravity.CENTER);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             btn.setLetterSpacing(0f);
         }

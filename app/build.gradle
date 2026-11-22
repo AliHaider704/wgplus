@@ -11,8 +11,8 @@ android {
         applicationId "org.telegram.wgplus.module"
         minSdk 21
         targetSdk 34
-        versionCode 19
-        versionName "1.7.9"
+        versionCode 20
+        versionName "1.8.0"
     }
 
     splits {

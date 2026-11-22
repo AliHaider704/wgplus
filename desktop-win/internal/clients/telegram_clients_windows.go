@@ -390,6 +390,28 @@ func shellExecuteOpen(uri string) error {
 	return nil
 }
 
+// HasTgProtocolHandler checks whether Windows Registry has a registered tg:// protocol handler.
+func HasTgProtocolHandler() bool {
+	k, err := registry.OpenKey(registry.CLASSES_ROOT, `tg\shell\open\command`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
+	defer k.Close()
+	val, _, err := k.GetStringValue("")
+	return err == nil && strings.TrimSpace(val) != ""
+}
+
+// OpenTgURI opens a tg:// URI via ShellExecuteW only if a tg:// protocol handler is registered.
+func OpenTgURI(uri string) error {
+	if !strings.HasPrefix(strings.ToLower(strings.TrimSpace(uri)), "tg://") {
+		return errors.New("only tg:// URIs are allowed")
+	}
+	if !HasTgProtocolHandler() {
+		return errors.New("tg:// protocol handler is not registered")
+	}
+	return shellExecuteOpen(uri)
+}
+
 // ApplyProxyToClient dispatches tg://socks directly to the targeted Telegram/AyuGram/64Gram/Forkgram executable
 // (bypassing broken Windows Registry protocol handlers on Portable instances), or via ShellExecuteW for MSIX Unigram.
 func ApplyProxyToClient(entry config.TelegramClientEntry, tgURI string) (ApplyResult, error) {

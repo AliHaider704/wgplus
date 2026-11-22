@@ -152,7 +152,12 @@ public class ModuleLauncherActivity extends Activity {
 
         String localizedTitle = WgStrings.appTitle(isAr);
         setTitle(localizedTitle);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            try {
+                setTaskDescription(new ActivityManager.TaskDescription(localizedTitle, R.mipmap.ic_launcher));
+            } catch (Throwable ignored) {
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
             try {
                 setTaskDescription(new ActivityManager.TaskDescription(localizedTitle));
             } catch (Throwable ignored) {
@@ -252,6 +257,7 @@ public class ModuleLauncherActivity extends Activity {
         statusCard.addView(statusHeading, shLp);
 
         boolean active = WireGuardManager.isTunnelRunning(this, sourceApk);
+        boolean sharedObserved = active && WireGuardManager.isSharedTunnelObserved(this, sourceApk);
         boolean guarded = !active && WireGuardManager.isKillSwitchGuardActiveNow(this, sourceApk);
         boolean hasProfile = WireGuardManager.hasAnyConfiguredProfile(this);
         int port = active ? WireGuardManager.getActivePort(this, sourceApk) : 0;
@@ -262,29 +268,34 @@ public class ModuleLauncherActivity extends Activity {
                 ? WgStrings.localizeProfileName(shownProfile.name, isAr)
                 : "";
 
-        WireGuardManager.TunnelStats stats = (active && port > 0)
+        WireGuardManager.TunnelStats stats = (active && port > 0 && !sharedObserved)
                 ? WireGuardManager.getLiveStats(this, sourceApk)
                 : new WireGuardManager.TunnelStats();
         int handshakeStateCode = 0; // 0=idle, 1=handshaking, 2=verified, 3=stalled
         if (active && port > 0) {
-            long nowEpoch = System.currentTimeMillis() / 1000L;
-            boolean recentHs = stats.lastHandshakeSec > 0
-                    && Math.max(0L, nowEpoch - stats.lastHandshakeSec) < STALE_HANDSHAKE_THRESHOLD_SEC;
-            if (recentHs) {
+            if (sharedObserved) {
                 mObservedActiveNoHsAtMs = 0L;
                 handshakeStateCode = 2;
             } else {
-                long startedAtMs = WireGuardManager.getTunnelStartedAtMs();
-                if (startedAtMs <= 0L) {
-                    if (mObservedActiveNoHsAtMs <= 0L) {
-                        mObservedActiveNoHsAtMs = SystemClock.elapsedRealtime();
+                long nowEpoch = System.currentTimeMillis() / 1000L;
+                boolean recentHs = stats.lastHandshakeSec > 0
+                        && Math.max(0L, nowEpoch - stats.lastHandshakeSec) < STALE_HANDSHAKE_THRESHOLD_SEC;
+                if (recentHs) {
+                    mObservedActiveNoHsAtMs = 0L;
+                    handshakeStateCode = 2;
+                } else {
+                    long startedAtMs = WireGuardManager.getTunnelStartedAtMs();
+                    if (startedAtMs <= 0L) {
+                        if (mObservedActiveNoHsAtMs <= 0L) {
+                            mObservedActiveNoHsAtMs = SystemClock.elapsedRealtime();
+                        }
+                        startedAtMs = mObservedActiveNoHsAtMs;
                     }
-                    startedAtMs = mObservedActiveNoHsAtMs;
+                    long elapsedNoHs = Math.max(0L, SystemClock.elapsedRealtime() - startedAtMs);
+                    boolean staleOldHs = stats.lastHandshakeSec > 0
+                            && (nowEpoch - stats.lastHandshakeSec) >= STALE_HANDSHAKE_THRESHOLD_SEC;
+                    handshakeStateCode = (elapsedNoHs >= STALLED_HANDSHAKE_THRESHOLD_MS || staleOldHs) ? 3 : 1;
                 }
-                long elapsedNoHs = Math.max(0L, SystemClock.elapsedRealtime() - startedAtMs);
-                boolean staleOldHs = stats.lastHandshakeSec > 0
-                        && (nowEpoch - stats.lastHandshakeSec) >= STALE_HANDSHAKE_THRESHOLD_SEC;
-                handshakeStateCode = (elapsedNoHs >= STALLED_HANDSHAKE_THRESHOLD_MS || staleOldHs) ? 3 : 1;
             }
         } else {
             mObservedActiveNoHsAtMs = 0L;
@@ -327,7 +338,9 @@ public class ModuleLauncherActivity extends Activity {
 
         TextView helper = new TextView(this);
         styleText(helper, isAr, theme.textSecondary, 13f, false);
-        if (handshakeStateCode == 2 || handshakeStateCode == 1) {
+        if (sharedObserved) {
+            helper.setText(WgStrings.sharedTunnelActiveSubline(isAr, port));
+        } else if (handshakeStateCode == 2 || handshakeStateCode == 1) {
             helper.setText(WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec));
         } else if (handshakeStateCode == 3) {
             helper.setText(WgStrings.statusStalledHint(isAr));
@@ -457,7 +470,7 @@ public class ModuleLauncherActivity extends Activity {
                 ViewGroup.LayoutParams.WRAP_CONTENT
         ));
 
-        String verName = "1.7.9";
+        String verName = "1.8.0";
         try {
             verName = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
         } catch (Throwable ignored) {

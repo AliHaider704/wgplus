@@ -61,6 +61,7 @@ type AppSettings struct {
 	StartMinimized           bool   `json:"startMinimized"`
 	MinimizeToTray           bool   `json:"minimizeToTray"`
 	CallChecklistAck         bool   `json:"callChecklistAck"`
+	ChannelInvitedV2         bool   `json:"channelInvitedV2,omitempty"`
 }
 
 // PersistedState is the root JSON state persisted to disk (secrets DPAPI-encrypted).

@@ -409,12 +409,22 @@ function renderClients() {
   }
 }
 
-function renderProfiles() {
+let lastProfilesRenderSig = "";
+
+function renderProfiles(forceRender) {
   if (!state) return;
   const tr = t();
   const listEl = el("profiles-list");
-  listEl.innerHTML = "";
   const profiles = state.profiles || [];
+  const activeId = state.activeProfileId || state.settings.activeProfileId;
+  const lang = state?.settings?.language === "ar" ? "ar" : "en";
+  const sig = `${lang}|${state.connected ? 1 : 0}|${activeId || ""}|` +
+    profiles.map((p) => `${p.id}:${p.name}:${p.endpoint}:${p.mtu}:${p.awgParams ? 1 : 0}:${p.lastPingMs}`).join(";");
+  if (!forceRender && sig === lastProfilesRenderSig && listEl.childElementCount > 0) {
+    return;
+  }
+  lastProfilesRenderSig = sig;
+  listEl.innerHTML = "";
   if (profiles.length === 0) {
     const empty = document.createElement("div");
     empty.className = "empty-state";
@@ -423,29 +433,27 @@ function renderProfiles() {
     return;
   }
 
-  const activeId = state.activeProfileId || state.settings.activeProfileId;
-
   for (const p of profiles) {
     const isActive = p.id === activeId;
     const row = document.createElement("div");
     row.className = `row-item${isActive ? " row-item-active" : ""}`;
-
-    const main = document.createElement("div");
-    main.className = "row-main";
-    main.style.cursor = "pointer";
-    main.addEventListener("click", async () => {
+    row.style.cursor = "pointer";
+    row.addEventListener("click", async () => {
       try {
-        if (state.connected) {
-          await api().SwitchProfile(p.id);
-        } else {
-          state.settings.activeProfileId = p.id;
-          await api().UpdateSettings(state.settings);
-        }
+        const wasConnected = !!state?.connected;
+        lastProfilesRenderSig = "";
+        await api().SelectProfile(p.id);
         await refreshBootstrap();
+        if (wasConnected) {
+          maybeInviteToOfficialChannel();
+        }
       } catch (err) {
         showError(String(err));
       }
     });
+
+    const main = document.createElement("div");
+    main.className = "row-main";
 
     const title = document.createElement("div");
     title.className = "row-title";
@@ -694,14 +702,16 @@ async function runVerifyRoute() {
 
 function maybeInviteToOfficialChannel() {
   try {
-    if (localStorage.getItem("wgplus_channel_invited_v1") === "1") return;
-    localStorage.setItem("wgplus_channel_invited_v1", "1");
-    showToast(t().channelInviteToast);
-    setTimeout(() => {
+    if (localStorage.getItem("wgplus_channel_invited_v2") === "1") return;
+    setTimeout(async () => {
       try {
-        wailsRuntime()?.BrowserOpenURL("tg://resolve?domain=wgplus_official");
+        const opened = await api()?.OpenOfficialChannel();
+        if (opened) {
+          localStorage.setItem("wgplus_channel_invited_v2", "1");
+          showToast(t().channelInviteToast);
+        }
       } catch {}
-    }, 700);
+    }, 500);
   } catch {}
 }
 
@@ -782,6 +792,7 @@ function wireEvents() {
     try {
       await api().EnableAwg15AndReconnect();
       await refreshBootstrap();
+      maybeInviteToOfficialChannel();
       showToast(t().toastAwgRecovered);
       await runVerifyRoute();
     } catch (err) {
@@ -1085,6 +1096,9 @@ function wireEvents() {
   });
 }
 
+let updateCheckSucceeded = false;
+let updateCheckInFlight = false;
+
 function subscribeRuntimeEvents() {
   const rt = wailsRuntime();
   if (!rt?.EventsOn) return;
@@ -1108,8 +1122,12 @@ function subscribeRuntimeEvents() {
 
   rt.EventsOn("stateChanged", (nextState) => {
     if (!nextState) return;
+    const wasConnected = !!state?.connected;
     state = nextState;
     renderAll();
+    if (nextState.connected && !wasConnected && !updateCheckSucceeded && !updateCheckInFlight) {
+      runUpdateFlow();
+    }
   });
 
   rt.EventsOn("failover", (info) => {
@@ -1152,8 +1170,13 @@ function notesFor(info) {
 }
 
 async function runUpdateFlow() {
+  if (updateCheckInFlight) return;
+  updateCheckInFlight = true;
   try {
     const upd = await api().CheckForUpdate();
+    if (upd?.checkedOk) {
+      updateCheckSucceeded = true;
+    }
     if (upd?.available) {
       const tr = t();
       showUpdateOverlay({
@@ -1182,5 +1205,7 @@ async function runUpdateFlow() {
     } else if (info) {
       await api().AckWhatsNew();
     }
-  } catch (_) { /* offline: never block */ }
+  } catch (_) { /* offline: never block */ } finally {
+    updateCheckInFlight = false;
+  }
 }

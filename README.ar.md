@@ -26,15 +26,15 @@
 
 <div dir="rtl">
 
-## التحميل (`v1.7.9`)
+## التحميل (`v1.8.0`)
 
 | المنصة | رابط التحميل | المتطلبات | الملاحظات |
 |--------|--------------|-----------|-----------|
-| **ويندوز (ملف `.exe` مفرد، `17.23 MB`)** | [`WireGuardPlus-Windows-x64.exe`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64.exe) | ويندوز 10/11 (x64)، بدون مسؤول | تشغيل مباشر، تشفير DPAPI، أيقونة شريط النظام |
-| **ويندوز المحمول (`.zip`، `6.61 MB`)** | [`WireGuardPlus-Windows-x64-Portable.zip`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64-Portable.zip) | ويندوز 10/11 (x64)، فلاش/مجلد | يحتوي `portable.flag`، حفظ محلي كامل بدون AppData |
-| **أندرويد ARM64 (`5.08 MB` - موصى به)** | [`WireGuardPlus-1.7.9-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.9-arm64-v8a.apk) | أندرويد 5.0+ (arm64-v8a) | بدون روت عبر LSPatch أو بالروت عبر LSPosed |
-| **أندرويد ARMv7 (`5.05 MB`)** | [`WireGuardPlus-1.7.9-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.9-armeabi-v7a.apk) | أندرويد 5.0+ (armeabi-v7a) | للأجهزة ذات معمارية 32 بت |
-| **أندرويد الشاملة (`11.27 MB`)** | [`WireGuardPlus-1.7.9.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.9.apk) | أندرويد 5.0+ (arm64 + armv7a) | نسخة شاملة متوافقة مع التحديثات التلقائية |
+| **ويندوز (ملف `.exe` مفرد، `17.33 MB`)** | [`WireGuardPlus-Windows-x64.exe`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64.exe) | ويندوز 10/11 (x64)، بدون مسؤول | تشغيل مباشر، تشفير DPAPI، أيقونة شريط النظام |
+| **ويندوز المحمول (`.zip`، `6.63 MB`)** | [`WireGuardPlus-Windows-x64-Portable.zip`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64-Portable.zip) | ويندوز 10/11 (x64)، فلاش/مجلد | يحتوي `portable.flag`، حفظ محلي كامل بدون AppData |
+| **أندرويد ARM64 (`5.11 MB` - موصى به)** | [`WireGuardPlus-1.8.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.8.0-arm64-v8a.apk) | أندرويد 5.0+ (arm64-v8a) | بدون روت عبر LSPatch أو بالروت عبر LSPosed / Vector |
+| **أندرويد ARMv7 (`5.08 MB`)** | [`WireGuardPlus-1.8.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.8.0-armeabi-v7a.apk) | أندرويد 5.0+ (armeabi-v7a) | للأجهزة ذات معمارية 32 بت |
+| **أندرويد الشاملة (`11.29 MB`)** | [`WireGuardPlus-1.8.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.8.0.apk) | أندرويد 5.0+ (arm64 + armv7a) | نسخة شاملة متوافقة مع التحديثات التلقائية |
 
 تحقق من تطابق الملفات عبر [`SHA256SUMS.txt`](https://github.com/AliHaider704/wgplus/releases/latest/download/SHA256SUMS.txt)، أو شاهد [فيديو الشرح (`MP4`)](https://github.com/AliHaider704/wgplus/releases/download/v1.7.3/WireGuardPlus-Windows-Walkthrough.mp4)، أو انضم إلى [قناة تيليجرام الرسمية](https://t.me/wgplus_official).
 
@@ -116,7 +116,7 @@ flowchart LR
 <div dir="rtl">
 
 - **ويندوز:** يكتشف تلقائيًا نسخ **Telegram Desktop** و**النسخ المحمولة Portable** و**AyuGramDesktop** و**64Gram** و**Unigram** و**Forkgram** بدون صلاحيات مسؤول أو تعريفات شبكة، ويحمي منفذ `127.0.0.1` بجدار عمليات عبر `iphlpapi` مع بقاء Tailscale والألعاب دون تأثر.
-- **أندرويد:** يندمج مباشرة داخل **تليجرام بلس** (`org.telegram.plus`) و**تليجرام الرسمي** (`org.telegram.messenger`) بخطافات آمنة (`XC_MethodHook`) ليتعايش مع الإضافات الأخرى مثل **TeleVip** بدون تعارض.
+- **أندرويد:** يندمج مباشرة داخل **تليجرام الرسمي** (`org.telegram.messenger` و`.beta` و`.web`)، و**تليجرام بلس** (`org.telegram.plus`)، و**Nagram** (`xyz.nextalone.nagram`)، و**AyuGram** (`com.radolyn.ayugram`)، و**Telegraph** (`ir.ilmili.telegraph` و`ir.p2021.telegraph`)، و**Telegram Gold** (`org.telegram.gold`)، و**Telegram X** (`org.thunderdog.challegram`)، وأي عميل مبني على `ApplicationLoader` بخطافات آمنة (`XC_MethodHook`) ليعمل عبر LSPosed / Vector / LSPatch ويتعايش مع الإضافات مثل **TeleVip** بدون تعارض.
 
 > مشروع مجتمعي غير رسمي، وليس تابعًا لتليجرام أو WireGuard أو Cloudflare أو Amnezia.
 
@@ -150,9 +150,9 @@ flowchart LR
 
 يتطلب **أندرويد 5.0+** (**أندرويد 11+** للتفعيل الصامت عبر التصحيح اللاسلكي).
 
-1. حمّل [`WireGuardPlus-1.7.9-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.9-arm64-v8a.apk) (`5.08 MB`) أو [`WireGuardPlus-1.7.9-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.9-armeabi-v7a.apk) (`5.05 MB`) أو [`WireGuardPlus-1.7.9.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.7.9.apk) (الشاملة).
-2. **بدون روت (LSPatch):** ادمج **تليجرام بلس** (`org.telegram.plus`) أو **تليجرام الرسمي** (`org.telegram.messenger`) عبر [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch) بوضع **Portable** أو **Local**، ثم ثبّت تليجرام وافتح تطبيق **نفق وايرجارد بلس** لإكمال ربط التصحيح اللاسلكي ذي الـ 6 أرقام لمرة واحدة.
-   - **مع روت (LSPosed):** فعّل **WireGuard Plus** في **LSPosed -> Modules** وحدد تليجرام ثم امنح الروت داخل التطبيق لحماية صامتة.
+1. حمّل [`WireGuardPlus-1.8.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.8.0-arm64-v8a.apk) (`5.11 MB`) أو [`WireGuardPlus-1.8.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.8.0-armeabi-v7a.apk) (`5.08 MB`) أو [`WireGuardPlus-1.8.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.8.0.apk) (الشاملة).
+2. **بدون روت (LSPatch):** ادمج أي نسخة مدعومة (**Telegram** أو **Telegram Plus** أو **Nagram** أو **AyuGram** أو **Telegraph** أو **Telegram Gold** أو **Telegram X**) عبر [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch) بوضع **Portable** أو **Local**، ثم ثبّت تيليجرام وافتح تطبيق **نفق وايرجارد بلس** لإكمال ربط التصحيح اللاسلكي ذي الـ 6 أرقام لمرة واحدة.
+   - **مع روت (LSPosed / Vector):** فعّل **WireGuard Plus** في **LSPosed / Vector -> Modules** وحدد تطبيقات تيليجرام ثم امنح الروت داخل التطبيق لحماية صامتة.
 3. داخل تليجرام افتح **الإعدادات -> البيانات والتخزين -> إعدادات البروكسي -> نفق وايرجارد** وأضف ملفك واتصل.
 
 التفاصيل الكاملة وحلول المشاكل في [دليل المستخدم](docs/USER_GUIDE.md).

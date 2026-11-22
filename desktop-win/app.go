@@ -808,6 +808,9 @@ func (a *App) Connect(profileID string) error {
 		a.connected = wgbridge.IsRunning()
 		a.lastError = err.Error()
 		a.mu.Unlock()
+		if ks && !a.connected {
+			_, _ = wgbridge.StartKillSwitchGuard()
+		}
 		a.refreshTray()
 		a.emitStateChanged()
 		return err
@@ -825,6 +828,7 @@ func (a *App) Connect(profileID string) error {
 	a.syncMonitoredPorts()
 	a.refreshTray()
 	a.emitStateChanged()
+	go a.maybeInviteOfficialChannelOnce()
 	return nil
 }
 
@@ -847,11 +851,101 @@ func (a *App) Disconnect() error {
 	a.syncMonitoredPorts()
 	a.refreshTray()
 	a.emitStateChanged()
+	go a.maybeInviteOfficialChannelOnce()
 	return nil
 }
 
 func (a *App) SwitchProfile(profileID string) error {
 	return a.Connect(profileID)
+}
+
+// SelectProfile selects a server profile cleanly in both disconnected and connected states.
+// When disconnected, it updates both activeID and ActiveProfileID so Connect uses it immediately.
+// When connected, it switches the live tunnel to the chosen profile.
+func (a *App) SelectProfile(profileID string) error {
+	id := strings.TrimSpace(profileID)
+	if id == "" {
+		return errors.New("profile id is required")
+	}
+	a.mu.Lock()
+	found := false
+	for _, p := range a.state.Profiles {
+		if p.ID == id {
+			found = true
+			break
+		}
+	}
+	if !found {
+		a.mu.Unlock()
+		return errors.New("profile not found")
+	}
+	isConn := a.connected
+	if !isConn {
+		a.activeID = id
+		a.state.Settings.ActiveProfileID = id
+		if err := a.store.Save(a.state); err != nil {
+			a.mu.Unlock()
+			return err
+		}
+		a.mu.Unlock()
+		a.refreshTray()
+		a.emitStateChanged()
+		return nil
+	}
+	a.mu.Unlock()
+	return a.Connect(id)
+}
+
+// OpenOfficialChannel opens @wgplus_official directly inside Telegram Desktop via tg://resolve
+// without ever launching a web browser. Returns true if a Telegram client was dispatched.
+func (a *App) OpenOfficialChannel() (bool, error) {
+	const channelURI = "tg://resolve?domain=wgplus_official"
+	detected := a.ScanTelegramClients()
+
+	// Prefer a currently running desktop executable, then any installed desktop executable
+	var candidates []config.TelegramClientEntry
+	for _, c := range detected {
+		if !c.IsMsix && strings.TrimSpace(c.ExePath) != "" && c.Running {
+			candidates = append(candidates, c)
+		}
+	}
+	for _, c := range detected {
+		if !c.IsMsix && strings.TrimSpace(c.ExePath) != "" && !c.Running {
+			candidates = append(candidates, c)
+		}
+	}
+	for _, c := range candidates {
+		if res, err := clients.ApplyProxyToClient(c, channelURI); err == nil && res.Dispatched {
+			return true, nil
+		}
+	}
+	// Fallback to Windows tg:// protocol handler only if registered (never opens browser)
+	if clients.HasTgProtocolHandler() {
+		if err := clients.OpenTgURI(channelURI); err == nil {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// maybeInviteOfficialChannelOnce dispatches @wgplus_official directly to the active Telegram
+// client once per install (tracked in encrypted vault settings, never in WebView2 localStorage).
+func (a *App) maybeInviteOfficialChannelOnce() {
+	a.mu.Lock()
+	already := a.state.Settings.ChannelInvitedV2
+	a.mu.Unlock()
+	if already {
+		return
+	}
+	time.Sleep(1500 * time.Millisecond)
+	opened, _ := a.OpenOfficialChannel()
+	if !opened {
+		return
+	}
+	a.mu.Lock()
+	a.state.Settings.ChannelInvitedV2 = true
+	_ = a.store.Save(a.state)
+	a.mu.Unlock()
 }
 
 // EnableAwg15AndReconnect applies the strong AmneziaWG 1.5 DPI bypass preset to the active server
@@ -1628,6 +1722,7 @@ func (a *App) UpdateSettings(s config.AppSettings) (config.AppSettings, error) {
 	if s.ActiveProfileID == "" {
 		s.ActiveProfileID = prev.ActiveProfileID
 	}
+	s.ChannelInvitedV2 = prev.ChannelInvitedV2
 
 	if s.StartWithWindows != prev.StartWithWindows {
 		exePath, _ := os.Executable()
@@ -1638,6 +1733,9 @@ func (a *App) UpdateSettings(s config.AppSettings) (config.AppSettings, error) {
 	}
 
 	a.state.Settings = s
+	if !a.connected && s.ActiveProfileID != "" {
+		a.activeID = s.ActiveProfileID
+	}
 	if err := a.store.Save(a.state); err != nil {
 		a.mu.Unlock()
 		return prev, err

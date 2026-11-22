@@ -60,7 +60,7 @@ final class UpdateGate {
             }
         } catch (Throwable ignored) {
         }
-        return "1.7.9";
+        return "1.8.0";
     }
 
     private static Activity unwrapActivity(Context ctx) {
