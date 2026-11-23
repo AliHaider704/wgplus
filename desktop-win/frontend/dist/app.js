@@ -58,10 +58,21 @@ function applyStaticLabels() {
   document.title = tr.appTitle;
   el("app-title").textContent = tr.appTitle;
   el("storage-mode-label").textContent = state?.portableMode ? tr.modePortable : tr.modeStandard;
+  el("btn-open-diagnostics").textContent = tr.openDiagnostics;
   el("btn-hide-tray").textContent = tr.hideToTray;
   el("btn-lang-toggle").textContent = tr.langToggle;
   el("btn-theme-toggle").textContent = theme === "dark" ? tr.themeLight : tr.themeDark;
   el("btn-dismiss-error").textContent = tr.dismiss;
+  el("btn-join-channel").textContent = tr.joinChannelBtn;
+  el("modal-diag-title").textContent = tr.diagTitle;
+  el("lbl-diag-desc").textContent = tr.diagDesc;
+  el("lbl-diag-blocked-title").textContent = tr.diagBlockedTitle;
+  el("btn-close-diag").textContent = tr.close;
+  el("btn-diag-refresh").textContent = tr.diagRefresh;
+  el("btn-diag-copy").textContent = tr.diagCopy;
+  el("btn-diag-save").textContent = tr.diagSave;
+  el("btn-diag-clear").textContent = tr.diagClear;
+  el("btn-diag-github").textContent = tr.diagGithub;
 
   el("lbl-onboard-title").textContent = tr.onboardTitle;
   el("lbl-onboard-desc").textContent = tr.onboardDesc;
@@ -184,6 +195,14 @@ function applyStaticLabels() {
   el("modal-qr-title").textContent = tr.qrTitle;
   el("qr-caption").textContent = tr.qrCaption;
   el("btn-close-qr").textContent = tr.close;
+
+  if (el("modal-channel-title")) {
+    el("modal-channel-title").textContent = tr.channelModalTitle;
+    el("modal-channel-body").textContent = tr.channelModalBody;
+    el("btn-channel-open").textContent = tr.channelOpenBtn;
+    el("btn-channel-yes").textContent = tr.channelYesBtn;
+    el("btn-channel-no").textContent = tr.channelNoBtn;
+  }
 }
 
 function updateSparkline(rxHist, txHist) {
@@ -314,6 +333,11 @@ function renderStatusAndTelemetry() {
   el("val-proxy-uri").textContent = lri(state.proxyUri || "");
   if (state.lastError) {
     showError(state.lastError);
+  }
+  const chModal = el("modal-channel");
+  if (chModal) {
+    const showChannelGate = !!(state.connected && state.settings && !state.settings.channelInvitedV4);
+    chModal.classList.toggle("hidden", !showChannelGate);
   }
 }
 
@@ -562,8 +586,27 @@ function renderSettingsAndLogs() {
   } else {
     for (const ev of evs) {
       const line = document.createElement("div");
+      line.className = "diag-blocked-row";
+      const txt = document.createElement("span");
       const timeStr = new Date(ev.timestampUnix * 1000).toLocaleTimeString();
-      line.textContent = `[${timeStr}] ${ev.action.toUpperCase()} ${ev.protocol} ${ev.clientLabel} (PID ${ev.pid}, :${ev.peerPort})`;
+      txt.textContent = `[${timeStr}] ${ev.action.toUpperCase()} ${ev.protocol} ${ev.clientLabel} (PID ${ev.pid}, :${ev.peerPort})${ev.exePath ? ` - ${ev.exePath}` : ""}`;
+      line.appendChild(txt);
+      if (ev.action === "block" && ev.exePath) {
+        const allowBtn = document.createElement("button");
+        allowBtn.type = "button";
+        allowBtn.className = "btn btn-mini";
+        allowBtn.textContent = tr.diagAllowClient;
+        allowBtn.addEventListener("click", async () => {
+          try {
+            await api().ApproveBlockedClientPath(ev.exePath);
+            await refreshBootstrap();
+            showToast(tr.toastClientAllowed);
+          } catch (err) {
+            showError(String(err));
+          }
+        });
+        line.appendChild(allowBtn);
+      }
       logBox.appendChild(line);
     }
   }
@@ -639,6 +682,69 @@ function closeAllModals() {
   el("modal-editor").classList.add("hidden");
   el("modal-paste").classList.add("hidden");
   el("modal-qr").classList.add("hidden");
+  el("modal-diagnostics").classList.add("hidden");
+}
+
+function renderBlockedClientsInDiag() {
+  const wrap = el("diag-blocked-wrap");
+  const list = el("diag-blocked-list");
+  const tr = t();
+  const seen = new Set();
+  const blocked = [];
+  for (const ev of (state?.guardEvents || []).slice().reverse()) {
+    if (ev.action === "block" && ev.exePath && !seen.has(ev.exePath.toLowerCase())) {
+      seen.add(ev.exePath.toLowerCase());
+      blocked.push(ev);
+    }
+  }
+  list.innerHTML = "";
+  if (blocked.length === 0) {
+    wrap.classList.add("hidden");
+    return;
+  }
+  wrap.classList.remove("hidden");
+  for (const ev of blocked) {
+    const row = document.createElement("div");
+    row.className = "diag-blocked-row";
+    const pathSpan = document.createElement("span");
+    pathSpan.className = "mono";
+    pathSpan.textContent = ev.exePath;
+    const allowBtn = document.createElement("button");
+    allowBtn.type = "button";
+    allowBtn.className = "btn btn-mini";
+    allowBtn.textContent = tr.diagAllowClient;
+    allowBtn.addEventListener("click", async () => {
+      try {
+        await api().ApproveBlockedClientPath(ev.exePath);
+        await refreshBootstrap();
+        await refreshDiagnosticsModal();
+        showToast(tr.toastClientAllowed);
+      } catch (err) {
+        showError(String(err));
+      }
+    });
+    row.appendChild(pathSpan);
+    row.appendChild(allowBtn);
+    list.appendChild(row);
+  }
+}
+
+async function refreshDiagnosticsModal() {
+  const tr = t();
+  const view = el("diag-report-view");
+  view.textContent = tr.diagLoading;
+  renderBlockedClientsInDiag();
+  try {
+    const rep = await api().GetDiagnosticReport();
+    view.textContent = (rep && rep.trim()) ? rep : tr.diagEmpty;
+  } catch (err) {
+    view.textContent = `${tr.diagError} (${String(err)})`;
+  }
+}
+
+async function openDiagnosticsModal() {
+  el("modal-diagnostics").classList.remove("hidden");
+  await refreshDiagnosticsModal();
 }
 
 async function handleDroppedOrPastedFiles(files) {
@@ -675,13 +781,21 @@ async function runVerifyRoute() {
     const body = el("verify-body");
     body.innerHTML = "";
 
-    const row1 = document.createElement("div");
-    row1.textContent = `${tr.verifyExit}: ${rep.exitIp ? lri(`${rep.exitIp} (${rep.country || "?"}) - ${rep.exitRttMs} `) + tr.unitsMs : tr.verifyFail + (rep.exitError ? ` (${lri(rep.exitError)})` : "")}`;
-    body.appendChild(row1);
+    if (rep.error) {
+      const errRow = document.createElement("div");
+      errRow.textContent = `${tr.verifyFail}: ${lri(rep.error)}`;
+      body.appendChild(errRow);
+    }
 
-    const row2 = document.createElement("div");
-    row2.textContent = `${tr.verifyUdpReady}: ${rep.udpOk ? `${tr.verifyPass} (${lri(String(rep.udpRttMs))} ${tr.unitsMs})` : `${tr.verifyFail}${rep.udpError ? ` (${lri(rep.udpError)})` : ""}`}`;
-    body.appendChild(row2);
+    if (!rep.error || rep.exitIp || rep.exitError || rep.udpOk || rep.udpError) {
+      const row1 = document.createElement("div");
+      row1.textContent = `${tr.verifyExit}: ${rep.exitIp ? lri(`${rep.exitIp} (${rep.country || "?"}) - ${rep.exitRttMs} `) + tr.unitsMs : tr.verifyFail + (rep.exitError ? ` (${lri(rep.exitError)})` : "")}`;
+      body.appendChild(row1);
+
+      const row2 = document.createElement("div");
+      row2.textContent = `${tr.verifyUdpReady}: ${rep.udpOk ? `${tr.verifyPass} (${lri(String(rep.udpRttMs))} ${tr.unitsMs})` : `${tr.verifyFail}${rep.udpError ? ` (${lri(rep.udpError)})` : ""}`}`;
+      body.appendChild(row2);
+    }
 
     if (Array.isArray(rep.dcLatencies) && rep.dcLatencies.length) {
       const dcLine = document.createElement("div");
@@ -698,21 +812,6 @@ async function runVerifyRoute() {
     verifying = false;
     renderStatusAndTelemetry();
   }
-}
-
-function maybeInviteToOfficialChannel() {
-  try {
-    if (localStorage.getItem("wgplus_channel_invited_v2") === "1") return;
-    setTimeout(async () => {
-      try {
-        const opened = await api()?.OpenOfficialChannel();
-        if (opened) {
-          localStorage.setItem("wgplus_channel_invited_v2", "1");
-          showToast(t().channelInviteToast);
-        }
-      } catch {}
-    }, 500);
-  } catch {}
 }
 
 async function runQuickWarp(forceNew) {
@@ -732,7 +831,6 @@ async function runQuickWarp(forceNew) {
     } else {
       showToast(tr.toastWarpReady);
     }
-    maybeInviteToOfficialChannel();
     await runVerifyRoute();
   } catch (err) {
     showError(String(err));
@@ -744,6 +842,84 @@ async function runQuickWarp(forceNew) {
 }
 
 function wireEvents() {
+  el("btn-open-diagnostics").addEventListener("click", () => openDiagnosticsModal());
+  el("btn-close-diag").addEventListener("click", closeAllModals);
+  el("btn-diag-refresh").addEventListener("click", () => refreshDiagnosticsModal());
+  el("btn-diag-copy").addEventListener("click", async () => {
+    try {
+      const rep = await api().GetDiagnosticReport();
+      await navigator.clipboard.writeText(rep || "");
+      showToast(t().toastDiagCopied);
+    } catch (err) {
+      showError(String(err));
+    }
+  });
+  el("btn-diag-save").addEventListener("click", async () => {
+    try {
+      const savedPath = await api().SaveDiagnosticReport();
+      if (savedPath) showToast(t().toastDiagSaved);
+    } catch (err) {
+      showError(String(err));
+    }
+  });
+  el("btn-diag-clear").addEventListener("click", async () => {
+    try {
+      await api().ClearDiagnostics();
+      await refreshDiagnosticsModal();
+      showToast(t().toastDiagCleared);
+    } catch (err) {
+      showError(String(err));
+    }
+  });
+  el("btn-diag-github").addEventListener("click", async () => {
+    try {
+      await api().OpenGitHubBugReport();
+      showToast(t().toastDiagGithub);
+    } catch (err) {
+      showError(String(err));
+    }
+  });
+  el("btn-join-channel").addEventListener("click", async () => {
+    try {
+      const opened = await api().OpenOfficialChannel();
+      showToast(opened ? t().toastChannelOpened : t().toastChannelMissing);
+    } catch (err) {
+      showError(String(err));
+    }
+  });
+  if (el("btn-channel-open")) {
+    el("btn-channel-open").addEventListener("click", async () => {
+      try {
+        const opened = await api().OpenOfficialChannel();
+        showToast(opened ? t().toastChannelOpened : t().toastChannelMissing);
+        await api().AcknowledgeOfficialChannel();
+        el("modal-channel").classList.add("hidden");
+        await refreshBootstrap();
+      } catch (err) {
+        showError(String(err));
+      }
+    });
+    el("btn-channel-yes").addEventListener("click", async () => {
+      try {
+        await api().AcknowledgeOfficialChannel();
+        el("modal-channel").classList.add("hidden");
+        await refreshBootstrap();
+      } catch (err) {
+        showError(String(err));
+      }
+    });
+    el("btn-channel-no").addEventListener("click", async () => {
+      try {
+        showToast(t().channelMustSubToast);
+        const opened = await api().OpenOfficialChannel();
+        if (!opened) {
+          showToast(t().toastChannelMissing);
+        }
+      } catch (err) {
+        showError(String(err));
+      }
+    });
+  }
   el("btn-hide-tray").addEventListener("click", () => api().HideToTray());
   el("btn-lang-toggle").addEventListener("click", () =>
     persistCurrentSettings((s) => {
@@ -774,7 +950,6 @@ function wireEvents() {
       } else {
         const target = state.activeProfileId || state.settings.activeProfileId || state.profiles?.[0]?.id || "";
         await api().Connect(target);
-        maybeInviteToOfficialChannel();
       }
       await refreshBootstrap();
     } catch (err) {
@@ -792,7 +967,6 @@ function wireEvents() {
     try {
       await api().EnableAwg15AndReconnect();
       await refreshBootstrap();
-      maybeInviteToOfficialChannel();
       showToast(t().toastAwgRecovered);
       await runVerifyRoute();
     } catch (err) {
@@ -1049,7 +1223,7 @@ function wireEvents() {
   el("btn-close-paste").addEventListener("click", closeAllModals);
   el("btn-close-qr").addEventListener("click", closeAllModals);
 
-  for (const id of ["modal-editor", "modal-paste", "modal-qr"]) {
+  for (const id of ["modal-editor", "modal-paste", "modal-qr", "modal-diagnostics"]) {
     el(id).addEventListener("click", (ev) => {
       if (ev.target === el(id)) closeAllModals();
     });

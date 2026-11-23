@@ -180,6 +180,7 @@ public final class BuiltinAdbKeyManager {
             if (sCachedPrivateKey != null && sCachedCertificate != null) {
                 return new KeyIdentity(sCachedPrivateKey, sCachedCertificate);
             }
+            WgKeystoreCrypto.init(context);
             SharedPreferences p = prefs(context);
             String encPriv = p.getString(KEY_PRIVATE_PKCS8_ENC, "");
             String certB64 = p.getString(KEY_CERT_X509_B64, "");

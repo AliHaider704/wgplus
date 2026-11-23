@@ -152,7 +152,15 @@ public class ModuleLauncherActivity extends Activity {
 
         String localizedTitle = WgStrings.appTitle(isAr);
         setTitle(localizedTitle);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+        if (Build.VERSION.SDK_INT >= 33) {
+            try {
+                setTaskDescription(new ActivityManager.TaskDescription.Builder()
+                        .setLabel(localizedTitle)
+                        .setIcon(R.mipmap.ic_launcher)
+                        .build());
+            } catch (Throwable ignored) {
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             try {
                 setTaskDescription(new ActivityManager.TaskDescription(localizedTitle, R.mipmap.ic_launcher));
             } catch (Throwable ignored) {
@@ -465,12 +473,33 @@ public class ModuleLauncherActivity extends Activity {
         );
 
         // 3. Optional Advanced Background Stability Card (collapsed by default)
-        content.addView(buildHybridContinuityCard(isAr, theme, cardPad), new LinearLayout.LayoutParams(
+        content.addView(buildHybridContinuityCard(isAr, theme, cardPad), createCardParamsWithBottom(12));
+
+        // 4. Sanitized Diagnostics & GitHub Issue Reporter Entry
+        Button diagEntryBtn = createActionButton(WgStrings.diagnosticsBtn(isAr), theme, false);
+        diagEntryBtn.setContentDescription("wgplus_btn_diagnostics");
+        diagEntryBtn.setOnClickListener(v ->
+                WireGuardDialog.showDiagnosticsModal(this, sourceApk, isAr, theme)
+        );
+        LinearLayout.LayoutParams diagLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        diagLp.bottomMargin = WgTheme.dp(this, 10);
+        content.addView(diagEntryBtn, diagLp);
+
+        // 5. Direct Official Channel Link (@wgplus_official)
+        Button channelEntryBtn = createActionButton(WgStrings.officialChannelBtn(isAr), theme, true);
+        channelEntryBtn.setContentDescription("wgplus_btn_channel");
+        channelEntryBtn.setOnClickListener(v ->
+                WireGuardManager.openOfficialChannel(this, null)
+        );
+        content.addView(channelEntryBtn, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
         ));
 
-        String verName = "1.8.0";
+        String verName = "1.9.0";
         try {
             verName = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
         } catch (Throwable ignored) {

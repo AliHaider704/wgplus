@@ -91,7 +91,8 @@ public final class TelegramXBridge {
                                 WireGuardManager.syncPullSharedStateFromProvider(appCtx, true);
                                 NativeBridgeLoader.ensureLoaded(appCtx, modulePath);
                                 if (WireGuardManager.isKillSwitchEnabled(appCtx)) {
-                                    WireGuardManager.enforceKillSwitchIfDisconnected(appCtx, modulePath, lpparam.classLoader);
+                                    int ksPort = WireGuardManager.enforceKillSwitchIfDisconnected(appCtx, modulePath, lpparam.classLoader);
+                                    applyTdlibProxyReflective(lpparam.classLoader, ksPort > 0 ? ksPort : 9);
                                 }
                                 if (WireGuardManager.isAutoConnectEnabled(appCtx)) {
                                     int port = WireGuardManager.startAndBind(appCtx, modulePath, lpparam.classLoader);
@@ -268,7 +269,10 @@ public final class TelegramXBridge {
             }
             Constructor<?> socksCtor = socksCls.getDeclaredConstructor(String.class, String.class);
             socksCtor.setAccessible(true);
-            Object proxyType = socksCtor.newInstance("", "");
+            Object proxyType = socksCtor.newInstance(
+                    WireGuardManager.getActiveSocksUser(),
+                    WireGuardManager.getActiveSocksPass()
+            );
 
             Constructor<?> addCtor = addProxyCls.getDeclaredConstructor(String.class, int.class, boolean.class, XposedHelpers.findClass("org.drinkless.tdlib.TdApi$ProxyType", cl));
             addCtor.setAccessible(true);
@@ -286,6 +290,23 @@ public final class TelegramXBridge {
             if (client == null) {
                 return false;
             }
+            // Also enable use_proxy_for_calls in TDLib when available
+            try {
+                Class<?> setOptCls = XposedHelpers.findClassIfExists("org.drinkless.tdlib.TdApi$SetOption", cl);
+                Class<?> optBoolCls = XposedHelpers.findClassIfExists("org.drinkless.tdlib.TdApi$OptionValueBoolean", cl);
+                Class<?> optValCls = XposedHelpers.findClassIfExists("org.drinkless.tdlib.TdApi$OptionValue", cl);
+                if (setOptCls != null && optBoolCls != null && optValCls != null) {
+                    Object boolVal = optBoolCls.getDeclaredConstructor(boolean.class).newInstance(true);
+                    Object setOpt = setOptCls.getDeclaredConstructor(String.class, optValCls).newInstance("use_proxy_for_calls", boolVal);
+                    for (Method m : client.getClass().getMethods()) {
+                        if ("send".equals(m.getName()) && m.getParameterTypes().length >= 2) {
+                            m.invoke(client, setOpt, null);
+                            break;
+                        }
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
             for (Method m : client.getClass().getMethods()) {
                 if ("send".equals(m.getName()) && m.getParameterTypes().length >= 2) {
                     m.invoke(client, req, null);
@@ -302,7 +323,13 @@ public final class TelegramXBridge {
      * even on builds with obfuscated internal TDLib wrappers.
      */
     public static Intent buildSocksDispatchIntent(int port) {
-        Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse("tg://socks?server=127.0.0.1&port=" + port));
+        StringBuilder uri = new StringBuilder("tg://socks?server=127.0.0.1&port=").append(port);
+        String user = WireGuardManager.getActiveSocksUser();
+        String pass = WireGuardManager.getActiveSocksPass();
+        if (user != null && !user.isEmpty()) {
+            uri.append("&user=").append(Uri.encode(user)).append("&pass=").append(Uri.encode(pass != null ? pass : ""));
+        }
+        Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(uri.toString()));
         i.setPackage(PACKAGE_NAME);
         i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         return i;

@@ -1165,17 +1165,41 @@ public final class WireGuardDialog {
         footer.setBackgroundColor(theme.surfaceFooter);
         footer.setPadding(padH, WgTheme.dp(ctx, 10), padH, WgTheme.dp(ctx, 10));
 
+        Button channelBtn = createSecondaryButton(ctx, WgStrings.officialChannelBtn(isAr), theme);
+        channelBtn.setContentDescription("wgplus_dlg_channel");
+        channelBtn.setOnClickListener(v -> {
+            captureDraftInputs.run();
+            WireGuardManager.saveConfig(ctx, state.draft);
+            WireGuardManager.openOfficialChannel(ctx, dialog::dismiss);
+        });
+        LinearLayout.LayoutParams chBtnLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        chBtnLp.bottomMargin = WgTheme.dp(ctx, 8);
+        footer.addView(channelBtn, chBtnLp);
+
+        LinearLayout footerBtnRow = new LinearLayout(ctx);
+        footerBtnRow.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button diagBtn = createSecondaryButton(ctx, WgStrings.diagnosticsBtn(isAr), theme);
+        diagBtn.setOnClickListener(v -> showDiagnosticsModal(ctx, moduleApkPath, isAr, theme));
+        LinearLayout.LayoutParams dBtnLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        setMarginEndCompat(dBtnLp, WgTheme.dp(ctx, 8), isAr);
+
         Button closeBtn = createSecondaryButton(ctx, WgStrings.closeBtn(isAr), theme);
         closeBtn.setOnClickListener(v -> {
             captureDraftInputs.run();
             WireGuardManager.saveConfig(ctx, state.draft);
             dialog.dismiss();
         });
-        footer.addView(closeBtn, new LinearLayout.LayoutParams(
+        footerBtnRow.addView(diagBtn, dBtnLp);
+        footerBtnRow.addView(closeBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        footer.addView(footerBtnRow, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
         ));
-        String dlgVer = "1.8.0";
+        String dlgVer = "1.9.0";
         try {
             dlgVer = ctx.getPackageManager().getPackageInfo("org.telegram.wgplus.module", 0).versionName;
         } catch (Throwable ignored) {
@@ -1374,7 +1398,7 @@ public final class WireGuardDialog {
                         ).show();
                         rebuildUi.run();
                         triggerVerification.run();
-                        WireGuardManager.maybeInviteToOfficialChannel(ctx, isAr);
+                        WireGuardManager.maybeInviteToOfficialChannel(ctx, isAr, dialog::dismiss);
                     });
                 } catch (final Throwable err) {
                     mainHandler.post(() -> {
@@ -1642,11 +1666,11 @@ public final class WireGuardDialog {
                         0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
                 );
                 setMarginEndCompat(eBtnLp, WgTheme.dp(ctx, 6), isAr);
-                LinearLayout.LayoutParams dBtnLp = new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams delRowLp = new LinearLayout.LayoutParams(
                         0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f
                 );
                 rowBtns.addView(editRowBtn, eBtnLp);
-                rowBtns.addView(delRowBtn, dBtnLp);
+                rowBtns.addView(delRowBtn, delRowLp);
                 rowCard.addView(rowBtns, rbWrapLp);
             }
 
@@ -1777,7 +1801,19 @@ public final class WireGuardDialog {
                 CharSequence rawText = clip.getItemAt(0).coerceToText(ctx);
                 String text = rawText != null ? rawText.toString().trim() : "";
                 // Automatically handle multi-profile JSON backup if pasted here too
-                if (text.startsWith("{") && text.contains(WireGuardManager.BACKUP_SCHEMA)) {
+                if (WireGuardManager.isEncryptedBackupEnvelope(text)) {
+                    promptBackupPassphraseModal(ctx, isAr, theme, false, pass -> {
+                        try {
+                            int count = WireGuardManager.importEncryptedBackupV1(ctx, moduleApkPath, text, pass);
+                            state.draft = WireGuardManager.loadConfig(ctx);
+                            state.configExpanded = false;
+                            Toast.makeText(ctx, WgStrings.toastRestoredBackup(isAr, count), Toast.LENGTH_SHORT).show();
+                            rebuildUi.run();
+                        } catch (Throwable err) {
+                            Toast.makeText(ctx, WgStrings.localizeError(err, isAr), Toast.LENGTH_LONG).show();
+                        }
+                    });
+                } else if (text.startsWith("{") && text.contains("wgplus.profiles.v1")) {
                     int count = WireGuardManager.importProfilesBackupJson(ctx, text);
                     state.draft = WireGuardManager.loadConfig(ctx);
                     state.configExpanded = false;
@@ -1836,19 +1872,27 @@ public final class WireGuardDialog {
         });
 
         backupAllBtn.setOnClickListener(v -> {
-            try {
-                captureDraftInputs.run();
-                WireGuardManager.saveConfig(ctx, state.draft);
-                String backupJson = WireGuardManager.exportAllProfilesBackupJson(ctx);
-                ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);
-                if (cm != null) {
-                    cm.setPrimaryClip(ClipData.newPlainText("WireGuardPlusBackup", backupJson));
-                    int count = WireGuardManager.loadProfiles(ctx).size();
-                    Toast.makeText(ctx, WgStrings.toastExportedBackup(isAr, count), Toast.LENGTH_SHORT).show();
+            captureDraftInputs.run();
+            WireGuardManager.saveConfig(ctx, state.draft);
+            promptBackupPassphraseModal(ctx, isAr, theme, true, pass -> {
+                try {
+                    String encrypted = WireGuardManager.exportEncryptedBackupV1(ctx, moduleApkPath, pass);
+                    ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);
+                    if (cm != null) {
+                        ClipData clip = ClipData.newPlainText("WireGuardPlusBackup", encrypted);
+                        if (Build.VERSION.SDK_INT >= 33) {
+                            android.os.PersistableBundle extras = new android.os.PersistableBundle();
+                            extras.putBoolean("android.content.extra.IS_SENSITIVE", true);
+                            clip.getDescription().setExtras(extras);
+                        }
+                        cm.setPrimaryClip(clip);
+                        int count = WireGuardManager.loadProfiles(ctx).size();
+                        Toast.makeText(ctx, WgStrings.backupExportedEncryptedToast(isAr, count), Toast.LENGTH_SHORT).show();
+                    }
+                } catch (Throwable err) {
+                    Toast.makeText(ctx, WgStrings.localizeError(err, isAr), Toast.LENGTH_LONG).show();
                 }
-            } catch (Throwable err) {
-                Toast.makeText(ctx, WgStrings.localizeError(err, isAr), Toast.LENGTH_LONG).show();
-            }
+            });
         });
 
         restoreAllBtn.setOnClickListener(v -> {
@@ -1860,13 +1904,28 @@ public final class WireGuardDialog {
                     throw new WgStrings.WgException(WgStrings.ErrorCode.EMPTY_CLIPBOARD);
                 }
                 CharSequence rawText = cm.getPrimaryClip().getItemAt(0).coerceToText(ctx);
-                String payload = rawText != null ? rawText.toString().trim() : "";
-                int count = WireGuardManager.importProfilesBackupJson(ctx, payload);
-                state.draft = WireGuardManager.loadConfig(ctx);
-                state.configExpanded = false;
-                state.advancedExpanded = state.draft.hasAwgConfigured();
-                Toast.makeText(ctx, WgStrings.toastRestoredBackup(isAr, count), Toast.LENGTH_SHORT).show();
-                rebuildUi.run();
+                final String payload = rawText != null ? rawText.toString().trim() : "";
+                if (WireGuardManager.isEncryptedBackupEnvelope(payload)) {
+                    promptBackupPassphraseModal(ctx, isAr, theme, false, pass -> {
+                        try {
+                            int count = WireGuardManager.importEncryptedBackupV1(ctx, moduleApkPath, payload, pass);
+                            state.draft = WireGuardManager.loadConfig(ctx);
+                            state.configExpanded = false;
+                            state.advancedExpanded = state.draft.hasAwgConfigured();
+                            Toast.makeText(ctx, WgStrings.toastRestoredBackup(isAr, count), Toast.LENGTH_SHORT).show();
+                            rebuildUi.run();
+                        } catch (Throwable err) {
+                            Toast.makeText(ctx, WgStrings.localizeError(err, isAr), Toast.LENGTH_LONG).show();
+                        }
+                    });
+                } else {
+                    int count = WireGuardManager.importProfilesBackupJson(ctx, payload);
+                    state.draft = WireGuardManager.loadConfig(ctx);
+                    state.configExpanded = false;
+                    state.advancedExpanded = state.draft.hasAwgConfigured();
+                    Toast.makeText(ctx, WgStrings.toastRestoredBackup(isAr, count), Toast.LENGTH_SHORT).show();
+                    rebuildUi.run();
+                }
             } catch (Throwable err) {
                 Toast.makeText(ctx, WgStrings.localizeError(err, isAr), Toast.LENGTH_LONG).show();
             }
@@ -1942,7 +2001,7 @@ public final class WireGuardDialog {
                         ).show();
                         rebuildUi.run();
                         triggerVerification.run();
-                        WireGuardManager.maybeInviteToOfficialChannel(ctx, isAr);
+                        WireGuardManager.maybeInviteToOfficialChannel(ctx, isAr, dialog::dismiss);
                     });
                 } catch (final Throwable err) {
                     mainHandler.post(() -> {
@@ -1988,7 +2047,7 @@ public final class WireGuardDialog {
                         ).show();
                         rebuildUi.run();
                         triggerVerification.run();
-                        WireGuardManager.maybeInviteToOfficialChannel(ctx, isAr);
+                        WireGuardManager.maybeInviteToOfficialChannel(ctx, isAr, dialog::dismiss);
                     });
                 } catch (final Throwable err) {
                     mainHandler.post(() -> {
@@ -2023,7 +2082,7 @@ public final class WireGuardDialog {
                         Toast.makeText(ctx, WgStrings.toastAwgRecovered(isAr, port), Toast.LENGTH_SHORT).show();
                         rebuildUi.run();
                         triggerVerification.run();
-                        WireGuardManager.maybeInviteToOfficialChannel(ctx, isAr);
+                        WireGuardManager.maybeInviteToOfficialChannel(ctx, isAr, dialog::dismiss);
                     });
                 } catch (final Throwable err) {
                     mainHandler.post(() -> {
@@ -2212,6 +2271,218 @@ public final class WireGuardDialog {
         if (confirmDialog.getWindow() != null) {
             confirmDialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
         }
+    }
+
+    private interface PassphraseConsumer {
+        void onPassphrase(String passphrase);
+    }
+
+    private static void promptBackupPassphraseModal(
+            Context ctx,
+            boolean isAr,
+            WgTheme theme,
+            boolean isExport,
+            PassphraseConsumer consumer
+    ) {
+        LinearLayout box = new LinearLayout(ctx);
+        box.setOrientation(LinearLayout.VERTICAL);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+            box.setLayoutDirection(isAr ? View.LAYOUT_DIRECTION_RTL : View.LAYOUT_DIRECTION_LTR);
+        }
+        box.setBackground(WgTheme.cardBackground(ctx, theme.surfaceCard, theme.borderSubtle, 14f));
+        int p = WgTheme.dp(ctx, 18);
+        box.setPadding(p, p, p, p);
+
+        TextView title = new TextView(ctx);
+        applyProseTextStyle(title, isAr, theme.textPrimary, 15.5f, true);
+        title.setText(WgStrings.backupPassphraseTitle(isAr, isExport));
+        box.addView(title);
+
+        EditText passInput = new EditText(ctx);
+        passInput.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        passInput.setHint(WgStrings.backupPassphraseHint(isAr));
+        passInput.setHintTextColor(theme.textSecondary);
+        passInput.setTextColor(theme.textPrimary);
+        passInput.setBackground(WgTheme.cardBackground(ctx, theme.surfaceInput, theme.borderSubtle, 8f));
+        int ep = WgTheme.dp(ctx, 12);
+        passInput.setPadding(ep, ep, ep, ep);
+        LinearLayout.LayoutParams ipLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        ipLp.topMargin = WgTheme.dp(ctx, 12);
+        ipLp.bottomMargin = WgTheme.dp(ctx, 14);
+        box.addView(passInput, ipLp);
+
+        LinearLayout btnRow = new LinearLayout(ctx);
+        btnRow.setOrientation(LinearLayout.HORIZONTAL);
+        Button cancelBtn = createSecondaryButton(ctx, WgStrings.cancelBtn(isAr), theme);
+        Button okBtn = createPrimaryAccentButton(ctx, isExport ? WgStrings.backupEncryptBtn(isAr) : WgStrings.backupDecryptBtn(isAr), theme);
+
+        LinearLayout.LayoutParams c1 = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        setMarginEndCompat(c1, WgTheme.dp(ctx, 8), isAr);
+        btnRow.addView(cancelBtn, c1);
+        btnRow.addView(okBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        box.addView(btnRow);
+
+        final AlertDialog dlg = new AlertDialog.Builder(ctx)
+                .setView(box)
+                .setCancelable(true)
+                .create();
+        cancelBtn.setOnClickListener(v -> dlg.dismiss());
+        okBtn.setOnClickListener(v -> {
+            String val = passInput.getText() != null ? passInput.getText().toString() : "";
+            dlg.dismiss();
+            consumer.onPassphrase(val);
+        });
+        dlg.show();
+        if (dlg.getWindow() != null) {
+            dlg.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
+    }
+
+    public static void showDiagnosticsModal(
+            final Context ctx,
+            final String moduleApkPath,
+            final boolean isAr,
+            final WgTheme theme
+    ) {
+        LinearLayout box = new LinearLayout(ctx);
+        box.setOrientation(LinearLayout.VERTICAL);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.JELLY_BEAN_MR1) {
+            box.setLayoutDirection(isAr ? View.LAYOUT_DIRECTION_RTL : View.LAYOUT_DIRECTION_LTR);
+        }
+        box.setBackground(WgTheme.cardBackground(ctx, theme.surfaceCard, theme.borderSubtle, 16f));
+        int p = WgTheme.dp(ctx, 18);
+        box.setPadding(p, p, p, p);
+
+        TextView title = new TextView(ctx);
+        applyProseTextStyle(title, isAr, theme.textPrimary, 16f, true);
+        title.setText(WgStrings.diagnosticsTitle(isAr));
+        box.addView(title);
+
+        TextView desc = new TextView(ctx);
+        applyProseTextStyle(desc, isAr, theme.textSecondary, 12.5f, false);
+        desc.setText(WgStrings.diagnosticsDesc(isAr));
+        LinearLayout.LayoutParams descLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        descLp.topMargin = WgTheme.dp(ctx, 4);
+        descLp.bottomMargin = WgTheme.dp(ctx, 10);
+        box.addView(desc, descLp);
+
+        ScrollView logScroll = new ScrollView(ctx);
+        logScroll.setBackground(WgTheme.cardBackground(ctx, theme.surfaceInput, theme.borderSubtle, 8f));
+        int lPad = WgTheme.dp(ctx, 10);
+        logScroll.setPadding(lPad, lPad, lPad, lPad);
+        final TextView reportView = new TextView(ctx);
+        reportView.setText(WgStrings.diagnosticsLoading(isAr));
+        reportView.setTextColor(theme.textPrimary);
+        reportView.setTextSize(11.5f);
+        reportView.setTypeface(Typeface.MONOSPACE);
+        reportView.setTextIsSelectable(true);
+        logScroll.addView(reportView, new ScrollView.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+        LinearLayout.LayoutParams scLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                WgTheme.dp(ctx, 220)
+        );
+        scLp.bottomMargin = WgTheme.dp(ctx, 12);
+        box.addView(logScroll, scLp);
+
+        final String[] latestReport = new String[]{""};
+        final Handler h = new Handler(Looper.getMainLooper());
+        final Runnable loadReport = () -> {
+            reportView.setText(WgStrings.diagnosticsLoading(isAr));
+            new Thread(() -> {
+                String built;
+                try {
+                    built = WgDiagnosticsLog.buildMarkdownReport(ctx, moduleApkPath);
+                } catch (Throwable t) {
+                    built = WgStrings.diagnosticsEmpty(isAr);
+                }
+                final String finalBuilt = built;
+                latestReport[0] = finalBuilt;
+                h.post(() -> reportView.setText(finalBuilt));
+            }, "wgplus-diag-build").start();
+        };
+
+        LinearLayout actionRow1 = new LinearLayout(ctx);
+        actionRow1.setOrientation(LinearLayout.HORIZONTAL);
+        Button copyBtn = createSecondaryButton(ctx, WgStrings.diagnosticsCopyBtn(isAr), theme);
+        Button clearBtn = createSecondaryButton(ctx, WgStrings.diagnosticsClearBtn(isAr), theme);
+        LinearLayout.LayoutParams r1a = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        setMarginEndCompat(r1a, WgTheme.dp(ctx, 8), isAr);
+        actionRow1.addView(copyBtn, r1a);
+        actionRow1.addView(clearBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        LinearLayout.LayoutParams ar1Lp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        ar1Lp.bottomMargin = WgTheme.dp(ctx, 8);
+        box.addView(actionRow1, ar1Lp);
+
+        Button githubBtn = createPrimaryAccentButton(ctx, WgStrings.diagnosticsGithubBtn(isAr), theme);
+        LinearLayout.LayoutParams ghLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        ghLp.bottomMargin = WgTheme.dp(ctx, 8);
+        box.addView(githubBtn, ghLp);
+
+        Button closeBtn = createSecondaryButton(ctx, WgStrings.closeBtn(isAr), theme);
+        box.addView(closeBtn, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        ));
+
+        final AlertDialog diagDialog = new AlertDialog.Builder(ctx)
+                .setView(box)
+                .setCancelable(true)
+                .create();
+
+        copyBtn.setOnClickListener(v -> {
+            String txt = latestReport[0].isEmpty()
+                    ? WgDiagnosticsLog.buildMarkdownReport(ctx, moduleApkPath)
+                    : latestReport[0];
+            ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null) {
+                cm.setPrimaryClip(ClipData.newPlainText("WireGuardPlusDiagnostics", txt));
+                Toast.makeText(ctx, WgStrings.diagnosticsCopiedToast(isAr), Toast.LENGTH_SHORT).show();
+            }
+        });
+        clearBtn.setOnClickListener(v -> {
+            WgDiagnosticsLog.clear();
+            Toast.makeText(ctx, WgStrings.diagnosticsClearedToast(isAr), Toast.LENGTH_SHORT).show();
+            loadReport.run();
+        });
+        githubBtn.setOnClickListener(v -> {
+            String txt = latestReport[0].isEmpty()
+                    ? WgDiagnosticsLog.buildMarkdownReport(ctx, moduleApkPath)
+                    : latestReport[0];
+            ClipboardManager cm = (ClipboardManager) ctx.getSystemService(Context.CLIPBOARD_SERVICE);
+            if (cm != null) {
+                cm.setPrimaryClip(ClipData.newPlainText("WireGuardPlusDiagnostics", txt));
+            }
+            Toast.makeText(ctx, WgStrings.diagnosticsGithubToast(isAr), Toast.LENGTH_LONG).show();
+            try {
+                String env = Uri.encode(Build.MANUFACTURER + " " + Build.MODEL + " (Android " + Build.VERSION.RELEASE + ") - WireGuard Plus v" + WgStrings.VERSION_LABEL);
+                Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse("https://github.com/AliHaider704/wgplus/issues/new?template=bug_report.yml&environment=" + env));
+                i.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                ctx.startActivity(i);
+            } catch (Throwable ignored) {
+            }
+        });
+        closeBtn.setOnClickListener(v -> diagDialog.dismiss());
+
+        diagDialog.show();
+        if (diagDialog.getWindow() != null) {
+            diagDialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.TRANSPARENT));
+        }
+        loadReport.run();
     }
 
     private static void renderTelemetryBox(

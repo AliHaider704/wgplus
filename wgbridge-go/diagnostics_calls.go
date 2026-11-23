@@ -174,6 +174,120 @@ func VerifyRouteAndCallsJSON(socksPort int, username, password string) string {
 	return verifyRouteAndCallsWithTargets(socksPort, username, password, defaultVerifyTargets())
 }
 
+func probeExitTrace(socksPort int, username, password, dialAddr, serverName string, useTLS bool) (exitIP, country string, rttMs int64, errStr string) {
+	start := time.Now()
+	c, err := dialViaLocalSocks5(socksPort, username, password, dialAddr, 6*time.Second)
+	if err != nil {
+		return "", "", 0, err.Error()
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(6 * time.Second))
+
+	var rw io.ReadWriter = c
+	if useTLS {
+		tlsConn := tls.Client(c, &tls.Config{
+			ServerName: serverName,
+			MinVersion: tls.VersionTLS12,
+		})
+		if hErr := tlsConn.Handshake(); hErr != nil {
+			return "", "", 0, hErr.Error()
+		}
+		rw = tlsConn
+	}
+
+	req := fmt.Sprintf("GET /cdn-cgi/trace HTTP/1.1\r\nHost: %s\r\nUser-Agent: WireGuardPlus/1.5\r\nConnection: close\r\n\r\n", serverName)
+	if _, wErr := io.WriteString(rw, req); wErr != nil {
+		return "", "", 0, wErr.Error()
+	}
+	bodyBytes, rErr := io.ReadAll(io.LimitReader(rw, 8192))
+	if rErr != nil && len(bodyBytes) == 0 {
+		return "", "", 0, rErr.Error()
+	}
+	for _, line := range strings.Split(string(bodyBytes), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "ip=") {
+			exitIP = strings.TrimPrefix(line, "ip=")
+		} else if strings.HasPrefix(line, "loc=") {
+			country = strings.TrimPrefix(line, "loc=")
+		}
+	}
+	if exitIP == "" {
+		return "", "", 0, "missing ip field in trace response"
+	}
+	rtt := time.Since(start).Milliseconds()
+	if rtt < 1 {
+		rtt = 1
+	}
+	return exitIP, country, rtt, ""
+}
+
+func probeUdpDnsOnce(socksPort int, username, password string, target netip.AddrPort) (int64, string) {
+	start := time.Now()
+	ctrl, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", socksPort), 4*time.Second)
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer ctrl.Close()
+	_ = ctrl.SetDeadline(time.Now().Add(5 * time.Second))
+
+	_, relayPort, err := performSocks5Handshake(ctrl, username, password, 0x03, "0.0.0.0", 0)
+	if err != nil || relayPort == 0 {
+		if err == nil {
+			err = errors.New("relay port is 0")
+		}
+		return 0, err.Error()
+	}
+
+	uConn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(relayPort)})
+	if err != nil {
+		return 0, err.Error()
+	}
+	defer uConn.Close()
+	_ = uConn.SetDeadline(time.Now().Add(4 * time.Second))
+
+	dnsQuery, qErr := encodeDnsQueryA("telegram.org")
+	if qErr != nil {
+		return 0, qErr.Error()
+	}
+	dnsQuery[0] = 0x57
+	dnsQuery[1] = 0x48
+
+	v4 := target.Addr().As4()
+	udpPkt := make([]byte, 10+len(dnsQuery))
+	udpPkt[3] = 0x01
+	copy(udpPkt[4:8], v4[:])
+	binary.BigEndian.PutUint16(udpPkt[8:10], target.Port())
+	copy(udpPkt[10:], dnsQuery)
+
+	if _, wErr := uConn.Write(udpPkt); wErr != nil {
+		return 0, wErr.Error()
+	}
+
+	respBuf := make([]byte, 1500)
+	rn, rErr := uConn.Read(respBuf)
+	if rErr != nil {
+		return 0, rErr.Error()
+	}
+	_, _, payload, pErr := parseSocks5UdpDatagram(respBuf[:rn])
+	if pErr != nil || len(payload) < 12 {
+		if pErr == nil {
+			pErr = errors.New("short UDP DNS reply")
+		}
+		return 0, pErr.Error()
+	}
+	if payload[0] != 0x57 || payload[1] != 0x48 {
+		return 0, "UDP DNS txid mismatch"
+	}
+	if _, parseErr := parseDnsResponseA(payload, true); parseErr != nil {
+		return 0, parseErr.Error()
+	}
+	rtt := time.Since(start).Milliseconds()
+	if rtt < 1 {
+		rtt = 1
+	}
+	return rtt, ""
+}
+
 func verifyRouteAndCallsWithTargets(socksPort int, username, password string, tgt verifyTargets) string {
 	if socksPort <= 0 {
 		socksPort = GetActivePort()
@@ -187,60 +301,23 @@ func verifyRouteAndCallsWithTargets(socksPort int, username, password string, tg
 
 	var wg sync.WaitGroup
 
-	// 1. Exit IP + Country via trace endpoint
+	// 1. Exit IP + Country via trace endpoint (with 1.0.0.1 fallback if 1.1.1.1:443 fails)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		start := time.Now()
-		c, err := dialViaLocalSocks5(socksPort, username, password, tgt.traceDialAddr, 6*time.Second)
-		if err != nil {
-			report.ExitError = err.Error()
-			return
-		}
-		defer c.Close()
-		_ = c.SetDeadline(time.Now().Add(6 * time.Second))
-
-		var rw io.ReadWriter = c
-		if tgt.traceUseTLS {
-			tlsConn := tls.Client(c, &tls.Config{
-				ServerName: tgt.traceServerName,
-				MinVersion: tls.VersionTLS12,
-			})
-			if hErr := tlsConn.Handshake(); hErr != nil {
-				report.ExitError = hErr.Error()
-				return
-			}
-			rw = tlsConn
-		}
-
-		req := fmt.Sprintf("GET /cdn-cgi/trace HTTP/1.1\r\nHost: %s\r\nUser-Agent: WireGuardPlus/1.5\r\nConnection: close\r\n\r\n", tgt.traceServerName)
-		if _, wErr := io.WriteString(rw, req); wErr != nil {
-			report.ExitError = wErr.Error()
-			return
-		}
-		bodyBytes, rErr := io.ReadAll(io.LimitReader(rw, 8192))
-		if rErr != nil && len(bodyBytes) == 0 {
-			report.ExitError = rErr.Error()
-			return
-		}
-		body := string(bodyBytes)
-		for _, line := range strings.Split(body, "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "ip=") {
-				report.ExitIP = strings.TrimPrefix(line, "ip=")
-			} else if strings.HasPrefix(line, "loc=") {
-				report.Country = strings.TrimPrefix(line, "loc=")
+		ip, cc, rtt, errStr := probeExitTrace(socksPort, username, password, tgt.traceDialAddr, tgt.traceServerName, tgt.traceUseTLS)
+		if errStr != "" && tgt.traceDialAddr == "1.1.1.1:443" {
+			ip2, cc2, rtt2, errStr2 := probeExitTrace(socksPort, username, password, "1.0.0.1:443", tgt.traceServerName, tgt.traceUseTLS)
+			if errStr2 == "" {
+				ip, cc, rtt, errStr = ip2, cc2, rtt2, ""
+			} else {
+				errStr = errStr2
 			}
 		}
-		if report.ExitIP == "" {
-			report.ExitError = "missing ip field in trace response"
-			return
-		}
-		rtt := time.Since(start).Milliseconds()
-		if rtt < 1 {
-			rtt = 1
-		}
+		report.ExitIP = ip
+		report.Country = cc
 		report.ExitRttMs = rtt
+		report.ExitError = errStr
 	}()
 
 	// 2. Parallel Telegram DC TCP latencies
@@ -264,81 +341,22 @@ func verifyRouteAndCallsWithTargets(socksPort int, username, password string, tg
 		}(i, dc.name, dc.addr)
 	}
 
-	// 3. Real RFC 1928 UDP ASSOCIATE call readiness check
+	// 3. Real RFC 1928 UDP ASSOCIATE call readiness check (with 8.8.8.8:53 fallback)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		start := time.Now()
-		ctrl, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", socksPort), 4*time.Second)
-		if err != nil {
-			report.UdpError = err.Error()
-			return
-		}
-		defer ctrl.Close()
-		_ = ctrl.SetDeadline(time.Now().Add(5 * time.Second))
-
-		_, relayPort, err := performSocks5Handshake(ctrl, username, password, 0x03, "0.0.0.0", 0)
-		if err != nil || relayPort == 0 {
-			if err == nil {
-				err = errors.New("relay port is 0")
+		rtt, errStr := probeUdpDnsOnce(socksPort, username, password, tgt.udpDnsTarget)
+		if errStr != "" && tgt.udpDnsTarget == netip.MustParseAddrPort("1.1.1.1:53") {
+			rtt2, errStr2 := probeUdpDnsOnce(socksPort, username, password, netip.MustParseAddrPort("8.8.8.8:53"))
+			if errStr2 == "" {
+				rtt, errStr = rtt2, ""
+			} else {
+				errStr = errStr2
 			}
-			report.UdpError = err.Error()
-			return
 		}
-
-		uConn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(relayPort)})
-		if err != nil {
-			report.UdpError = err.Error()
+		if errStr != "" {
+			report.UdpError = errStr
 			return
-		}
-		defer uConn.Close()
-		_ = uConn.SetDeadline(time.Now().Add(4 * time.Second))
-
-		dnsQuery, qErr := encodeDnsQueryA("telegram.org")
-		if qErr != nil {
-			report.UdpError = qErr.Error()
-			return
-		}
-		dnsQuery[0] = 0x57
-		dnsQuery[1] = 0x48
-
-		v4 := tgt.udpDnsTarget.Addr().As4()
-		udpPkt := make([]byte, 10+len(dnsQuery))
-		udpPkt[3] = 0x01
-		copy(udpPkt[4:8], v4[:])
-		binary.BigEndian.PutUint16(udpPkt[8:10], tgt.udpDnsTarget.Port())
-		copy(udpPkt[10:], dnsQuery)
-
-		if _, wErr := uConn.Write(udpPkt); wErr != nil {
-			report.UdpError = wErr.Error()
-			return
-		}
-
-		respBuf := make([]byte, 1500)
-		rn, rErr := uConn.Read(respBuf)
-		if rErr != nil {
-			report.UdpError = rErr.Error()
-			return
-		}
-		_, _, payload, pErr := parseSocks5UdpDatagram(respBuf[:rn])
-		if pErr != nil || len(payload) < 12 {
-			if pErr == nil {
-				pErr = errors.New("short UDP DNS reply")
-			}
-			report.UdpError = pErr.Error()
-			return
-		}
-		if payload[0] != 0x57 || payload[1] != 0x48 {
-			report.UdpError = "UDP DNS txid mismatch"
-			return
-		}
-		if _, parseErr := parseDnsResponseA(payload, true); parseErr != nil {
-			report.UdpError = parseErr.Error()
-			return
-		}
-		rtt := time.Since(start).Milliseconds()
-		if rtt < 1 {
-			rtt = 1
 		}
 		report.UdpOk = true
 		report.UdpRttMs = rtt

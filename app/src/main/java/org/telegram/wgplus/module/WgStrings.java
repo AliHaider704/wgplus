@@ -12,7 +12,7 @@ public final class WgStrings {
 
     public static final String LANG_AR = "ar";
     public static final String LANG_EN = "en";
-    public static final String VERSION_LABEL = "1.7.3";
+    public static final String VERSION_LABEL = "1.9.0";
 
     private static final Map<String, String> AR_COUNTRIES = new HashMap<>();
 
@@ -1383,5 +1383,84 @@ public final class WgStrings {
                         ? "تعذّر تشغيل المحرك الأصلي داخل التطبيق. أعد فتح تيليجرام وحاول مجددًا."
                         : ("Native tunnel engine failed to initialize" + (detail.isEmpty() ? "." : (": " + detail)));
         }
+    }
+
+    public static String diagnosticsBtn(boolean ar) {
+        return ar ? "التشخيص والأخطاء" : "Diagnostics";
+    }
+
+    public static String officialChannelBtn(boolean ar) {
+        return ar
+                ? ("القناة الرسمية (" + ltr("@wgplus_official") + ")")
+                : "Official Channel (@wgplus_official)";
+    }
+
+    public static String diagnosticsTitle(boolean ar) {
+        return ar ? "تقرير التشخيص والإبلاغ عبر " + ltr("GitHub") : "Diagnostics & GitHub Issue Report";
+    }
+
+    public static String diagnosticsDesc(boolean ar) {
+        return ar
+                ? "تُحذف المفاتيح الخاصة وعناوين الخوادم وكلمات المرور تلقائيًا قبل النسخ أو الإرسال."
+                : "Private keys, preshared keys, endpoints, and passwords are automatically redacted before copying or submitting.";
+    }
+
+    public static String diagnosticsCopyBtn(boolean ar) {
+        return ar ? "نسخ التقرير" : "Copy Report";
+    }
+
+    public static String diagnosticsGithubBtn(boolean ar) {
+        return ar ? "إرسال بلاغ على " + ltr("GitHub") : "Report on GitHub";
+    }
+
+    public static String diagnosticsClearBtn(boolean ar) {
+        return ar ? "مسح السجل" : "Clear Logs";
+    }
+
+    public static String diagnosticsLoading(boolean ar) {
+        return ar ? "جارٍ تجميع تقرير التشخيص المنظّف..." : "Collecting sanitized diagnostic report...";
+    }
+
+    public static String diagnosticsEmpty(boolean ar) {
+        return ar ? "لا توجد أحداث أخطاء مسجّلة حاليًا." : "No error events recorded yet.";
+    }
+
+    public static String diagnosticsCopiedToast(boolean ar) {
+        return ar ? "تم نسخ تقرير التشخيص المنظّف للحافظة." : "Sanitized diagnostic report copied to clipboard.";
+    }
+
+    public static String diagnosticsGithubToast(boolean ar) {
+        return ar
+                ? "تم نسخ التقرير المنظّف؛ الصقه داخل صفحة البلاغ في " + ltr("GitHub") + "."
+                : "Sanitized report copied. Paste it into the GitHub issue form.";
+    }
+
+    public static String diagnosticsClearedToast(boolean ar) {
+        return ar ? "تم مسح سجل التشخيص." : "Diagnostic logs cleared.";
+    }
+
+    public static String backupPassphraseTitle(boolean ar, boolean isExport) {
+        if (isExport) {
+            return ar ? "تشفير النسخة الاحتياطية (" + ltr(".wgplus") + ")" : "Encrypt Backup Bundle (.wgplus)";
+        }
+        return ar ? "فك تشفير النسخة الاحتياطية (" + ltr(".wgplus") + ")" : "Decrypt Backup Bundle (.wgplus)";
+    }
+
+    public static String backupPassphraseHint(boolean ar) {
+        return ar ? "أدخل كلمة مرور (4 محارف فأكثر)" : "Enter passphrase (4+ characters)";
+    }
+
+    public static String backupEncryptBtn(boolean ar) {
+        return ar ? "تشفير ونسخ" : "Encrypt & Copy";
+    }
+
+    public static String backupDecryptBtn(boolean ar) {
+        return ar ? "فك التشفير والاستيراد" : "Decrypt & Import";
+    }
+
+    public static String backupExportedEncryptedToast(boolean ar, int count) {
+        return ar
+                ? "تم تشفير ونسخ " + ltr(String.valueOf(count)) + " خوادم بصيغة " + ltr("wgplus-backup-v1") + "."
+                : "Encrypted and copied " + count + " server(s) in wgplus-backup-v1 format.";
     }
 }

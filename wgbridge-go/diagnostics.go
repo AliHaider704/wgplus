@@ -42,6 +42,23 @@ func StopKillSwitchGuard() {
 	mu.Unlock()
 }
 
+// SetKillSwitchArmed keeps the fail-closed mux guard armed or disarmed across tunnel start/stop
+// transitions without tearing down an active tunnel.
+func SetKillSwitchArmed(armed bool) {
+	mu.Lock()
+	defer mu.Unlock()
+	muxKillSwitch = armed
+	if armed {
+		if port, err := ensureMuxListenerLocked(); err != nil {
+			RecordDiag("KILLSWITCH", "ARM_ERR", err.Error())
+		} else if port > 0 {
+			notifyMuxWaitersLocked()
+		}
+	} else {
+		stopMuxIfIdleLocked()
+	}
+}
+
 // GetKillSwitchPort returns the active local kill-switch/mux port, or 0 if guard is disabled.
 func GetKillSwitchPort() int {
 	mu.Lock()

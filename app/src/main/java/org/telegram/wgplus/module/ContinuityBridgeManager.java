@@ -274,6 +274,7 @@ public final class ContinuityBridgeManager {
                     }
                     WORKER.execute(() -> {
                         try {
+                            PrivilegeBridge.resetDaemonBootstrapBackoff();
                             if (!PrivilegeBridge.isStandaloneDaemonAlive(appCtx)) {
                                 if (PrivilegeBridge.isRootAvailablePassive(appCtx)) {
                                     List<String> pkgs = collectInstalledTargetsAndModule(appCtx);
@@ -402,9 +403,8 @@ public final class ContinuityBridgeManager {
         boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
         boolean builtinAdbPaired = BuiltinAdbKeyManager.isPaired(appCtx);
         boolean sovereignReady = daemonAlive || rootReady || selfPrivileged;
-        boolean backendReady = sovereignReady || builtinAdbPaired;
-        boolean forcedImportant = backendReady && (!sElevatedPids.isEmpty() || sovereignReady);
-        ContinuityTier tier = computeContinuityTier(stealthEnabled, backendReady, listenerConnected || listenerEnabled);
+        boolean forcedImportant = sovereignReady && (!sElevatedPids.isEmpty() || daemonAlive || selfPrivileged);
+        ContinuityTier tier = computeContinuityTier(stealthEnabled, sovereignReady, listenerConnected || listenerEnabled);
         boolean stealthProtected = tier != ContinuityTier.STANDARD_FGS;
         return new StealthSnapshot(
                 stealthEnabled,

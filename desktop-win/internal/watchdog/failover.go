@@ -11,10 +11,11 @@ import (
 
 // Dependencies abstracts tunnel health checks, rebinding, probing, and switching for testability.
 type Dependencies struct {
-	IsRunning        func() bool
-	TunnelUptime     func() time.Duration
-	SnapshotStats    func() (handshakeAgeSec int64, txBytes uint64)
-	ForceRebind      func() bool
+	IsRunning            func() bool
+	TunnelUptime         func() time.Duration
+	SnapshotStats        func() (handshakeAgeSec int64, txBytes uint64)
+	SnapshotTrafficStats func() (handshakeAgeSec int64, rxBytes uint64, txBytes uint64)
+	ForceRebind          func() bool
 	SetPending       func(pending bool)
 	ListProfiles     func() (activeID string, profiles []config.ServerProfile)
 	IsAutoFailover   func() bool
@@ -31,6 +32,7 @@ type Monitor struct {
 	checkInterval time.Duration
 
 	mu               sync.Mutex
+	lastRxBytes      uint64
 	lastTxBytes      uint64
 	consecutiveStall int
 	lastFailoverAt   time.Time
@@ -67,6 +69,7 @@ func (m *Monitor) Step(ctx context.Context) {
 	if m.deps.IsRunning == nil || !m.deps.IsRunning() {
 		m.mu.Lock()
 		m.consecutiveStall = 0
+		m.lastRxBytes = 0
 		m.lastTxBytes = 0
 		m.mu.Unlock()
 		return
@@ -80,19 +83,33 @@ func (m *Monitor) Step(ctx context.Context) {
 		return
 	}
 
-	hsAge, txBytes := m.deps.SnapshotStats()
+	var hsAge int64
+	var rxBytes, txBytes uint64
+	hasRx := false
+	if m.deps.SnapshotTrafficStats != nil {
+		hsAge, rxBytes, txBytes = m.deps.SnapshotTrafficStats()
+		hasRx = true
+	} else if m.deps.SnapshotStats != nil {
+		hsAge, txBytes = m.deps.SnapshotStats()
+	}
+
 	m.mu.Lock()
+	prevRx := m.lastRxBytes
 	prevTx := m.lastTxBytes
+	m.lastRxBytes = rxBytes
 	m.lastTxBytes = txBytes
 	m.mu.Unlock()
 
 	txGrowing := txBytes > prevTx+64
+	txWithoutRx := hasRx && txGrowing && rxBytes == prevRx
 	needsRecovery := false
 	if hsAge < 0 {
 		needsRecovery = true
 	} else if hsAge > 195 {
 		needsRecovery = true
 	} else if hsAge > 145 && txGrowing {
+		needsRecovery = true
+	} else if txWithoutRx {
 		needsRecovery = true
 	}
 

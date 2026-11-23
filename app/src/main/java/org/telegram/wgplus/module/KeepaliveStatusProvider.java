@@ -3,17 +3,29 @@ package org.telegram.wgplus.module;
 import android.content.ContentProvider;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.Intent;
 import android.content.SharedPreferences;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
+import android.content.pm.Signature;
+import android.content.pm.SigningInfo;
 import android.database.Cursor;
 import android.net.Uri;
 import android.os.Binder;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Process;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import java.security.MessageDigest;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 
 /**
  * Synchronous Binder IPC bridge queried by hooked Telegram processes ({@code WireGuardManager})
@@ -42,7 +54,11 @@ public class KeepaliveStatusProvider extends ContentProvider {
     public static final String METHOD_REGISTER_SHARED_TUNNEL = "register_shared_tunnel";
     public static final String METHOD_QUERY_SHARED_TUNNEL = "query_shared_tunnel";
     public static final String METHOD_CLEAR_SHARED_TUNNEL = "clear_shared_tunnel";
+    public static final String METHOD_START_VOIP_RELAY = "start_voip_relay";
     public static final String EXTRA_JSON = "json";
+    public static final String EXTRA_HOST = "host";
+    public static final String EXTRA_PORT = "port";
+    public static final String RESULT_LOCAL_PORT = "local_port";
 
     public static final String EXTRA_PID = "pid";
     public static final String EXTRA_WANTS_ALWAYS_AWAKE = "wants_always_awake";
@@ -162,7 +178,12 @@ public class KeepaliveStatusProvider extends ContentProvider {
             out.putInt("tx", tx);
             return out;
         }
-        String safePkg = sanitizePackageName(arg);
+        String callerPkg = resolveVerifiedCallerPackage(ctx, arg);
+        if (callerPkg == null) {
+            WgDiagnosticsLog.record("SEC", "PROVIDER_DENY", "rejected uid=" + Binder.getCallingUid() + " method=" + method);
+            return null;
+        }
+        String safePkg = callerPkg;
         if (METHOD_ENSURE_STEALTH.equals(method)) {
             int pid = extras != null ? extras.getInt(EXTRA_PID, -1) : -1;
             boolean wantsAwake = extras == null || extras.getBoolean(EXTRA_WANTS_ALWAYS_AWAKE, true);
@@ -191,17 +212,11 @@ public class KeepaliveStatusProvider extends ContentProvider {
             return readHookTelemetryBundle(ctx);
         }
         if (METHOD_SYNC_PULL_STATE.equals(method)) {
-            if (!isTrustedSyncCaller(ctx)) {
-                return null;
-            }
             Bundle out = new Bundle();
             out.putString(RESULT_JSON, WireGuardManager.exportSharedSyncBundleJson(ctx));
             return out;
         }
         if (METHOD_SYNC_PUSH_STATE.equals(method)) {
-            if (!isTrustedSyncCaller(ctx)) {
-                return null;
-            }
             String json = extras != null ? extras.getString(EXTRA_JSON, "") : "";
             long rev = WireGuardManager.importSharedSyncBundleJson(ctx, json, false);
             Bundle out = new Bundle();
@@ -210,20 +225,21 @@ public class KeepaliveStatusProvider extends ContentProvider {
             return out;
         }
         if (METHOD_REGISTER_SHARED_TUNNEL.equals(method)) {
-            if (!isTrustedSyncCaller(ctx)) {
-                return null;
-            }
             int port = extras != null ? extras.getInt("port", -1) : -1;
             String sig = extras != null ? extras.getString("sig", "") : "";
-            String owner = extras != null ? extras.getString("owner", safePkg) : safePkg;
+            String owner = !safePkg.isEmpty() ? safePkg : (extras != null ? sanitizePackageName(extras.getString("owner", "")) : "");
             String profileId = extras != null ? extras.getString("profileId", "") : "";
             String profileName = extras != null ? extras.getString("profileName", "") : "";
+            String socksUser = extras != null ? extras.getString("socksUser", "") : "";
+            String socksPass = extras != null ? extras.getString("socksPass", "") : "";
             ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE).edit()
                     .putInt("port", port)
                     .putString("sig", sig != null ? sig : "")
                     .putString("owner", owner != null ? owner : "")
                     .putString("profileId", profileId != null ? profileId : "")
                     .putString("profileName", profileName != null ? profileName : "")
+                    .putString("socksUser", socksUser != null ? socksUser : "")
+                    .putString("socksPass", socksPass != null ? socksPass : "")
                     .putLong("updatedAt", System.currentTimeMillis())
                     .commit();
             Bundle out = new Bundle();
@@ -231,9 +247,6 @@ public class KeepaliveStatusProvider extends ContentProvider {
             return out;
         }
         if (METHOD_QUERY_SHARED_TUNNEL.equals(method)) {
-            if (!isTrustedSyncCaller(ctx)) {
-                return null;
-            }
             android.content.SharedPreferences sp = ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
             Bundle out = new Bundle();
             out.putInt("port", sp.getInt("port", -1));
@@ -241,14 +254,13 @@ public class KeepaliveStatusProvider extends ContentProvider {
             out.putString("owner", sp.getString("owner", ""));
             out.putString("profileId", sp.getString("profileId", ""));
             out.putString("profileName", sp.getString("profileName", ""));
+            out.putString("socksUser", sp.getString("socksUser", ""));
+            out.putString("socksPass", sp.getString("socksPass", ""));
             out.putLong("updatedAt", sp.getLong("updatedAt", 0L));
             return out;
         }
         if (METHOD_CLEAR_SHARED_TUNNEL.equals(method)) {
-            if (!isTrustedSyncCaller(ctx)) {
-                return null;
-            }
-            String callerOwner = extras != null ? extras.getString("owner", safePkg) : safePkg;
+            String callerOwner = !safePkg.isEmpty() ? safePkg : (extras != null ? sanitizePackageName(extras.getString("owner", "")) : "");
             android.content.SharedPreferences sp = ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
             String curOwner = sp.getString("owner", "");
             if (curOwner.isEmpty() || curOwner.equals(callerOwner)) {
@@ -256,6 +268,14 @@ public class KeepaliveStatusProvider extends ContentProvider {
             }
             Bundle out = new Bundle();
             out.putBoolean("ok", true);
+            return out;
+        }
+        if (METHOD_START_VOIP_RELAY.equals(method)) {
+            String host = extras != null ? extras.getString(EXTRA_HOST, "") : "";
+            int port = extras != null ? extras.getInt(EXTRA_PORT, -1) : -1;
+            int localPort = WireGuardManager.startLocalVoipEndpointRelay(ctx, host, port);
+            Bundle out = new Bundle();
+            out.putInt(RESULT_LOCAL_PORT, localPort);
             return out;
         }
         if (METHOD_AUTOMATION_STATUS.equals(method)) {
@@ -400,33 +420,139 @@ public class KeepaliveStatusProvider extends ContentProvider {
         return out;
     }
 
+    private static final String CERT_PINS_PREFS = "wg_plus_trusted_caller_certs";
+    // Known official SHA-256 signing certificate digests (lowercase hex, no colons).
+    private static final Set<String> KNOWN_OFFICIAL_CERTS = new HashSet<>(Arrays.asList(
+            // Official Telegram (Play / Direct)
+            "496b68c0f0e38839e141ef48b636260b8215c255a0e7aa80147f9bb2e149c173",
+            // Telegram X (Challegram)
+            "b577c8d6f67d2eb1e837e89695993055fd9b9f5fc47f2a0fa5d9de2fb489a385"
+    ));
+
     private static boolean isPrivilegedCaller() {
         int caller = Binder.getCallingUid();
         return caller == Process.myUid() || caller == 0 || caller == 2000;
     }
 
-    private static boolean isTrustedSyncCaller(Context ctx) {
+    private static String resolveVerifiedCallerPackage(Context ctx, String argHint) {
         if (isPrivilegedCaller()) {
-            return true;
+            return sanitizePackageName(argHint);
         }
         if (ctx == null) {
-            return false;
+            return null;
         }
         try {
-            String[] pkgs = ctx.getPackageManager().getPackagesForUid(Binder.getCallingUid());
-            if (pkgs == null) {
-                return false;
+            PackageManager pm = ctx.getPackageManager();
+            if (pm == null) {
+                return null;
+            }
+            String[] pkgs = pm.getPackagesForUid(Binder.getCallingUid());
+            if (pkgs == null || pkgs.length == 0) {
+                return null;
             }
             for (String p : pkgs) {
-                for (String target : ContinuityBridgeManager.DEFAULT_TARGET_PACKAGES) {
-                    if (target.equals(p)) {
-                        return true;
-                    }
+                if (!isSupportedTelegramPackage(p)) {
+                    continue;
+                }
+                if (verifyPackageSigningTrust(ctx, pm, p)) {
+                    return p;
                 }
             }
         } catch (Throwable ignored) {
         }
+        return null;
+    }
+
+    private static boolean isSupportedTelegramPackage(String pkg) {
+        if (pkg == null || pkg.isEmpty()) {
+            return false;
+        }
+        for (String target : ContinuityBridgeManager.DEFAULT_TARGET_PACKAGES) {
+            if (target.equals(pkg)) {
+                return true;
+            }
+        }
         return false;
+    }
+
+    static boolean verifyPackageSigningTrust(Context ctx, PackageManager pm, String pkg) {
+        if (ctx == null || pm == null || pkg == null || pkg.isEmpty()) {
+            return false;
+        }
+        String certHash = computePrimarySigningCertSha256(pm, pkg);
+        if (certHash.isEmpty()) {
+            return false;
+        }
+        if (KNOWN_OFFICIAL_CERTS.contains(certHash)) {
+            return true;
+        }
+        // Own module signature (self-signed or matched build)
+        String ownCert = computePrimarySigningCertSha256(pm, ctx.getPackageName());
+        if (!ownCert.isEmpty() && ownCert.equals(certHash)) {
+            return true;
+        }
+        // Two-tier TOFU pinning for LSPatch / custom-signed Telegram forks:
+        // package must declare a real launcher activity so empty squatter apps cannot pre-claim a fork package.
+        if (!hasLauncherEntryActivity(pm, pkg)) {
+            return false;
+        }
+        SharedPreferences pins = ctx.getSharedPreferences(CERT_PINS_PREFS, Context.MODE_PRIVATE);
+        String key = "cert_" + pkg;
+        String pinned = pins.getString(key, "");
+        if (pinned == null || pinned.isEmpty()) {
+            pins.edit().putString(key, certHash).apply();
+            return true;
+        }
+        return pinned.equals(certHash);
+    }
+
+    private static boolean hasLauncherEntryActivity(PackageManager pm, String pkg) {
+        try {
+            Intent mainIntent = new Intent(Intent.ACTION_MAIN);
+            mainIntent.addCategory(Intent.CATEGORY_LAUNCHER);
+            mainIntent.setPackage(pkg);
+            List<ResolveInfo> resolved = pm.queryIntentActivities(mainIntent, 0);
+            return resolved != null && !resolved.isEmpty();
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    @SuppressWarnings("deprecation")
+    private static String computePrimarySigningCertSha256(PackageManager pm, String pkg) {
+        try {
+            Signature[] sigs = null;
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                PackageInfo pi = pm.getPackageInfo(pkg, PackageManager.GET_SIGNING_CERTIFICATES);
+                if (pi != null && pi.signingInfo != null) {
+                    SigningInfo si = pi.signingInfo;
+                    sigs = si.hasMultipleSigners()
+                            ? si.getApkContentsSigners()
+                            : si.getSigningCertificateHistory();
+                }
+            } else {
+                PackageInfo pi = pm.getPackageInfo(pkg, PackageManager.GET_SIGNATURES);
+                if (pi != null) {
+                    sigs = pi.signatures;
+                }
+            }
+            if (sigs == null || sigs.length == 0 || sigs[0] == null) {
+                return "";
+            }
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(sigs[0].toByteArray());
+            StringBuilder hex = new StringBuilder(digest.length * 2);
+            for (byte b : digest) {
+                hex.append(String.format(Locale.US, "%02x", b & 0xff));
+            }
+            return hex.toString();
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static boolean isTrustedSyncCaller(Context ctx) {
+        return resolveVerifiedCallerPackage(ctx, "") != null;
     }
 
     private static Bundle toBundle(Context ctx, ContinuityBridgeManager.StealthSnapshot snap) {

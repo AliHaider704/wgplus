@@ -1,0 +1,72 @@
+name: Bug Report
+description: Report a connection, VoIP call, hook, or crash bug on Android or Windows
+title: "[Bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Paste the **Sanitized Diagnostic Report** copied from the WireGuard Plus **Diagnostics** screen below.
+        Private keys, preshared keys, passwords, and server endpoints are stripped automatically.
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Android (Non-Root / LSPatch)
+        - Android (Root / LSPosed / Vector)
+        - Windows Desktop
+    validations:
+      required: true
+
+  - type: dropdown
+    id: category
+    attributes:
+      label: Issue Category
+      options:
+        - Voice / Video Calls ("Exchanging encryption keys" or drops)
+        - Slow / Stuck Connection (requires manual reconnect)
+        - Login / Logged-Out Screen Stuck Loading
+        - Network Transition (Wi-Fi <-> Cellular / Sleep / Doze)
+        - App Crash / ANR / Hook Failure
+        - App Icon / UI / Localization
+        - Security / Process Guard
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Version, Device & Client
+      description: e.g. WireGuard Plus v1.9.0, Galaxy S23 Ultra Android 17, Telegram Plus / Nagram 13.2.2, or Windows 11 + Telegram Desktop
+      placeholder: "WireGuard Plus v1.9.0 | Device / OS | Client"
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: What happened & steps to reproduce
+      placeholder: |
+        1. ...
+        2. ...
+        3. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized Diagnostic Bundle (from Diagnostics -> Copy Report)
+      description: Paste the Markdown diagnostic output directly here. Do NOT paste raw WireGuard configs or PrivateKey lines.
+      render: markdown
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Confirmation
+      options:
+        - label: I verified that no PrivateKey, PresharedKey, or password is included in the pasted text.
+          required: true

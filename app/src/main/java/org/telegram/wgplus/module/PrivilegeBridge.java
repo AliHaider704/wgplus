@@ -437,12 +437,29 @@ public final class PrivilegeBridge {
                 + " </dev/null >/dev/null 2>&1 &";
     }
 
+    private static volatile int sDaemonFailCount = 0;
+
+    public static void resetDaemonBootstrapBackoff() {
+        sDaemonFailCount = 0;
+        sLastDaemonLaunchMs = 0L;
+    }
+
     public static void bootstrapStandaloneDaemonAsync(Context context, List<String> targets) {
         if (context == null) {
             return;
         }
         long now = System.currentTimeMillis();
-        if (now - sLastDaemonLaunchMs < 20000L) {
+        long backoffMs;
+        if (sDaemonFailCount <= 0) {
+            backoffMs = 20_000L;
+        } else if (sDaemonFailCount == 1) {
+            backoffMs = 120_000L;
+        } else if (sDaemonFailCount == 2) {
+            backoffMs = 600_000L;
+        } else {
+            backoffMs = 1_800_000L;
+        }
+        if (now - sLastDaemonLaunchMs < backoffMs) {
             return;
         }
         sLastDaemonLaunchMs = now;
@@ -450,15 +467,23 @@ public final class PrivilegeBridge {
         DAEMON_EXEC.execute(() -> {
             try {
                 if (isStandaloneDaemonAlive(appCtx)) {
+                    sDaemonFailCount = 0;
                     return;
                 }
                 if (BuiltinAdbKeyManager.isPaired(appCtx)) {
-                    WgAdbConnectionManager.getInstance(appCtx).bootstrapSovereignShell(true);
+                    boolean ok = WgAdbConnectionManager.getInstance(appCtx).bootstrapSovereignShell(true);
+                    if (ok) {
+                        sDaemonFailCount = 0;
+                    } else {
+                        sDaemonFailCount = Math.min(4, sDaemonFailCount + 1);
+                    }
                     return;
                 }
                 String listenerComp = appCtx.getPackageName() + "/" + KeepaliveBridgeListenerService.class.getName();
-                bootstrapRootOncePerBoot(appCtx, targets, listenerComp, true);
+                boolean ok = bootstrapRootOncePerBoot(appCtx, targets, listenerComp, true);
+                sDaemonFailCount = ok ? 0 : Math.min(4, sDaemonFailCount + 1);
             } catch (Throwable ignored) {
+                sDaemonFailCount = Math.min(4, sDaemonFailCount + 1);
             }
         });
     }
@@ -741,10 +766,14 @@ public final class PrivilegeBridge {
                         4000
                 );
             } else if (BuiltinAdbKeyManager.isPaired(appCtx)) {
-                res = WgAdbConnectionManager.getInstance(appCtx).runShellCommand(
-                        "/system/bin/env CLASSPATH=" + apkPath + " /system/bin/app_process /system/bin " + DaemonProcessHelper.class.getName(),
-                        4000
-                );
+                // Only probe ADB synchronously if an ADB connection is already live; otherwise never block Binder IPC for 7.6s.
+                WgAdbConnectionManager mgr = WgAdbConnectionManager.getInstance(appCtx);
+                if (mgr.isConnected()) {
+                    res = mgr.runShellCommand(
+                            "/system/bin/env CLASSPATH=" + apkPath + " /system/bin/app_process /system/bin " + DaemonProcessHelper.class.getName(),
+                            4000
+                    );
+                }
             }
             if (res != null) {
                 String out = res.output;

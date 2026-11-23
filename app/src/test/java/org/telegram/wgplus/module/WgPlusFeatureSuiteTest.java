@@ -450,7 +450,7 @@ public class WgPlusFeatureSuiteTest {
 
     @Test
     public void testHybridContinuityTierResolutionAndVersionLabel() {
-        assertEquals("1.7.3", WgStrings.VERSION_LABEL);
+        assertEquals("1.9.0", WgStrings.VERSION_LABEL);
 
         assertEquals(
                 ContinuityBridgeManager.ContinuityTier.HYBRID_FULL,
@@ -657,7 +657,77 @@ public class WgPlusFeatureSuiteTest {
             assertFalse(WgStrings.cleanCacheBtn(ar, true).isEmpty());
             assertFalse(WgStrings.toastCacheCleaned(ar, 1024L * 1024L, 5).isEmpty());
             assertFalse(WgStrings.toastCacheCleaned(ar, 0L, 0).isEmpty());
+            assertFalse(WgStrings.diagnosticsBtn(ar).isEmpty());
+            assertFalse(WgStrings.diagnosticsGithubBtn(ar).isEmpty());
+            assertFalse(WgStrings.officialChannelBtn(ar).isEmpty());
+            assertTrue(WgStrings.officialChannelBtn(ar).contains("@wgplus_official"));
+            assertFalse(WgStrings.backupPassphraseTitle(ar, true).isEmpty());
+            assertFalse(WgStrings.backupPassphraseTitle(ar, false).isEmpty());
         }
+    }
+
+    @Test
+    public void testSocks5ClientAuthNoAuthAndRfc1929() throws Exception {
+        // 1. No-auth handshake
+        java.io.ByteArrayOutputStream noAuthOut = new java.io.ByteArrayOutputStream();
+        java.io.DataInputStream noAuthIn = new java.io.DataInputStream(
+                new java.io.ByteArrayInputStream(new byte[]{0x05, 0x00})
+        );
+        WireGuardManager.performSocks5ClientAuth(noAuthOut, noAuthIn, "", "");
+        org.junit.Assert.assertArrayEquals(new byte[]{0x05, 0x01, 0x00}, noAuthOut.toByteArray());
+
+        // 2. RFC 1929 username/password handshake
+        java.io.ByteArrayOutputStream authOut = new java.io.ByteArrayOutputStream();
+        java.io.DataInputStream authIn = new java.io.DataInputStream(
+                new java.io.ByteArrayInputStream(new byte[]{0x05, 0x02, 0x01, 0x00})
+        );
+        WireGuardManager.performSocks5ClientAuth(authOut, authIn, "wg", "pass123");
+        org.junit.Assert.assertArrayEquals(
+                new byte[]{0x05, 0x02, 0x00, 0x02, 0x01, 0x02, 'w', 'g', 0x07, 'p', 'a', 's', 's', '1', '2', '3'},
+                authOut.toByteArray()
+        );
+
+        // 3. Server rejects wrong credentials (0x01, 0x01)
+        try {
+            java.io.DataInputStream badIn = new java.io.DataInputStream(
+                    new java.io.ByteArrayInputStream(new byte[]{0x05, 0x02, 0x01, 0x01})
+            );
+            WireGuardManager.performSocks5ClientAuth(new java.io.ByteArrayOutputStream(), badIn, "wg", "wrong");
+            fail("expected SOCKS5 auth failure");
+        } catch (IllegalStateException expected) {
+            assertTrue(expected.getMessage().contains("SOCKS5 auth failed"));
+        }
+    }
+
+    @Test
+    public void testPatchVoipConfigJsonForProxy() throws Exception {
+        String sample = "{\"enable_vp8_encoder\":true,\"force_tcp\":false,\"use_tcp\":false,\"audio_frame_size\":60}";
+        String patched = WireGuardManager.patchVoipConfigJsonForProxy(sample);
+        assertNotNull(patched);
+        org.json.JSONObject obj = new org.json.JSONObject(patched);
+        assertTrue(obj.getBoolean("force_tcp"));
+        assertTrue(obj.getBoolean("use_tcp"));
+        assertTrue(obj.getBoolean("enable_vp8_encoder"));
+        assertEquals(60, obj.getInt("audio_frame_size"));
+        assertEquals("plain", WireGuardManager.patchVoipConfigJsonForProxy("plain"));
+    }
+
+    @Test
+    public void testKeystoreNoPlaintextFallbackAndDiagnosticsRedaction() {
+        // Even in headless JVM (no AndroidKeyStore provider), WgKeystoreCrypto.encrypt MUST NOT return plaintext.
+        String enc = WgKeystoreCrypto.encrypt(SAMPLE_PRIV_B64);
+        assertFalse("encrypt() must never return raw plaintext", SAMPLE_PRIV_B64.equals(enc));
+        assertTrue("encrypted value must carry enc:v1 or enc:v2 prefix", WgKeystoreCrypto.isEncryptedValue(enc));
+        assertEquals(SAMPLE_PRIV_B64, WgKeystoreCrypto.decrypt(enc));
+
+        String raw = "PrivateKey=" + SAMPLE_PRIV_B64 + " PresharedKey=" + SAMPLE_PSK_B64
+                + " endpoint=198.51.100.42:51820 pass=mySecret123";
+        String sanitized = WgDiagnosticsLog.sanitize(raw);
+        assertFalse("PrivateKey leaked in diagnostic sanitizer", sanitized.contains(SAMPLE_PRIV_B64));
+        assertFalse("PresharedKey leaked in diagnostic sanitizer", sanitized.contains(SAMPLE_PSK_B64));
+        assertFalse("Endpoint leaked in diagnostic sanitizer", sanitized.contains("198.51.100.42:51820"));
+        assertFalse("Password leaked in diagnostic sanitizer", sanitized.contains("mySecret123"));
+        assertTrue(sanitized.contains("[REDACTED]") || sanitized.contains("[KEY_REDACTED]"));
     }
 
     private static double contrastRatio(int rgb1, int rgb2) {

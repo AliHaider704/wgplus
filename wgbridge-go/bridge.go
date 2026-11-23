@@ -58,10 +58,12 @@ var (
 	muxNotifyCh              chan struct{}
 	preferredMuxPorts        = []int{48729, 48730, 48731, 48732, 0}
 	preferredMuxPortOverride int
+	recoveryEpoch            atomic.Int64
 
-	socksAuthMu   sync.RWMutex
-	socksAuthUser string
-	socksAuthPass string
+	socksAuthMu           sync.RWMutex
+	socksAuthUser         string
+	socksAuthPass         string
+	lastSocksAuthDiagNano atomic.Int64
 
 	tcpCopyBufPool = sync.Pool{
 		New: func() any {
@@ -371,7 +373,16 @@ func hopActivePeer(hopPort bool, forcePeerReset bool) bool {
 	}
 
 	triggerPeerHandshakeDirect(dev, params.pubHex, !forcePeerReset)
+	recoveryEpoch.Add(1)
+	if forcePeerReset {
+		RecordDiag("TUNNEL", "REBIND", fmt.Sprintf("peer reset hopPort=%v", hopPort))
+	}
 	return true
+}
+
+// GetRecoveryEpoch returns a monotonically increasing counter incremented on each tunnel rebind/hop.
+func GetRecoveryEpoch() int64 {
+	return recoveryEpoch.Load()
 }
 
 func readActiveTotals(dev *device.Device) (rx uint64, tx uint64, hsSec int64) {
@@ -677,11 +688,18 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 			continue
 		}
 
-		// Case B: Significant outbound payload (>= 256B, ignoring small keepalives) with zero
-		// inbound RX across 2 consecutive 3s intervals (6s) OR expired handshake (>220s) with no RX.
-		if (txDelta >= 256 && rx == lastRx) || (hsAge > 220 && txDelta >= 128 && rx == lastRx) {
+		// Case B: Outbound payload with zero inbound RX across 2 consecutive 3s intervals (6s).
+		// Lower threshold (64B) when active TCP/UDP flows exist so small TCP retransmissions and
+		// VoIP STUN/DTLS retries are caught in 6s instead of waiting 220s.
+		hasActiveFlows := activeTcpConns.Load() > 0 || activeUdpAssocs.Load() > 0
+		stalled := (txDelta >= 256 && rx == lastRx) ||
+			(hasActiveFlows && txDelta >= 64 && rx == lastRx) ||
+			(hsAge > 220 && txDelta >= 64 && rx == lastRx)
+		if stalled {
 			stalledTicks++
 			if stalledTicks >= 2 && canHardHop {
+				watchdogRecoveries.Add(1)
+				RecordDiag("WATCHDOG", "STALL_HOP", fmt.Sprintf("txDelta=%d hsAge=%d flows=%v", txDelta, hsAge, hasActiveFlows))
 				hopActivePeer(true, true)
 				lastHardHopAt = time.Now()
 				stalledTicks = 0
@@ -795,9 +813,9 @@ func ForceRebindAndHandshake() bool {
 	return waitForHandshakeQuick(dev, 1000*time.Millisecond)
 }
 
-// EnsureTunnelAlive verifies the active tunnel is genuinely responsive;
-// if handshake is older than 15s (e.g. after Doze/notification wakeup) it nudges a soft handshake first,
-// and if stale or unresponsive it performs a fresh port hop + immediate re-handshake within timeoutMs.
+// EnsureTunnelAlive verifies the active tunnel is genuinely responsive without disturbing
+// healthy WireGuard sessions (RekeyAfterTime=120s). Only if the handshake is missing or >=120s old
+// does it attempt a non-disruptive soft handshake first, escalating to a port hop on actual failure.
 func EnsureTunnelAlive(timeoutMs int) bool {
 	mu.Lock()
 	dev := activeDev
@@ -809,31 +827,30 @@ func EnsureTunnelAlive(timeoutMs int) bool {
 		return false
 	}
 
-	_, _, hsSec := readDeviceCounters(dev)
+	prevRx, _, hsSec := readDeviceCounters(dev)
 	nowSec := time.Now().Unix()
-	if hsSec > 0 && (nowSec-hsSec) < 15 {
+	if hsSec > 0 && (nowSec-hsSec) < 120 {
 		return true
 	}
 
 	if timeoutMs <= 0 {
-		timeoutMs = 1200
+		timeoutMs = 1500
 	}
 	if timeoutMs > 5000 {
 		timeoutMs = 5000
 	}
 
-	// If handshake is 15s..120s old, try a fast non-disruptive soft handshake first to confirm the UDP path is alive
-	if hsSec > 0 && (nowSec-hsSec) < 120 && pubHex != "" {
+	if hsSec > 0 && pubHex != "" {
 		prevHs := hsSec
 		triggerPeerHandshakeDirect(dev, pubHex, true)
-		probeWait := time.Duration(timeoutMs/3) * time.Millisecond
-		if probeWait > 450*time.Millisecond {
-			probeWait = 450 * time.Millisecond
+		probeWait := time.Duration(timeoutMs) * time.Millisecond
+		if probeWait > 1500*time.Millisecond {
+			probeWait = 1500 * time.Millisecond
 		}
 		deadline := time.Now().Add(probeWait)
 		for time.Now().Before(deadline) {
-			_, _, curHs := readDeviceCounters(dev)
-			if curHs > prevHs {
+			curRx, _, curHs := readDeviceCounters(dev)
+			if curHs > prevHs || curRx > prevRx {
 				return true
 			}
 			if muxDeviceClosedOrReplaced(dev) {
@@ -843,10 +860,14 @@ func EnsureTunnelAlive(timeoutMs int) bool {
 		}
 	}
 
+	RecordDiag("TUNNEL", "ENSURE_HOP", fmt.Sprintf("hsSec=%d timeoutMs=%d", hsSec, timeoutMs))
 	if !hopActivePeer(true, true) {
 		return false
 	}
 	half := time.Duration(timeoutMs/2) * time.Millisecond
+	if half < 350*time.Millisecond {
+		half = 350 * time.Millisecond
+	}
 	if waitForHandshakeQuick(dev, half) {
 		return true
 	}
@@ -897,8 +918,9 @@ func GetTunnelStats() string {
 // unless KillSwitchGuard is currently protecting outbound traffic.
 func StopTunnel() {
 	mu.Lock()
-	defer mu.Unlock()
 	stopLocked()
+	mu.Unlock()
+	StopAllVoipRelays()
 }
 
 func stopTunnelOnlyLocked() {
@@ -1078,6 +1100,14 @@ func awaitInitialHandshakeBeforeDial(ctx context.Context) {
 	}
 }
 
+func recordSocksAuthReject(reason string) {
+	nowNano := time.Now().UnixNano()
+	prev := lastSocksAuthDiagNano.Load()
+	if nowNano-prev > int64(3*time.Second) && lastSocksAuthDiagNano.CompareAndSwap(prev, nowNano) {
+		RecordDiag("SOCKS_AUTH", "REJECT", reason)
+	}
+}
+
 func readSocks5HandshakeAndReq(client net.Conn) (cmd byte, host string, dstPort uint16, reqParsed bool) {
 	// 1. Greeting: VER, NMETHODS, METHODS...
 	hdr := make([]byte, 2)
@@ -1112,6 +1142,7 @@ func readSocks5HandshakeAndReq(client net.Conn) (cmd byte, host string, dstPort 
 		}
 		if !hasUserPass {
 			_, _ = client.Write([]byte{0x05, 0xFF})
+			recordSocksAuthReject("client omitted user/pass method 0x02")
 			return 0, "", 0, false
 		}
 		if _, err := client.Write([]byte{0x05, 0x02}); err != nil {
@@ -1121,24 +1152,28 @@ func readSocks5HandshakeAndReq(client net.Conn) (cmd byte, host string, dstPort 
 		var subHdr [2]byte
 		if _, err := io.ReadFull(client, subHdr[:]); err != nil || subHdr[0] != 0x01 {
 			_, _ = client.Write([]byte{0x01, 0x01})
+			recordSocksAuthReject("invalid rfc1929 subnegotiation header")
 			return 0, "", 0, false
 		}
 		uBuf := make([]byte, int(subHdr[1]))
 		if len(uBuf) > 0 {
 			if _, err := io.ReadFull(client, uBuf); err != nil {
 				_, _ = client.Write([]byte{0x01, 0x01})
+				recordSocksAuthReject("truncated rfc1929 username")
 				return 0, "", 0, false
 			}
 		}
 		var pLen [1]byte
 		if _, err := io.ReadFull(client, pLen[:]); err != nil {
 			_, _ = client.Write([]byte{0x01, 0x01})
+			recordSocksAuthReject("missing rfc1929 password length")
 			return 0, "", 0, false
 		}
 		pBuf := make([]byte, int(pLen[0]))
 		if len(pBuf) > 0 {
 			if _, err := io.ReadFull(client, pBuf); err != nil {
 				_, _ = client.Write([]byte{0x01, 0x01})
+				recordSocksAuthReject("truncated rfc1929 password")
 				return 0, "", 0, false
 			}
 		}
@@ -1146,6 +1181,7 @@ func readSocks5HandshakeAndReq(client net.Conn) (cmd byte, host string, dstPort 
 		pOk := subtle.ConstantTimeCompare(pBuf, []byte(expectedPass))
 		if (uOk & pOk) != 1 {
 			_, _ = client.Write([]byte{0x01, 0x01})
+			recordSocksAuthReject("username/password mismatch")
 			return 0, "", 0, false
 		}
 		if _, err := client.Write([]byte{0x01, 0x00}); err != nil {
@@ -1278,6 +1314,16 @@ func handleTcpConnect(ctx context.Context, client net.Conn, dialer udpDialer, ho
 }
 
 func handleTcpConnectTracked(ctx context.Context, client net.Conn, dialer udpDialer, host string, dstPort uint16, clientLabel string) {
+	// Fast-fail IPv6 literal dials when the tunnel has no IPv6 or IPv6 is blocked so clients
+	// (especially logged-out Telegram tgnet) immediately fall back to IPv4 DCs in <1ms.
+	if ip, pErr := netip.ParseAddr(host); pErr == nil && ip.Unmap().Is6() {
+		if fnet, ok := dialer.(*fastNet); ok && !fnet.SupportsIPv6() {
+			udpIpv6DialFastFails.Add(1)
+			_, _ = client.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+			return
+		}
+	}
+
 	awaitInitialHandshakeBeforeDial(ctx)
 
 	targetAddr := net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
@@ -1286,7 +1332,14 @@ func handleTcpConnectTracked(ctx context.Context, client net.Conn, dialer udpDia
 	remote, err := dialer.DialContext(dialCtx, "tcp", targetAddr)
 	cancel()
 	if err != nil {
-		_, _ = client.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		var repCode byte = 0x04
+		errStr := strings.ToLower(err.Error())
+		if strings.Contains(errStr, "ipv6 blocked") || strings.Contains(errStr, "no route") || strings.Contains(errStr, "network") {
+			repCode = 0x03
+		} else if strings.Contains(errStr, "refused") {
+			repCode = 0x05
+		}
+		_, _ = client.Write([]byte{0x05, repCode, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 	defer remote.Close()
@@ -1303,6 +1356,10 @@ func handleTcpConnectTracked(ctx context.Context, client net.Conn, dialer udpDia
 	statEnt := trackClientConnStart(clientLabel)
 	defer trackClientConnEnd(statEnt)
 
+	relayTcpBidirectional(ctx, client, remote, statEnt)
+}
+
+func relayTcpBidirectional(ctx context.Context, client, remote net.Conn, statEnt *clientStatEntry) {
 	stopDone := make(chan struct{})
 	defer close(stopDone)
 	go func() {
@@ -1328,29 +1385,52 @@ func handleTcpConnectTracked(ctx context.Context, client net.Conn, dialer udpDia
 	<-done
 }
 
-type udpRemoteSession struct {
-	remoteConn net.Conn
-	replyHdr   []byte
-	clientAddr atomic.Value // stores *net.UDPAddr
+type udpClientSession struct {
+	key        string
+	clientAddr *net.UDPAddr
+	v4Conn     net.PacketConn
+	v6Conn     net.PacketConn
+	lastActive atomic.Int64 // UnixNano
+	closeOnce  sync.Once
 }
 
-func parseSocks5UdpDatagram(pkt []byte) (targetAddr string, replyHdr []byte, payload []byte, err error) {
+func (s *udpClientSession) close() {
+	s.closeOnce.Do(func() {
+		if s.v4Conn != nil {
+			_ = s.v4Conn.Close()
+		}
+		if s.v6Conn != nil {
+			_ = s.v6Conn.Close()
+		}
+	})
+}
+
+type udpGuardDecision struct {
+	allowed     bool
+	expiresNano int64
+}
+
+type udpDnsCacheEntry struct {
+	ip          netip.Addr
+	expiresNano int64
+}
+
+func parseSocks5UdpDatagram(pkt []byte) (host string, dstPort uint16, payload []byte, err error) {
 	if len(pkt) < 10 {
-		return "", nil, nil, errors.New("short SOCKS5 UDP packet")
+		return "", 0, nil, errors.New("short SOCKS5 UDP packet")
 	}
 	// RSV must be 0x0000 and FRAG must be 0x00 (RFC 1928 Section 7)
 	if pkt[2] != 0x00 {
-		return "", nil, nil, errors.New("fragmented SOCKS5 UDP not supported")
+		return "", 0, nil, errors.New("fragmented SOCKS5 UDP not supported")
 	}
 
 	atyp := pkt[3]
-	var host string
 	var hdrEnd int
 
 	switch atyp {
 	case 0x01: // IPv4: 4 + 4 + 2 = 10
 		if len(pkt) < 10 {
-			return "", nil, nil, errors.New("truncated IPv4 UDP header")
+			return "", 0, nil, errors.New("truncated IPv4 UDP header")
 		}
 		host = net.IP(pkt[4:8]).String()
 		hdrEnd = 10
@@ -1358,29 +1438,122 @@ func parseSocks5UdpDatagram(pkt []byte) (targetAddr string, replyHdr []byte, pay
 		domLen := int(pkt[4])
 		hdrEnd = 4 + 1 + domLen + 2
 		if domLen == 0 || len(pkt) < hdrEnd {
-			return "", nil, nil, errors.New("truncated domain UDP header")
+			return "", 0, nil, errors.New("truncated domain UDP header")
 		}
 		host = string(pkt[5 : 5+domLen])
 	case 0x04: // IPv6: 4 + 16 + 2 = 22
 		if len(pkt) < 22 {
-			return "", nil, nil, errors.New("truncated IPv6 UDP header")
+			return "", 0, nil, errors.New("truncated IPv6 UDP header")
 		}
 		host = net.IP(pkt[4:20]).String()
 		hdrEnd = 22
 	default:
-		return "", nil, nil, errors.New("unsupported UDP ATYP")
+		return "", 0, nil, errors.New("unsupported UDP ATYP")
 	}
 
-	dstPort := binary.BigEndian.Uint16(pkt[hdrEnd-2 : hdrEnd])
-	targetAddr = net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
+	dstPort = binary.BigEndian.Uint16(pkt[hdrEnd-2 : hdrEnd])
+	return host, dstPort, pkt[hdrEnd:], nil
+}
 
-	hdrCopy := make([]byte, hdrEnd)
-	hdrCopy[0] = 0x00
-	hdrCopy[1] = 0x00
-	hdrCopy[2] = 0x00
-	copy(hdrCopy[3:], pkt[3:hdrEnd])
+func encodeSocks5UdpReplyHeader(dst []byte, remoteAddr net.Addr) int {
+	udpAddr, ok := remoteAddr.(*net.UDPAddr)
+	if !ok || udpAddr == nil {
+		return 0
+	}
+	dst[0] = 0x00
+	dst[1] = 0x00
+	dst[2] = 0x00
+	if ip4 := udpAddr.IP.To4(); ip4 != nil {
+		dst[3] = 0x01
+		copy(dst[4:8], ip4)
+		binary.BigEndian.PutUint16(dst[8:10], uint16(udpAddr.Port))
+		return 10
+	}
+	if ip16 := udpAddr.IP.To16(); ip16 != nil {
+		dst[3] = 0x04
+		copy(dst[4:20], ip16)
+		binary.BigEndian.PutUint16(dst[20:22], uint16(udpAddr.Port))
+		return 22
+	}
+	return 0
+}
 
-	return targetAddr, hdrCopy, pkt[hdrEnd:], nil
+func resolveUdpTargetIP(
+	ctx context.Context,
+	dialer udpDialer,
+	host string,
+	dnsCache map[string]udpDnsCacheEntry,
+	dnsMu *sync.Mutex,
+) (netip.Addr, error) {
+	if directIP, err := netip.ParseAddr(host); err == nil {
+		unmapped := directIP.Unmap()
+		if fnet, ok := dialer.(*fastNet); ok && unmapped.Is6() && !fnet.SupportsIPv6() {
+			return netip.Addr{}, errors.New("IPv6 unavailable or blocked")
+		}
+		return unmapped, nil
+	}
+
+	nowNano := time.Now().UnixNano()
+	dnsMu.Lock()
+	ent, ok := dnsCache[host]
+	dnsMu.Unlock()
+	if ok && nowNano < ent.expiresNano {
+		return ent.ip, nil
+	}
+
+	rCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+
+	var chosen netip.Addr
+	if fnet, ok := dialer.(*fastNet); ok {
+		addrs, err := fnet.ResolveUDPTarget(rCtx, host, fnet.SupportsIPv6())
+		if err != nil || len(addrs) == 0 {
+			if err == nil {
+				err = errors.New("no UDP target IP")
+			}
+			return netip.Addr{}, err
+		}
+		chosen = addrs[0]
+		for _, a := range addrs {
+			if a.Is4() {
+				chosen = a
+				break
+			}
+		}
+	} else {
+		ips, err := net.DefaultResolver.LookupNetIP(rCtx, "ip4", host)
+		if err != nil || len(ips) == 0 {
+			ips, err = net.DefaultResolver.LookupNetIP(rCtx, "ip", host)
+		}
+		if err != nil || len(ips) == 0 {
+			if err == nil {
+				err = errors.New("no UDP target IP")
+			}
+			return netip.Addr{}, err
+		}
+		chosen = ips[0].Unmap()
+	}
+
+	dnsMu.Lock()
+	if len(dnsCache) > 256 {
+		clear(dnsCache)
+	}
+	dnsCache[host] = udpDnsCacheEntry{
+		ip:          chosen,
+		expiresNano: time.Now().Add(30 * time.Second).UnixNano(),
+	}
+	dnsMu.Unlock()
+	return chosen, nil
+}
+
+func openFullConePacketConn(dialer udpDialer, isV6 bool) (net.PacketConn, error) {
+	if fnet, ok := dialer.(*fastNet); ok {
+		return fnet.DialUDPUnconnected(isV6)
+	}
+	if isV6 {
+		return net.ListenPacket("udp6", "[::]:0")
+	}
+	return net.ListenPacket("udp4", "0.0.0.0:0")
 }
 
 func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDialer) {
@@ -1414,6 +1587,9 @@ func handleUdpAssociateTracked(ctx context.Context, tcpControl net.Conn, dialer 
 		return
 	}
 
+	RecordDiag("UDP_ASSOC", "OPEN", fmt.Sprintf("label=%s relayPort=%d", clientLabel, relayPort))
+	defer RecordDiag("UDP_ASSOC", "CLOSE", fmt.Sprintf("label=%s relayPort=%d", clientLabel, relayPort))
+
 	activeUdpAssocs.Add(1)
 	defer activeUdpAssocs.Add(-1)
 	statEnt := trackClientConnStart(clientLabel)
@@ -1422,7 +1598,11 @@ func handleUdpAssociateTracked(ctx context.Context, tcpControl net.Conn, dialer 
 	sessionsCap := activeMaxUdpSessionsCap()
 	assocCtx, assocCancel := context.WithCancel(ctx)
 	var sessMu sync.RWMutex
-	sessions := make(map[string]*udpRemoteSession)
+	sessions := make(map[string]*udpClientSession)
+	var dnsMu sync.Mutex
+	dnsCache := make(map[string]udpDnsCacheEntry)
+	guardCache := make(map[int]udpGuardDecision)
+	var lastGuardDiagNano atomic.Int64
 
 	cleanupAll := func() {
 		assocCancel()
@@ -1430,7 +1610,7 @@ func handleUdpAssociateTracked(ctx context.Context, tcpControl net.Conn, dialer 
 		_ = tcpControl.Close()
 		sessMu.Lock()
 		for k, s := range sessions {
-			_ = s.remoteConn.Close()
+			s.close()
 			delete(sessions, k)
 		}
 		sessMu.Unlock()
@@ -1444,7 +1624,58 @@ func handleUdpAssociateTracked(ctx context.Context, tcpControl net.Conn, dialer 
 		_ = tcpControl.Close()
 	}()
 
-	// Pump local UDP frames from tgcalls into WireGuard netstack UDP sockets
+	// Reap idle local client UDP sockets so long-lived associations never leak or exhaust sessionsCap
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-assocCtx.Done():
+				return
+			case <-ticker.C:
+			}
+			cutoff := time.Now().Add(-120 * time.Second).UnixNano()
+			sessMu.Lock()
+			for k, s := range sessions {
+				if s.lastActive.Load() < cutoff {
+					s.close()
+					delete(sessions, k)
+				}
+			}
+			sessMu.Unlock()
+		}
+	}()
+
+	startReturnPump := func(s *udpClientSession, pConn net.PacketConn) {
+		go func() {
+			rBufPtr := udpFrameBufPool.Get().(*[]byte)
+			defer udpFrameBufPool.Put(rBufPtr)
+			respBuf := *rBufPtr
+
+			outBufPtr := udpFrameBufPool.Get().(*[]byte)
+			defer udpFrameBufPool.Put(outBufPtr)
+			outPkt := *outBufPtr
+
+			for {
+				rn, rAddr, readErr := pConn.ReadFrom(respBuf)
+				if readErr != nil {
+					return
+				}
+				hdrLen := encodeSocks5UdpReplyHeader(outPkt, rAddr)
+				if hdrLen == 0 || hdrLen+rn > len(outPkt) {
+					continue
+				}
+				copy(outPkt[hdrLen:hdrLen+rn], respBuf[:rn])
+				if _, wErr := udpLn.WriteToUDP(outPkt[:hdrLen+rn], s.clientAddr); wErr == nil {
+					s.lastActive.Store(time.Now().UnixNano())
+					udpPacketsRx.Add(1)
+					recordClientRx(statEnt, rn)
+				}
+			}
+		}()
+	}
+
+	// Pump local UDP frames from tgcalls into unconnected Full-Cone gVisor PacketConn sockets
 	go func() {
 		bufPtr := udpFrameBufPool.Get().(*[]byte)
 		defer udpFrameBufPool.Put(bufPtr)
@@ -1458,90 +1689,133 @@ func handleUdpAssociateTracked(ctx context.Context, tcpControl net.Conn, dialer 
 			if srcAddr == nil || !srcAddr.IP.IsLoopback() {
 				continue
 			}
-			if !invokeUdpPeerGuard(srcAddr, clientLabel) {
+
+			nowNano := time.Now().UnixNano()
+			dec, hasDec := guardCache[srcAddr.Port]
+			if !hasDec || nowNano >= dec.expiresNano {
+				allowed := invokeUdpPeerGuard(srcAddr, clientLabel)
+				dec = udpGuardDecision{
+					allowed:     allowed,
+					expiresNano: nowNano + int64(10*time.Second),
+				}
+				if len(guardCache) > 256 {
+					clear(guardCache)
+				}
+				guardCache[srcAddr.Port] = dec
+			}
+			if !dec.allowed {
 				blockedLocalAttempts.Add(1)
+				udpGuardDrops.Add(1)
+				prevDiag := lastGuardDiagNano.Load()
+				if nowNano-prevDiag > int64(5*time.Second) && lastGuardDiagNano.CompareAndSwap(prevDiag, nowNano) {
+					RecordDiag("UDP_GUARD", "DROP", fmt.Sprintf("blocked udp port=%d label=%s", srcAddr.Port, clientLabel))
+				}
 				continue
 			}
 
-			targetAddr, replyHdr, payload, pErr := parseSocks5UdpDatagram(buf[:n])
+			host, dstPort, payload, pErr := parseSocks5UdpDatagram(buf[:n])
 			if pErr != nil || len(payload) == 0 {
 				continue
 			}
 
-			// Fast read-lock lookup for existing RTP media stream
+			clientKey := srcAddr.String()
 			sessMu.RLock()
-			sess, exists := sessions[targetAddr]
+			sess, exists := sessions[clientKey]
 			sessMu.RUnlock()
 
-			if exists {
-				sess.clientAddr.Store(srcAddr)
-				if nw, wErr := sess.remoteConn.Write(payload); wErr == nil {
-					recordClientTx(statEnt, nw)
-				}
-				continue
-			}
-
-			// Slow path: new UDP target session
-			sessMu.Lock()
-			sess, exists = sessions[targetAddr]
 			if !exists {
-				if len(sessions) >= sessionsCap {
-					sessMu.Unlock()
-					continue
-				}
-				dialCtx, cancel := context.WithTimeout(assocCtx, 5*time.Second)
-				rConn, dErr := dialer.DialContext(dialCtx, "udp", targetAddr)
-				cancel()
-				if dErr != nil {
-					sessMu.Unlock()
-					continue
-				}
-				sess = &udpRemoteSession{
-					remoteConn: rConn,
-					replyHdr:   replyHdr,
-				}
-				sess.clientAddr.Store(srcAddr)
-				sessions[targetAddr] = sess
-				sessMu.Unlock()
-
-				// Pump return UDP packets from WireGuard netstack back to local client with RFC 1928 UDP header
-				go func(key string, s *udpRemoteSession) {
-					rBufPtr := udpFrameBufPool.Get().(*[]byte)
-					defer udpFrameBufPool.Put(rBufPtr)
-					respBuf := *rBufPtr
-
-					outBufPtr := udpFrameBufPool.Get().(*[]byte)
-					defer udpFrameBufPool.Put(outBufPtr)
-					outPkt := *outBufPtr
-
-					hdrLen := len(s.replyHdr)
-					copy(outPkt[:hdrLen], s.replyHdr)
-
-					for {
-						rn, readErr := s.remoteConn.Read(respBuf)
-						if readErr != nil {
-							sessMu.Lock()
-							delete(sessions, key)
-							sessMu.Unlock()
-							_ = s.remoteConn.Close()
-							return
-						}
-						cAddrAny := s.clientAddr.Load()
-						if cAddr, ok := cAddrAny.(*net.UDPAddr); ok && cAddr != nil && hdrLen+rn <= len(outPkt) {
-							copy(outPkt[hdrLen:hdrLen+rn], respBuf[:rn])
-							if _, wErr := udpLn.WriteToUDP(outPkt[:hdrLen+rn], cAddr); wErr == nil {
-								recordClientRx(statEnt, rn)
+				sessMu.Lock()
+				sess, exists = sessions[clientKey]
+				if !exists {
+					if len(sessions) >= sessionsCap {
+						var oldestKey string
+						var oldestTs int64 = nowNano
+						for k, cand := range sessions {
+							ts := cand.lastActive.Load()
+							if oldestKey == "" || ts < oldestTs {
+								oldestKey = k
+								oldestTs = ts
 							}
 						}
+						if oldestKey != "" {
+							sessions[oldestKey].close()
+							delete(sessions, oldestKey)
+						}
 					}
-				}(targetAddr, sess)
-			} else {
-				sess.clientAddr.Store(srcAddr)
+					clientCopy := &net.UDPAddr{
+						IP:   append([]byte(nil), srcAddr.IP...),
+						Port: srcAddr.Port,
+						Zone: srcAddr.Zone,
+					}
+					sess = &udpClientSession{
+						key:        clientKey,
+						clientAddr: clientCopy,
+					}
+					sess.lastActive.Store(nowNano)
+					sessions[clientKey] = sess
+				}
 				sessMu.Unlock()
 			}
+			sess.lastActive.Store(nowNano)
 
-			if nw, wErr := sess.remoteConn.Write(payload); wErr == nil {
+			targetIP, rErr := resolveUdpTargetIP(assocCtx, dialer, host, dnsCache, &dnsMu)
+			if rErr != nil {
+				continue
+			}
+			isV6 := targetIP.Is6()
+
+			var pConn net.PacketConn
+			if isV6 {
+				sessMu.RLock()
+				pConn = sess.v6Conn
+				sessMu.RUnlock()
+				if pConn == nil {
+					newConn, cErr := openFullConePacketConn(dialer, true)
+					if cErr != nil {
+						continue
+					}
+					sessMu.Lock()
+					if sess.v6Conn == nil {
+						sess.v6Conn = newConn
+						udpSocketsOpened.Add(1)
+						startReturnPump(sess, newConn)
+					} else {
+						_ = newConn.Close()
+					}
+					pConn = sess.v6Conn
+					sessMu.Unlock()
+				}
+			} else {
+				sessMu.RLock()
+				pConn = sess.v4Conn
+				sessMu.RUnlock()
+				if pConn == nil {
+					newConn, cErr := openFullConePacketConn(dialer, false)
+					if cErr != nil {
+						continue
+					}
+					sessMu.Lock()
+					if sess.v4Conn == nil {
+						sess.v4Conn = newConn
+						udpSocketsOpened.Add(1)
+						startReturnPump(sess, newConn)
+					} else {
+						_ = newConn.Close()
+					}
+					pConn = sess.v4Conn
+					sessMu.Unlock()
+				}
+			}
+
+			dstUdpAddr := &net.UDPAddr{
+				IP:   net.IP(targetIP.AsSlice()),
+				Port: int(dstPort),
+			}
+			if nw, wErr := pConn.WriteTo(payload, dstUdpAddr); wErr == nil {
+				udpPacketsTx.Add(1)
 				recordClientTx(statEnt, nw)
+			} else {
+				udpSendErrors.Add(1)
 			}
 		}
 	}()

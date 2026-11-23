@@ -7,8 +7,10 @@ import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.Service;
 import android.content.ComponentCallbacks2;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
 import android.content.res.Configuration;
 import android.graphics.Typeface;
@@ -57,6 +59,8 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
             "xyz.nextalone.nagram"
     ));
     private static final String FAB_TAG = "wg_plus_floating_trigger";
+    // ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING (API 34+); kept as literal for compileSdk compatibility.
+    private static final int FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING = 0x00000200;
 
     private static final ExecutorService STARTUP_EXEC = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(() -> {
@@ -161,6 +165,8 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                 // Fast lifecycle registration on main thread; zero heavy I/O or ZIP scanning here
                                 registerSmartKeepaliveLifecycle(hostAppCtx, lpparam.classLoader);
                                 registerHostMemoryCallbacks(hostAppCtx);
+                                // Fail-closed synchronous Kill Switch pre-arm before ConnectionsManager dials out
+                                WireGuardManager.preArmKillSwitchSync(hostAppCtx, lpparam.classLoader);
 
                                 STARTUP_EXEC.execute(() -> {
                                     try {
@@ -169,7 +175,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                         NativeBridgeLoader.ensureLoaded(hostAppCtx, MODULE_PATH);
 
                                         final boolean autoConnect = WireGuardManager.isAutoConnectEnabled(hostAppCtx);
-                                        if (autoConnect) {
+                                        if (autoConnect && NativeBridgeLoader.isLoaded()) {
                                             try {
                                                 wgbridge.Wgbridge.setTunnelStartupPending(true);
                                             } catch (Throwable ignored) {
@@ -202,9 +208,11 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                             } catch (Throwable err) {
                                                 XposedBridge.log("WGPlus: Auto-start failed: " + err.getMessage());
                                             } finally {
-                                                try {
-                                                    wgbridge.Wgbridge.setTunnelStartupPending(false);
-                                                } catch (Throwable ignored) {
+                                                if (NativeBridgeLoader.isLoaded()) {
+                                                    try {
+                                                        wgbridge.Wgbridge.setTunnelStartupPending(false);
+                                                    } catch (Throwable ignored) {
+                                                    }
                                                 }
                                             }
                                         }
@@ -364,6 +372,81 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                         }
                     }
             );
+            // Enforce Kill Switch against Telegram clearing/disabling proxy & re-bind immediately on Login/Add-Account init
+            XposedBridge.hookAllMethods(cmClass, "setProxySettings", new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (param.args == null || param.args.length < 6) {
+                            return;
+                        }
+                        Context ctx = getOrResolveAppContext(lpparam.classLoader);
+                        if (!WireGuardManager.isKillSwitchEnabled(ctx)) {
+                            return;
+                        }
+                        boolean enabled = Boolean.TRUE.equals(param.args[0]);
+                        String addr = param.args[1] instanceof String ? (String) param.args[1] : "";
+                        if (!enabled || !"127.0.0.1".equals(addr)) {
+                            int effPort = NativeBridgeLoader.isLoaded()
+                                    ? WireGuardManager.getEffectiveProxyPort(ctx, MODULE_PATH)
+                                    : WireGuardManager.getCachedSharedOrFallbackPort(ctx);
+                            param.args[0] = true;
+                            param.args[1] = "127.0.0.1";
+                            param.args[2] = effPort > 0 ? effPort : 9;
+                            param.args[3] = WireGuardManager.getActiveSocksUser();
+                            param.args[4] = WireGuardManager.getActiveSocksPass();
+                            param.args[5] = "";
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            XposedBridge.hookAllMethods(cmClass, "native_setProxySettings", new XC_MethodHook(XCallback.PRIORITY_HIGHEST) {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        if (param.args == null || param.args.length < 6) {
+                            return;
+                        }
+                        Context ctx = getOrResolveAppContext(lpparam.classLoader);
+                        if (!WireGuardManager.isKillSwitchEnabled(ctx)) {
+                            return;
+                        }
+                        String addr = param.args[1] instanceof String ? (String) param.args[1] : "";
+                        if (!"127.0.0.1".equals(addr)) {
+                            int effPort = NativeBridgeLoader.isLoaded()
+                                    ? WireGuardManager.getEffectiveProxyPort(ctx, MODULE_PATH)
+                                    : WireGuardManager.getCachedSharedOrFallbackPort(ctx);
+                            param.args[1] = "127.0.0.1";
+                            param.args[2] = effPort > 0 ? effPort : 9;
+                            param.args[3] = WireGuardManager.getActiveSocksUser();
+                            param.args[4] = WireGuardManager.getActiveSocksPass();
+                            param.args[5] = "";
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            });
+            XC_MethodHook rebindOnAccountLifecycle = new XC_MethodHook(XCallback.PRIORITY_DEFAULT) {
+                @Override
+                protected void afterHookedMethod(MethodHookParam param) {
+                    try {
+                        final Context ctx = getOrResolveAppContext(lpparam.classLoader);
+                        STARTUP_EXEC.execute(() -> {
+                            try {
+                                Thread.sleep(250L);
+                                if (NativeBridgeLoader.isLoaded()) {
+                                    WireGuardManager.reapplyProxyToAccountIfActive(ctx, lpparam.classLoader, 0);
+                                }
+                            } catch (Throwable ignored) {
+                            }
+                        });
+                    } catch (Throwable ignored) {
+                    }
+                }
+            };
+            XposedBridge.hookAllMethods(cmClass, "init", rebindOnAccountLifecycle);
+            XposedBridge.hookAllMethods(cmClass, "cleanup", rebindOnAccountLifecycle);
         } catch (Throwable t) {
             XposedBridge.log("WGPlus: ConnectionsManager keepalive hook warning: " + t.getMessage());
         }
@@ -406,19 +489,25 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                         }
                     }
             );
-            XposedHelpers.findAndHookMethod(
-                    nsClass,
-                    "onStartCommand",
-                    Intent.class,
-                    int.class,
-                    int.class,
-                    new XC_MethodHook(XCallback.PRIORITY_DEFAULT) {
-                        @Override
-                        protected void afterHookedMethod(MethodHookParam param) {
-                            try {
-                                if (!(param.thisObject instanceof Service)) {
-                                    return;
-                                }
+            Method targetOnStart = null;
+            for (Class<?> c = nsClass; c != null && Service.class.isAssignableFrom(c); c = c.getSuperclass()) {
+                try {
+                    targetOnStart = c.getDeclaredMethod("onStartCommand", Intent.class, int.class, int.class);
+                    break;
+                } catch (NoSuchMethodException ignored) {
+                }
+            }
+            if (targetOnStart != null) {
+                XposedBridge.hookMethod(
+                        targetOnStart,
+                        new XC_MethodHook(XCallback.PRIORITY_DEFAULT) {
+                            @Override
+                            protected void afterHookedMethod(MethodHookParam param) {
+                                try {
+                                    if (!nsClass.isInstance(param.thisObject)
+                                            || !(param.thisObject instanceof Service)) {
+                                        return;
+                                    }
                                 Service service = (Service) param.thisObject;
                                 Intent intent = param.args != null && param.args.length > 0 && param.args[0] instanceof Intent
                                         ? (Intent) param.args[0]
@@ -480,7 +569,10 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                             }
                         }
                     }
-            );
+                );
+            } else {
+                XposedBridge.log("WGPlus: NotificationsService onStartCommand method not found");
+            }
             XposedBridge.hookAllMethods(nsClass, "onTimeout", new XC_MethodHook(XCallback.PRIORITY_DEFAULT) {
                 @Override
                 protected void beforeHookedMethod(MethodHookParam param) {
@@ -540,14 +632,45 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                 .build();
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            service.startForeground(
-                    WireGuardManager.FG_NOTIFICATION_ID,
-                    notification,
-                    ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-            );
-        } else {
-            service.startForeground(WireGuardManager.FG_NOTIFICATION_ID, notification);
+            int fgType = resolvePreferredForegroundServiceType(service);
+            if (fgType != 0) {
+                try {
+                    service.startForeground(
+                            WireGuardManager.FG_NOTIFICATION_ID,
+                            notification,
+                            fgType
+                    );
+                    return;
+                } catch (Throwable t) {
+                    XposedBridge.log("WGPlus: startForeground(type=" + fgType + ") fallback: " + t.getMessage());
+                }
+            }
         }
+        service.startForeground(WireGuardManager.FG_NOTIFICATION_ID, notification);
+    }
+
+    private static int resolvePreferredForegroundServiceType(Service service) {
+        if (service == null || Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            return 0;
+        }
+        try {
+            PackageManager pm = service.getPackageManager();
+            if (pm != null) {
+                ServiceInfo si = pm.getServiceInfo(new ComponentName(service, service.getClass()), 0);
+                if (si != null) {
+                    int declaredType = si.getForegroundServiceType();
+                    if ((declaredType & ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC) != 0) {
+                        return ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC;
+                    }
+                    if ((declaredType & FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING) != 0) {
+                        return FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING;
+                    }
+                    return declaredType;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return 0;
     }
 
     private static void cancelOwnForegroundNotification(Service service) {
@@ -605,41 +728,139 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                     "org.telegram.messenger.voip.Instance$Proxy",
                     lpparam.classLoader
             );
-            if (instanceClass != null && proxyClass != null) {
-                Method[] methods = instanceClass.getDeclaredMethods();
-                for (Method m : methods) {
-                    if (!"makeNativeInstance".equals(m.getName())) {
-                        continue;
-                    }
-                    XposedBridge.hookMethod(m, new XC_MethodHook(XCallback.PRIORITY_DEFAULT) {
-                        @Override
-                        protected void beforeHookedMethod(MethodHookParam param) {
-                            try {
-                                Context ctx = getOrResolveAppContext(lpparam.classLoader);
-                                if (!WireGuardManager.shouldRouteCallsNow(ctx, MODULE_PATH)) {
-                                    return;
-                                }
-                                int effectivePort = WireGuardManager.getEffectiveProxyPort(ctx, MODULE_PATH);
-                                if (effectivePort <= 0 || param.args == null) {
-                                    return;
-                                }
-                                Class<?>[] paramTypes = ((Method) param.method).getParameterTypes();
+            final Class<?> configClass = XposedHelpers.findClassIfExists(
+                    "org.telegram.messenger.voip.Instance$Config",
+                    lpparam.classLoader
+            );
+            final Class<?> endpointClass = XposedHelpers.findClassIfExists(
+                    "org.telegram.messenger.voip.Instance$Endpoint",
+                    lpparam.classLoader
+            );
+            final XC_MethodHook voipProxyInjector = new XC_MethodHook(XCallback.PRIORITY_DEFAULT) {
+                @Override
+                protected void beforeHookedMethod(MethodHookParam param) {
+                    try {
+                        Context ctx = getOrResolveAppContext(lpparam.classLoader);
+                        boolean ks = WireGuardManager.isKillSwitchEnabled(ctx);
+                        if (!ks && !WireGuardManager.shouldRouteCallsNow(ctx, MODULE_PATH)) {
+                            return;
+                        }
+                        int effectivePort = WireGuardManager.getEffectiveProxyPort(ctx, MODULE_PATH);
+                        if (effectivePort <= 0 && ks) {
+                            effectivePort = WireGuardManager.enforceKillSwitchIfDisconnected(ctx, MODULE_PATH, lpparam.classLoader);
+                            if (effectivePort <= 0) {
+                                effectivePort = 9; // fail-closed blackhole when Kill Switch is armed
+                            }
+                        }
+                        if (effectivePort <= 0 || param.args == null) {
+                            return;
+                        }
+                        String socksUser = WireGuardManager.getActiveSocksUser();
+                        String socksPass = WireGuardManager.getActiveSocksPass();
+                        boolean hasAuth = socksUser != null && !socksUser.isEmpty();
+                        Class<?>[] paramTypes = ((Method) param.method).getParameterTypes();
+                        boolean injectedProxy = false;
+                        for (int i = 0; i < paramTypes.length && i < param.args.length; i++) {
+                            if (proxyClass.isAssignableFrom(paramTypes[i])) {
+                                Constructor<?> ctor = proxyClass.getDeclaredConstructor(
+                                        String.class, int.class, String.class, String.class
+                                );
+                                ctor.setAccessible(true);
+                                param.args[i] = ctor.newInstance("127.0.0.1", effectivePort, socksUser, socksPass);
+                                injectedProxy = true;
+                                String msg = ((Method) param.method).getName()
+                                        + " port=" + effectivePort + " auth=" + hasAuth;
+                                XposedBridge.log("WGPlus: Routed tgcalls VoIP instance (" + msg + ")");
+                                WgDiagnosticsLog.record("VOIP", "ROUTE", msg);
+                                break;
+                            }
+                        }
+                        if (injectedProxy) {
+                            if (configClass != null) {
                                 for (int i = 0; i < paramTypes.length && i < param.args.length; i++) {
-                                    if (proxyClass.isAssignableFrom(paramTypes[i])) {
-                                        Constructor<?> ctor = proxyClass.getDeclaredConstructor(
-                                                String.class, int.class, String.class, String.class
-                                        );
-                                        ctor.setAccessible(true);
-                                        param.args[i] = ctor.newInstance("127.0.0.1", effectivePort, "", "");
-                                        XposedBridge.log("WGPlus: Routed tgcalls VoIP instance through 127.0.0.1:" + effectivePort);
+                                    if (param.args[i] != null && configClass.isAssignableFrom(paramTypes[i])) {
+                                        try {
+                                            XposedHelpers.setBooleanField(param.args[i], "enableP2p", false);
+                                        } catch (Throwable ignored) {
+                                        }
                                         break;
                                     }
                                 }
-                            } catch (Throwable t) {
-                                XposedBridge.log("WGPlus: VoIP Instance hook warning: " + t.getMessage());
+                            }
+                            if (endpointClass != null) {
+                                int relayedCount = 0;
+                                boolean tunnelUp = WireGuardManager.isTunnelRunning(ctx, MODULE_PATH);
+                                for (int i = 0; i < param.args.length; i++) {
+                                    Object arg = param.args[i];
+                                    if (arg != null && arg.getClass().isArray()
+                                            && endpointClass.isAssignableFrom(arg.getClass().getComponentType())) {
+                                        Object[] eps = (Object[]) arg;
+                                        for (Object ep : eps) {
+                                            if (ep == null) {
+                                                continue;
+                                            }
+                                            try {
+                                                Object ipv4Obj = XposedHelpers.getObjectField(ep, "ipv4");
+                                                String rawIpv4 = ipv4Obj instanceof String ? ((String) ipv4Obj).trim() : "";
+                                                int rawPort = XposedHelpers.getIntField(ep, "port");
+                                                if (!rawIpv4.isEmpty() && !"127.0.0.1".equals(rawIpv4) && rawPort > 0) {
+                                                    int localPort = WireGuardManager.startVoipEndpointRelay(
+                                                            ctx,
+                                                            MODULE_PATH,
+                                                            rawIpv4,
+                                                            rawPort
+                                                    );
+                                                    if (localPort > 0) {
+                                                        XposedHelpers.setObjectField(ep, "ipv4", "127.0.0.1");
+                                                        try {
+                                                            XposedHelpers.setObjectField(ep, "ipv6", "");
+                                                        } catch (Throwable ignored) {
+                                                        }
+                                                        XposedHelpers.setIntField(ep, "port", localPort);
+                                                        XposedBridge.log("WGPlus: Relayed VoIP endpoint " + rawIpv4 + ":" + rawPort + " -> 127.0.0.1:" + localPort);
+                                                        WgDiagnosticsLog.record("VOIP", "RELAY", rawPort + "->" + localPort);
+                                                        relayedCount++;
+                                                    } else if (ks && !tunnelUp) {
+                                                        XposedHelpers.setObjectField(ep, "ipv4", "127.0.0.1");
+                                                        try {
+                                                            XposedHelpers.setObjectField(ep, "ipv6", "");
+                                                        } catch (Throwable ignored) {
+                                                        }
+                                                        XposedHelpers.setIntField(ep, "port", 9);
+                                                    }
+                                                }
+                                            } catch (Throwable ignored) {
+                                            }
+                                        }
+                                    }
+                                }
+                                if (relayedCount > 0) {
+                                    WgDiagnosticsLog.record("VOIP", "EP_RELAY", "count=" + relayedCount);
+                                }
                             }
                         }
-                    });
+                    } catch (Throwable t) {
+                        XposedBridge.log("WGPlus: VoIP Instance hook warning: " + t.getMessage());
+                        WgDiagnosticsLog.record("VOIP", "HOOK_WARN", t.getMessage());
+                    }
+                }
+            };
+            if (instanceClass != null && proxyClass != null) {
+                for (Method m : instanceClass.getDeclaredMethods()) {
+                    if ("makeNativeInstance".equals(m.getName())) {
+                        XposedBridge.hookMethod(m, voipProxyInjector);
+                    }
+                }
+            }
+            final Class<?> nativeInstanceClass = XposedHelpers.findClassIfExists(
+                    "org.telegram.messenger.voip.NativeInstance",
+                    lpparam.classLoader
+            );
+            if (nativeInstanceClass != null && proxyClass != null) {
+                for (Method m : nativeInstanceClass.getDeclaredMethods()) {
+                    if ("makeGroup".equals(m.getName()) || "make".equals(m.getName())) {
+                        XposedBridge.hookMethod(m, voipProxyInjector);
+                    }
                 }
             }
         } catch (Throwable t) {
@@ -661,18 +882,25 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                             protected void beforeHookedMethod(MethodHookParam param) {
                                 try {
                                     Context ctx = getOrResolveAppContext(lpparam.classLoader);
-                                    if (!WireGuardManager.shouldRouteCallsNow(ctx, MODULE_PATH)) {
+                                    boolean ks = WireGuardManager.isKillSwitchEnabled(ctx);
+                                    if (!ks && !WireGuardManager.shouldRouteCallsNow(ctx, MODULE_PATH)) {
                                         return;
                                     }
                                     int effectivePort = WireGuardManager.getEffectiveProxyPort(ctx, MODULE_PATH);
+                                    if (effectivePort <= 0 && ks) {
+                                        effectivePort = WireGuardManager.enforceKillSwitchIfDisconnected(ctx, MODULE_PATH, lpparam.classLoader);
+                                        if (effectivePort <= 0) {
+                                            effectivePort = 9;
+                                        }
+                                    }
                                     if (effectivePort > 0 && param.thisObject != null) {
                                         XposedHelpers.callMethod(
                                                 param.thisObject,
                                                 "setProxy",
                                                 "127.0.0.1",
                                                 effectivePort,
-                                                "",
-                                                ""
+                                                WireGuardManager.getActiveSocksUser(),
+                                                WireGuardManager.getActiveSocksPass()
                                         );
                                     }
                                 } catch (Throwable ignored) {

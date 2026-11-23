@@ -224,18 +224,42 @@ public final class WgAdbConnectionManager extends AbsAdbConnectionManager {
             return ConnectPath.LOCAL_TCP;
         }
 
-        // 2. Wireless Debugging TLS over Wi-Fi (Android requires Wi-Fi for adb_wifi_enabled)
+        // 2. Wireless Debugging TLS over Wi-Fi (Android requires Wi-Fi and Developer Options enabled)
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || !isWifiConnected(mAppCtx)) {
             return ConnectPath.NONE;
         }
         if (!BuiltinAdbKeyManager.isPaired(mAppCtx)) {
             return ConnectPath.NONE;
         }
+        boolean devEnabled = true;
+        boolean wifiAdbEnabled = false;
+        try {
+            devEnabled = Settings.Global.getInt(
+                    mAppCtx.getContentResolver(),
+                    Settings.Global.DEVELOPMENT_SETTINGS_ENABLED,
+                    0
+            ) == 1;
+            wifiAdbEnabled = Settings.Global.getInt(
+                    mAppCtx.getContentResolver(),
+                    "adb_wifi_enabled",
+                    0
+            ) == 1;
+        } catch (Throwable ignored) {
+        }
+        if (!devEnabled) {
+            Log.i(TAG, "Developer Options OFF; skipping Wireless Debugging TLS discovery");
+            return ConnectPath.NONE;
+        }
+        boolean canEnable = allowEnableWifiAdb && PrivilegeBridge.hasSelfWriteSecureSettingsPermission(mAppCtx);
+        if (!wifiAdbEnabled && !canEnable) {
+            Log.i(TAG, "Wireless Debugging OFF without WRITE_SECURE_SETTINGS; skipping mDNS scan");
+            return ConnectPath.NONE;
+        }
 
-        if (allowEnableWifiAdb && PrivilegeBridge.hasSelfWriteSecureSettingsPermission(mAppCtx)) {
+        if (canEnable) {
             try {
                 Settings.Global.putInt(mAppCtx.getContentResolver(), "adb_enabled", 1);
-                if (Settings.Global.getInt(mAppCtx.getContentResolver(), "adb_wifi_enabled", 0) != 1) {
+                if (!wifiAdbEnabled) {
                     Settings.Global.putInt(mAppCtx.getContentResolver(), "adb_wifi_enabled", 1);
                     try {
                         Thread.sleep(600L);

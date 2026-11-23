@@ -17,6 +17,7 @@
         </div>
       </div>
       <div class="topbar-actions">
+        <button id="btn-open-diagnostics" class="btn btn-subtle" type="button"></button>
         <button id="btn-hide-tray" class="btn btn-subtle" type="button"></button>
         <button id="btn-lang-toggle" class="btn btn-subtle" type="button">العربية</button>
         <button id="btn-theme-toggle" class="btn btn-subtle" type="button"></button>
@@ -477,6 +478,45 @@
       </div>
     </div>
 
+    <!-- Diagnostics & GitHub Issue Reporter Modal -->
+    <div id="modal-diagnostics" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="modal-diag-title">
+      <div class="modal-card modal-wide">
+        <div class="modal-head">
+          <h3 id="modal-diag-title" class="modal-title"></h3>
+          <button id="btn-close-diag" class="btn btn-mini" type="button"></button>
+        </div>
+        <p id="lbl-diag-desc" class="card-desc"></p>
+        <div id="diag-blocked-wrap" class="diag-blocked-wrap hidden">
+          <div id="lbl-diag-blocked-title" class="section-subtitle"></div>
+          <div id="diag-blocked-list" class="list-stack"></div>
+        </div>
+        <div class="toolbar-row">
+          <button id="btn-diag-refresh" class="btn btn-subtle" type="button"></button>
+          <button id="btn-diag-copy" class="btn btn-secondary" type="button"></button>
+          <button id="btn-diag-save" class="btn btn-subtle" type="button"></button>
+          <button id="btn-diag-clear" class="btn btn-subtle" type="button"></button>
+          <button id="btn-diag-github" class="btn btn-primary" type="button"></button>
+        </div>
+        <pre id="diag-report-view" class="diag-report-box mono"></pre>
+      </div>
+    </div>
+
+    <!-- Mandatory Official Channel Prompt -->
+    <div id="modal-channel" class="upd-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="modal-channel-title">
+      <div class="upd-card">
+        <span class="upd-badge">@wgplus_official</span>
+        <h2 id="modal-channel-title" class="upd-title"></h2>
+        <p id="modal-channel-body" class="upd-sub" style="white-space: pre-line;"></p>
+        <div class="form-stack">
+          <button id="btn-channel-open" class="btn btn-primary" type="button"></button>
+          <div class="split-2">
+            <button id="btn-channel-yes" class="btn btn-secondary" type="button"></button>
+            <button id="btn-channel-no" class="btn btn-subtle" type="button"></button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div id="upd-overlay" class="upd-overlay hidden" role="dialog" aria-modal="true" aria-labelledby="upd-title">
       <div class="upd-card">
         <span id="upd-badge" class="upd-badge"></span>
@@ -491,6 +531,7 @@
     </div>
     <footer class="app-footer">
       <span id="app-version-label" class="app-version-label"></span>
+      <button id="btn-join-channel" class="btn btn-link" type="button"></button>
     </footer>
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
   </div>

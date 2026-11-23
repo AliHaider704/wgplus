@@ -405,6 +405,51 @@ func (fnet *fastNet) ListenUDP(laddr *net.UDPAddr) (*gonet.UDPConn, error) {
 	return fnet.DialUDP(laddr, nil)
 }
 
+func (fnet *fastNet) SupportsIPv6() bool {
+	return fnet != nil && fnet.hasV6 && !fnet.blockIPv6.Load()
+}
+
+func (fnet *fastNet) DialUDPUnconnected(isV6 bool) (net.PacketConn, error) {
+	if isV6 {
+		if !fnet.SupportsIPv6() {
+			return nil, &net.OpError{Op: "listen", Err: errors.New("IPv6 unavailable or blocked")}
+		}
+		return gonet.DialUDP(fnet.stack, nil, nil, ipv6.ProtocolNumber)
+	}
+	if !fnet.hasV4 {
+		return nil, &net.OpError{Op: "listen", Err: errors.New("IPv4 unavailable")}
+	}
+	return gonet.DialUDP(fnet.stack, nil, nil, ipv4.ProtocolNumber)
+}
+
+func (fnet *fastNet) ResolveUDPTarget(ctx context.Context, host string, acceptV6 bool) ([]netip.Addr, error) {
+	if directIP, pErr := netip.ParseAddr(host); pErr == nil {
+		unmapped := directIP.Unmap()
+		if unmapped.Is6() && !acceptV6 {
+			return nil, &net.OpError{Op: "resolve", Err: errors.New("IPv6 blocked by tunnel policy")}
+		}
+		if unmapped.Is4() && !fnet.hasV4 {
+			return nil, &net.OpError{Op: "resolve", Err: errors.New("IPv4 unavailable")}
+		}
+		return []netip.Addr{unmapped}, nil
+	}
+	ips, err := fnet.LookupContextHost(ctx, host)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]netip.Addr, 0, len(ips))
+	for _, ip := range ips {
+		unmapped := ip.Unmap()
+		if (unmapped.Is4() && fnet.hasV4) || (unmapped.Is6() && acceptV6) {
+			out = append(out, unmapped)
+		}
+	}
+	if len(out) == 0 {
+		return nil, errors.New("no reachable address for target")
+	}
+	return out, nil
+}
+
 var fastProtoSplitter = regexp.MustCompile(`^(tcp|udp)(4|6)?$`)
 
 type dnsQueryResult struct {

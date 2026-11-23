@@ -95,3 +95,36 @@ func TestMonitorSkipsFailoverWhenDisabled(t *testing.T) {
 		t.Fatalf("expected no failover when AutoFailover is disabled")
 	}
 }
+
+func TestMonitorDetectsTxWithoutRxStallQuickly(t *testing.T) {
+	var switchedTo string
+	var tx uint64 = 100
+	m := NewMonitor(Dependencies{
+		IsRunning:    func() bool { return true },
+		TunnelUptime: func() time.Duration { return 25 * time.Second },
+		SnapshotTrafficStats: func() (int64, uint64, uint64) {
+			tx += 128
+			return 20, 5000, tx // fresh hsAge=20s, but RX frozen at 5000 while TX climbs
+		},
+		ForceRebind:    func() bool { return false },
+		IsAutoFailover: func() bool { return true },
+		ListProfiles: func() (string, []config.ServerProfile) {
+			return "a", []config.ServerProfile{{ID: "a", Name: "Primary"}, {ID: "b", Name: "Backup"}}
+		},
+		ProbeProfile: func(_ context.Context, _ config.ServerProfile) (int, error) {
+			return 25, nil
+		},
+		SwitchToProfile: func(id string) error {
+			switchedTo = id
+			return nil
+		},
+	}, time.Second)
+
+	// Step 1 establishes baseline (rx=5000), Steps 2 & 3 detect 2 consecutive TX-without-RX stalls.
+	m.Step(context.Background())
+	m.Step(context.Background())
+	m.Step(context.Background())
+	if switchedTo != "b" {
+		t.Fatalf("expected fast TX-without-RX stall failover to b, got %q", switchedTo)
+	}
+}

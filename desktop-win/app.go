@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -21,6 +23,7 @@ import (
 	"wgplus-win/internal/qr"
 	"wgplus-win/internal/syswin"
 	"wgplus-win/internal/vault"
+	"wgplus-win/internal/voiptun"
 	"wgplus-win/internal/warp"
 	"wgplus-win/internal/watchdog"
 )
@@ -115,6 +118,7 @@ type App struct {
 	startHidden   bool
 	pendingConf   string
 	manualStop    atomic.Bool
+	recoveryGen   atomic.Uint64
 }
 
 // NewApp initializes the DPAPI vault and Windows Process Guard prior to Wails startup.
@@ -243,6 +247,10 @@ func (a *App) startup(ctx context.Context) {
 		SnapshotStats: func() (int64, uint64) {
 			st := a.readBridgeStats()
 			return st.HandshakeAgeSec, st.TxBytes
+		},
+		SnapshotTrafficStats: func() (int64, uint64, uint64) {
+			st := a.readBridgeStats()
+			return st.HandshakeAgeSec, st.RxBytes, st.TxBytes
 		},
 		ForceRebind: func() bool {
 			return wgbridge.ForceRebindAndHandshake()
@@ -388,6 +396,7 @@ func (a *App) shutdown(_ context.Context) {
 	if a.trayHost != nil {
 		a.trayHost.Stop()
 	}
+	wgbridge.StopWindowsVoipTun()
 	wgbridge.StopHttpProxy()
 	wgbridge.StopTunnel()
 	wgbridge.StopKillSwitchGuard()
@@ -534,22 +543,54 @@ func (a *App) onClientsWatcherEvent(ev clients.WatcherEvent) {
 	}
 }
 
-func (a *App) handleWakeRecovery() {
+func (a *App) runSteppedRecovery(reason string, triggerFailoverOnExhaust bool) {
+	gen := a.recoveryGen.Add(1)
 	wgbridge.ClearDnsCache()
-	a.mu.Lock()
-	isUp := a.connected
-	a.mu.Unlock()
-	if !isUp {
-		a.mu.Lock()
-		on := a.state.Settings.AutoConnectOnLaunch
-		busy := a.connecting
-		a.mu.Unlock()
-		if on && !busy && !a.manualStop.Load() {
-			go a.autoConnectOnLaunch()
-		}
-		return
+	wgbridge.RecordDiag("RECOVERY", "START", reason)
+
+	delays := []time.Duration{
+		500 * time.Millisecond,
+		1500 * time.Millisecond,
+		2500 * time.Millisecond,
+		3500 * time.Millisecond,
 	}
-	if !wgbridge.ForceRebindAndHandshake() && a.failover != nil && a.bgCtx != nil {
+	recovered := false
+	for idx, wait := range delays {
+		if a.bgCtx != nil && a.bgCtx.Err() != nil {
+			return
+		}
+		if a.recoveryGen.Load() != gen {
+			return
+		}
+		a.mu.Lock()
+		isUp := a.connected
+		a.mu.Unlock()
+		if !isUp {
+			return
+		}
+		if idx > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-a.bgCtx.Done():
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			if a.recoveryGen.Load() != gen {
+				return
+			}
+		} else {
+			time.Sleep(wait)
+		}
+		if wgbridge.ForceRebindAndHandshake() {
+			recovered = true
+			wgbridge.RecordDiag("RECOVERY", "OK", fmt.Sprintf("%s attempt=%d", reason, idx+1))
+			break
+		}
+	}
+
+	if !recovered && triggerFailoverOnExhaust && a.failover != nil && a.bgCtx != nil && a.recoveryGen.Load() == gen {
+		wgbridge.RecordDiag("RECOVERY", "FAILOVER", reason)
 		a.failover.TriggerFailover(a.bgCtx)
 	}
 	a.syncMonitoredPorts()
@@ -557,17 +598,34 @@ func (a *App) handleWakeRecovery() {
 	a.emitStateChanged()
 }
 
-func (a *App) handleNetworkSwitch() {
+func (a *App) handleWakeRecovery() {
 	wgbridge.ClearDnsCache()
+	a.mu.Lock()
+	isUp := a.connected
+	on := a.state.Settings.AutoConnectOnLaunch
+	busy := a.connecting
+	a.mu.Unlock()
+	if !isUp {
+		if on && !busy && !a.manualStop.Load() {
+			go a.autoConnectOnLaunch()
+		}
+		return
+	}
+	a.runSteppedRecovery("wake", true)
+}
+
+func (a *App) handleNetworkSwitch() {
 	a.mu.Lock()
 	isUp := a.connected
 	a.mu.Unlock()
 	if !isUp {
 		return
 	}
-	_ = wgbridge.ForceRebindAndHandshake()
-	a.syncMonitoredPorts()
-	a.refreshTray()
+	if wgbridge.EnsureTunnelAlive(1200) {
+		wgbridge.RecordDiag("RECOVERY", "SKIP", "net_switch tunnel healthy")
+		return
+	}
+	a.runSteppedRecovery("net_switch", true)
 }
 
 func (a *App) traySnapshot() (string, syswin.TrayVisualState, string, bool, []syswin.TrayMenuProfile, []syswin.TrayMenuClient) {
@@ -825,10 +883,16 @@ func (a *App) Connect(profileID string) error {
 	_ = a.store.Save(a.state)
 	a.mu.Unlock()
 
+	if dllPath, dllErr := voiptun.EnsureWintunDLLForApp(a.store.DataDir()); dllErr != nil {
+		wgbridge.RecordDiag("VOIP_TUN", "DLL_ERR", dllErr.Error())
+	} else if vtErr := wgbridge.StartWindowsVoipTun(filepath.Dir(dllPath)); vtErr != nil {
+		// Non-fatal fallback: keep SOCKS5 tunnel active if user launched without Administrator privileges.
+		_ = vtErr
+	}
+
 	a.syncMonitoredPorts()
 	a.refreshTray()
 	a.emitStateChanged()
-	go a.maybeInviteOfficialChannelOnce()
 	return nil
 }
 
@@ -837,6 +901,7 @@ func (a *App) Disconnect() error {
 	defer a.connectMu.Unlock()
 	a.manualStop.Store(true)
 
+	wgbridge.StopWindowsVoipTun()
 	wgbridge.StopTunnel()
 	a.mu.Lock()
 	ks := a.state.Settings.KillSwitch
@@ -851,7 +916,6 @@ func (a *App) Disconnect() error {
 	a.syncMonitoredPorts()
 	a.refreshTray()
 	a.emitStateChanged()
-	go a.maybeInviteOfficialChannelOnce()
 	return nil
 }
 
@@ -897,20 +961,35 @@ func (a *App) SelectProfile(profileID string) error {
 }
 
 // OpenOfficialChannel opens @wgplus_official directly inside Telegram Desktop via tg://resolve
-// without ever launching a web browser. Returns true if a Telegram client was dispatched.
+// without ever launching a web browser. Includes running/installed Desktop, Portable, and MSIX Unigram.
 func (a *App) OpenOfficialChannel() (bool, error) {
 	const channelURI = "tg://resolve?domain=wgplus_official"
 	detected := a.ScanTelegramClients()
 
-	// Prefer a currently running desktop executable, then any installed desktop executable
+	// If a standard (non-portable) or MSIX client is already running and Windows has tg:// registered,
+	// prefer ShellExecuteW so installed builds keep their -workdir profile arguments.
+	hasNonPortableRunning := false
+	for _, c := range detected {
+		if c.Running && (!c.IsPortable || c.IsMsix) {
+			hasNonPortableRunning = true
+			break
+		}
+	}
+	if hasNonPortableRunning && clients.HasTgProtocolHandler() {
+		if err := clients.OpenTgURI(channelURI); err == nil {
+			return true, nil
+		}
+	}
+
+	// Prefer running desktop/portable/MSIX clients, then installed ones.
 	var candidates []config.TelegramClientEntry
 	for _, c := range detected {
-		if !c.IsMsix && strings.TrimSpace(c.ExePath) != "" && c.Running {
+		if c.Running && (c.IsMsix || strings.TrimSpace(c.ExePath) != "") {
 			candidates = append(candidates, c)
 		}
 	}
 	for _, c := range detected {
-		if !c.IsMsix && strings.TrimSpace(c.ExePath) != "" && !c.Running {
+		if !c.Running && (c.IsMsix || strings.TrimSpace(c.ExePath) != "") {
 			candidates = append(candidates, c)
 		}
 	}
@@ -928,21 +1007,51 @@ func (a *App) OpenOfficialChannel() (bool, error) {
 	return false, nil
 }
 
-// maybeInviteOfficialChannelOnce dispatches @wgplus_official directly to the active Telegram
-// client once per install (tracked in encrypted vault settings, never in WebView2 localStorage).
+// AcknowledgeOfficialChannel records that the user opened or confirmed the mandatory channel modal.
+func (a *App) AcknowledgeOfficialChannel() error {
+	a.mu.Lock()
+	a.state.Settings.ChannelInvitedV2 = true
+	a.state.Settings.ChannelInvitedV3 = true
+	a.state.Settings.ChannelInvitedV4 = true
+	err := a.store.Save(a.state)
+	a.mu.Unlock()
+	a.emitStateChanged()
+	return err
+}
+
+// maybeInviteOfficialChannelOnce dispatches @wgplus_official directly to an active running Telegram
+// client once per install while the tunnel is connected (never when disconnected or no client is running).
 func (a *App) maybeInviteOfficialChannelOnce() {
 	a.mu.Lock()
-	already := a.state.Settings.ChannelInvitedV2
+	already := a.state.Settings.ChannelInvitedV3
 	a.mu.Unlock()
 	if already {
 		return
 	}
-	time.Sleep(1500 * time.Millisecond)
+	time.Sleep(2200 * time.Millisecond)
+	a.mu.Lock()
+	isUp := a.connected && wgbridge.IsRunning()
+	a.mu.Unlock()
+	if !isUp {
+		return
+	}
+	detected := a.ScanTelegramClients()
+	anyRunning := false
+	for _, c := range detected {
+		if c.Running {
+			anyRunning = true
+			break
+		}
+	}
+	if !anyRunning {
+		return
+	}
 	opened, _ := a.OpenOfficialChannel()
 	if !opened {
 		return
 	}
 	a.mu.Lock()
+	a.state.Settings.ChannelInvitedV3 = true
 	a.state.Settings.ChannelInvitedV2 = true
 	_ = a.store.Save(a.state)
 	a.mu.Unlock()
@@ -1723,6 +1832,8 @@ func (a *App) UpdateSettings(s config.AppSettings) (config.AppSettings, error) {
 		s.ActiveProfileID = prev.ActiveProfileID
 	}
 	s.ChannelInvitedV2 = prev.ChannelInvitedV2
+	s.ChannelInvitedV3 = prev.ChannelInvitedV3
+	s.ChannelInvitedV4 = prev.ChannelInvitedV4
 
 	if s.StartWithWindows != prev.StartWithWindows {
 		exePath, _ := os.Executable()
@@ -1853,4 +1964,149 @@ func (a *App) ImportEncryptedBackupDialog(passphrase string) (BootstrapState, er
 	a.ScanTelegramClients()
 	a.emitStateChanged()
 	return a.GetBootstrapState(), nil
+}
+
+// ApproveBlockedClientPath registers a custom unsigned portable client path blocked by Process Guard.
+func (a *App) ApproveBlockedClientPath(exePath string) error {
+	clean := filepath.Clean(strings.TrimSpace(exePath))
+	if clean == "" {
+		return errors.New("executable path is required")
+	}
+	if _, err := os.Stat(clean); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	exists := false
+	for i := range a.state.CustomClients {
+		if strings.EqualFold(filepath.Clean(a.state.CustomClients[i].ExePath), clean) {
+			a.state.CustomClients[i].Enabled = true
+			exists = true
+			break
+		}
+	}
+	if !exists {
+		base := filepath.Base(clean)
+		a.state.CustomClients = append(a.state.CustomClients, config.TelegramClientEntry{
+			ID:           fmt.Sprintf("custom_%d", time.Now().UnixNano()),
+			Kind:         "custom",
+			DisplayName:  strings.TrimSuffix(base, filepath.Ext(base)),
+			ExePath:      clean,
+			InstallDir:   filepath.Dir(clean),
+			IsPortable:   true,
+			Enabled:      true,
+			AutoDetected: false,
+		})
+	}
+	err := a.store.Save(a.state)
+	a.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	a.procGuard.AllowExecutablePath(clean)
+	a.ScanTelegramClients()
+	a.emitStateChanged()
+	return nil
+}
+
+// GetDiagnosticReport builds a sanitized Markdown report safe to attach to GitHub Issues.
+// Never includes private keys, preshared keys, server endpoints, or SOCKS credentials.
+func (a *App) GetDiagnosticReport() string {
+	a.mu.Lock()
+	s := a.state.Settings
+	isConn := a.connected
+	lastErr := a.lastError
+	activeID := a.activeID
+	var profSummary string
+	for _, p := range a.state.Profiles {
+		if p.ID == activeID {
+			profSummary = fmt.Sprintf("mtu=%d keepAlive=%d useDoH=%v awg=%v warp=%v pingMs=%d",
+				p.MTU, p.KeepAlive, p.UseDoH, strings.TrimSpace(p.AwgParams) != "", p.IsWarp, p.LastPingMs)
+			break
+		}
+	}
+	clis := append([]config.TelegramClientEntry(nil), a.clients...)
+	a.mu.Unlock()
+
+	st := a.readBridgeStats()
+	udpTel := wgbridge.GetUdpTelemetryJSON()
+	diagEvents := wgbridge.GetDiagnosticsJSON()
+	guardEvents := a.procGuard.Events()
+
+	var b strings.Builder
+	b.WriteString("### WireGuard Plus Diagnostics (Windows)\n")
+	fmt.Fprintf(&b, "- **App Version**: `v%s`\n", AppVersion)
+	fmt.Fprintf(&b, "- **Platform**: `%s/%s` (Portable=%v)\n", goruntime.GOOS, goruntime.GOARCH, a.store.IsPortable())
+	fmt.Fprintf(&b, "- **Tunnel State**: connected=`%v`, running=`%v`, voipTunActive=`%v`, killSwitch=`%v`, guardMode=`%s`, authEnabled=`%v`, blockIPv6=`%v`\n",
+		isConn, st.Running, wgbridge.IsWindowsVoipTunActive(), s.KillSwitch, s.ProcessGuardMode, s.SocksAuthEnabled, s.BlockIPv6)
+	fmt.Fprintf(&b, "- **Ports & Stats**: socksPort=`%d`, rxBytes=`%d`, txBytes=`%d`, hsAgeSec=`%d`, activeTcp=`%d`, activeUdp=`%d`, guardBlocked=`%d`\n",
+		st.SocksPort, st.RxBytes, st.TxBytes, st.HandshakeAgeSec, st.ActiveTcpConns, st.ActiveUdpAssocs, st.BlockedLocalAttempts)
+	if profSummary != "" {
+		fmt.Fprintf(&b, "- **Active Profile Config**: `%s`\n", profSummary)
+	}
+	if strings.TrimSpace(lastErr) != "" {
+		fmt.Fprintf(&b, "- **Last Error**: `%s`\n", lastErr)
+	}
+	b.WriteString("- **Detected Clients**:\n")
+	if len(clis) == 0 {
+		b.WriteString("  - (none)\n")
+	} else {
+		for _, c := range clis {
+			fmt.Fprintf(&b, "  - `%s` (running=%v, enabled=%v, portable=%v, msix=%v)\n",
+				c.DisplayName, c.Running, c.Enabled, c.IsPortable, c.IsMsix)
+		}
+	}
+	fmt.Fprintf(&b, "\n#### UDP & Watchdog Telemetry\n```json\n%s\n```\n", udpTel)
+	fmt.Fprintf(&b, "\n#### Go Engine Ring Buffer\n```json\n%s\n```\n", diagEvents)
+
+	b.WriteString("\n#### Recent Process Guard Events\n```text\n")
+	if len(guardEvents) == 0 {
+		b.WriteString("(none)\n")
+	} else {
+		start := 0
+		if len(guardEvents) > 25 {
+			start = len(guardEvents) - 25
+		}
+		for _, ev := range guardEvents[start:] {
+			fmt.Fprintf(&b, "[%d] %s %s %s (pid=%d, :%d) path=%s\n",
+				ev.TimestampUnix, strings.ToUpper(ev.Action), ev.Protocol, ev.ClientLabel, ev.PID, ev.PeerPort, ev.ExePath)
+		}
+	}
+	b.WriteString("```\n")
+	return b.String()
+}
+
+func (a *App) ClearDiagnostics() {
+	wgbridge.ClearDiagnostics()
+}
+
+func (a *App) SaveDiagnosticReport() (string, error) {
+	if a.ctx == nil {
+		return "", errors.New("window context unavailable")
+	}
+	rep := a.GetDiagnosticReport()
+	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:           "Save Diagnostic Report",
+		DefaultFilename: "wireguard-plus-diagnostics.md",
+		Filters: []runtime.FileFilter{
+			{DisplayName: "Markdown Report (*.md)", Pattern: "*.md"},
+		},
+	})
+	if err != nil || strings.TrimSpace(path) == "" {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(rep), 0600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func (a *App) OpenGitHubBugReport() error {
+	rep := a.GetDiagnosticReport()
+	_ = syswin.CopyTextToClipboard(rep)
+	issueURL := "https://github.com/AliHaider704/wgplus/issues/new?template=bug_report.yml&environment=" +
+		url.QueryEscape(fmt.Sprintf("Windows (%s/%s) - WireGuard Plus v%s", goruntime.GOOS, goruntime.GOARCH, AppVersion))
+	if a.ctx != nil {
+		runtime.BrowserOpenURL(a.ctx, issueURL)
+	}
+	return nil
 }

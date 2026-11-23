@@ -416,13 +416,13 @@ func TestSocks5UdpAssociateVoipRelay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed reading SOCKS5 UDP reply: %v", err)
 	}
-	targetAddr, _, payload, err := parseSocks5UdpDatagram(recvBuf[:rn])
+	replyHost, replyPort, payload, err := parseSocks5UdpDatagram(recvBuf[:rn])
 	if err != nil {
 		t.Fatalf("invalid SOCKS5 UDP reply header: %v", err)
 	}
 	expectedPayload := "VOIP_ACK:OPUS_VOICE_FRAME_001"
 	if string(payload) != expectedPayload {
-		t.Fatalf("expected payload %q from %s, got %q", expectedPayload, targetAddr, string(payload))
+		t.Fatalf("expected payload %q from %s:%d, got %q", expectedPayload, replyHost, replyPort, string(payload))
 	}
 }
 
@@ -1133,4 +1133,278 @@ func TestUnifiedMuxPreservesPortAcrossKillSwitchStartupAndPause(t *testing.T) {
 		t.Fatalf("pending SOCKS5 dial during mux transition failed: %v", err)
 	}
 }
+
+func TestUdpAssociateFullConeMultiPeerAndDomainReply(t *testing.T) {
+	StopKillSwitchGuard()
+	StopTunnel()
+
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	srv := startLocalWgServer(t, "10.98.0.1", 1280, clientPub, "", "")
+	defer srv.closeAll()
+
+	// Peer A (STUN-like reflector) learns client source port and tells Peer B to send back to that exact port.
+	peerA, err := srv.tnet.ListenUDP(&net.UDPAddr{IP: net.IPv4(10, 98, 0, 1), Port: 3478})
+	if err != nil {
+		t.Fatalf("ListenUDP peerA failed: %v", err)
+	}
+	defer peerA.Close()
+
+	peerB, err := srv.tnet.ListenUDP(&net.UDPAddr{IP: net.IPv4(10, 98, 0, 1), Port: 3479})
+	if err != nil {
+		t.Fatalf("ListenUDP peerB failed: %v", err)
+	}
+	defer peerB.Close()
+
+	clientAddrCh := make(chan net.Addr, 2)
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, rAddr, rErr := peerA.ReadFrom(buf)
+			if rErr != nil {
+				return
+			}
+			select {
+			case clientAddrCh <- rAddr:
+			default:
+			}
+			_, _ = peerA.WriteTo([]byte("A:"+string(buf[:n])), rAddr)
+		}
+	}()
+	go func() {
+		buf := make([]byte, 512)
+		for {
+			n, rAddr, rErr := peerB.ReadFrom(buf)
+			if rErr != nil {
+				return
+			}
+			select {
+			case clientAddrCh <- rAddr:
+			default:
+			}
+			_, _ = peerB.WriteTo([]byte("B:"+string(buf[:n])), rAddr)
+		}
+	}()
+
+	tunPort, err := StartTunnelAdvanced(
+		clientPriv,
+		"",
+		"10.98.0.2/32",
+		"1.1.1.1",
+		srv.pubHex,
+		fmt.Sprintf("127.0.0.1:%d", srv.udpPort),
+		20,
+		1280,
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced failed: %v", err)
+	}
+	defer StopTunnel()
+
+	ctrl, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", tunPort), 3*time.Second)
+	if err != nil {
+		t.Fatalf("SOCKS5 TCP dial failed: %v", err)
+	}
+	defer ctrl.Close()
+	_, _ = ctrl.Write([]byte{0x05, 0x01, 0x00})
+	gResp := make([]byte, 2)
+	if _, err := io.ReadFull(ctrl, gResp); err != nil || gResp[1] != 0x00 {
+		t.Fatalf("SOCKS5 greeting failed: %v %v", gResp, err)
+	}
+	_, _ = ctrl.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	aResp := make([]byte, 10)
+	if _, err := io.ReadFull(ctrl, aResp); err != nil || aResp[1] != 0x00 {
+		t.Fatalf("UDP ASSOCIATE failed: %v %v", aResp, err)
+	}
+	relayPort := int(binary.BigEndian.Uint16(aResp[8:10]))
+
+	clientUdp, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: relayPort})
+	if err != nil {
+		t.Fatalf("DialUDP failed: %v", err)
+	}
+	defer clientUdp.Close()
+	_ = clientUdp.SetDeadline(time.Now().Add(4 * time.Second))
+
+	buildSocksUdp := func(ip [4]byte, port uint16, payload []byte) []byte {
+		pkt := make([]byte, 10+len(payload))
+		pkt[3] = 0x01
+		copy(pkt[4:8], ip[:])
+		binary.BigEndian.PutUint16(pkt[8:10], port)
+		copy(pkt[10:], payload)
+		return pkt
+	}
+
+	// 1. Send to Peer A
+	if _, err := clientUdp.Write(buildSocksUdp([4]byte{10, 98, 0, 1}, 3478, []byte("STUN1"))); err != nil {
+		t.Fatalf("write to peerA failed: %v", err)
+	}
+	rxBuf := make([]byte, 512)
+	rn, err := clientUdp.Read(rxBuf)
+	if err != nil {
+		t.Fatalf("read from peerA failed: %v", err)
+	}
+	rHost, rPort, rPayload, err := parseSocks5UdpDatagram(rxBuf[:rn])
+	if err != nil || rHost != "10.98.0.1" || rPort != 3478 || string(rPayload) != "A:STUN1" {
+		t.Fatalf("unexpected peerA reply: host=%s port=%d payload=%q err=%v", rHost, rPort, string(rPayload), err)
+	}
+
+	learnedClientAddr := <-clientAddrCh
+
+	// 2. Full-Cone test: Peer B sends unsolicited DTLS/ICE packet back to the EXACT port learned by Peer A!
+	if _, err := peerB.WriteTo([]byte("UNSOLICITED_DTLS"), learnedClientAddr); err != nil {
+		t.Fatalf("unsolicited peerB WriteTo failed: %v", err)
+	}
+	rn, err = clientUdp.Read(rxBuf)
+	if err != nil {
+		t.Fatalf("full-cone unsolicited read failed (symmetric NAT bug!): %v", err)
+	}
+	rHost, rPort, rPayload, err = parseSocks5UdpDatagram(rxBuf[:rn])
+	if err != nil || rHost != "10.98.0.1" || rPort != 3479 || string(rPayload) != "UNSOLICITED_DTLS" {
+		t.Fatalf("unexpected unsolicited reply: host=%s port=%d payload=%q err=%v", rHost, rPort, string(rPayload), err)
+	}
+
+	// 3. Send from same client socket to Peer B and verify Endpoint-Independent source port matches Peer A!
+	if _, err := clientUdp.Write(buildSocksUdp([4]byte{10, 98, 0, 1}, 3479, []byte("ICE2"))); err != nil {
+		t.Fatalf("write to peerB failed: %v", err)
+	}
+	rn, err = clientUdp.Read(rxBuf)
+	if err != nil {
+		t.Fatalf("read from peerB failed: %v", err)
+	}
+	_, _, rPayload, _ = parseSocks5UdpDatagram(rxBuf[:rn])
+	if string(rPayload) != "B:ICE2" {
+		t.Fatalf("expected B:ICE2, got %q", string(rPayload))
+	}
+	peerBSeenAddr := <-clientAddrCh
+	if peerBSeenAddr.String() != learnedClientAddr.String() {
+		t.Fatalf("symmetric NAT regression! peerA saw %s, peerB saw %s", learnedClientAddr.String(), peerBSeenAddr.String())
+	}
+}
+
+func TestEnsureTunnelAliveDoesNotWipeHealthyPeer(t *testing.T) {
+	StopKillSwitchGuard()
+	StopTunnel()
+
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	srv := startLocalWgServer(t, "10.99.0.1", 1280, clientPub, "", "")
+	defer srv.closeAll()
+
+	_, err := StartTunnelAdvanced(
+		clientPriv,
+		"",
+		"10.99.0.2/32",
+		"1.1.1.1",
+		srv.pubHex,
+		fmt.Sprintf("127.0.0.1:%d", srv.udpPort),
+		20,
+		1280,
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced failed: %v", err)
+	}
+	defer StopTunnel()
+
+	// Wait briefly for initial handshake completion
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if EnsureTunnelAlive(1500) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+
+	epochBefore := GetRecoveryEpoch()
+	for i := 0; i < 3; i++ {
+		if !EnsureTunnelAlive(1500) {
+			t.Fatalf("EnsureTunnelAlive returned false on healthy tunnel")
+		}
+	}
+	epochAfter := GetRecoveryEpoch()
+	if epochAfter != epochBefore {
+		t.Fatalf("EnsureTunnelAlive wiped/rebound healthy peer! epoch before=%d after=%d", epochBefore, epochAfter)
+	}
+}
+
+func TestEncryptDecryptBackupV1CrossPlatform(t *testing.T) {
+	payload := `{"schema":1,"profiles":[{"id":"p1","name":"WARP","privateKey":"TEST_KEY_123"}]}`
+	env, err := EncryptBackupV1(payload, "StrongPass!99")
+	if err != nil {
+		t.Fatalf("EncryptBackupV1 failed: %v", err)
+	}
+	if strings.Contains(env, "TEST_KEY_123") {
+		t.Fatalf("encrypted backup leaked plaintext secret")
+	}
+	if !strings.Contains(env, `"format": "wgplus-backup-v1"`) {
+		t.Fatalf("unexpected envelope format: %s", env)
+	}
+	if _, err := DecryptBackupV1(env, "WrongPass"); err == nil {
+		t.Fatalf("expected error on wrong passphrase")
+	}
+	plain, err := DecryptBackupV1(env, "StrongPass!99")
+	if err != nil {
+		t.Fatalf("DecryptBackupV1 failed: %v", err)
+	}
+	if plain != payload {
+		t.Fatalf("round-trip mismatch: got %q want %q", plain, payload)
+	}
+}
+
+func TestIpv6FastFailOnIpv4OnlyTunnel(t *testing.T) {
+	StopKillSwitchGuard()
+	StopTunnel()
+
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	srv := startLocalWgServer(t, "10.95.0.1", 1280, clientPub, "", "")
+	defer srv.closeAll()
+
+	tunPort, err := StartTunnelAdvanced(
+		clientPriv,
+		"",
+		"10.95.0.2/32",
+		"1.1.1.1",
+		srv.pubHex,
+		fmt.Sprintf("127.0.0.1:%d", srv.udpPort),
+		20,
+		1280,
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced failed: %v", err)
+	}
+	defer StopTunnel()
+
+	start := time.Now()
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", tunPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("SOCKS5 dial failed: %v", err)
+	}
+	defer c.Close()
+	_, _ = c.Write([]byte{0x05, 0x01, 0x00})
+	g := make([]byte, 2)
+	_, _ = io.ReadFull(c, g)
+
+	// Dial IPv6 literal 2001:67c:4e8::1 port 443 over IPv4-only tunnel
+	req := make([]byte, 22)
+	req[0], req[1], req[2], req[3] = 0x05, 0x01, 0x00, 0x04
+	copy(req[4:20], net.ParseIP("2001:67c:4e8::1").To16())
+	binary.BigEndian.PutUint16(req[20:22], 443)
+	_, _ = c.Write(req)
+
+	resp := make([]byte, 10)
+	if _, err := io.ReadFull(c, resp); err != nil {
+		t.Fatalf("failed reading SOCKS5 IPv6 fast-fail reply: %v", err)
+	}
+	elapsed := time.Since(start)
+	if resp[1] != 0x03 {
+		t.Fatalf("expected SOCKS5 reply 0x03 (network unreachable), got 0x%02x", resp[1])
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Fatalf("IPv6 fast-fail took too long (%v)", elapsed)
+	}
+}
+
 

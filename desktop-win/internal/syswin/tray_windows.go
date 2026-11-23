@@ -89,6 +89,10 @@ var (
 	modShell32  = windows.NewLazySystemDLL("shell32.dll")
 	modGdi32    = windows.NewLazySystemDLL("gdi32.dll")
 	modKernel32 = windows.NewLazySystemDLL("kernel32.dll")
+	modPowrprof = windows.NewLazySystemDLL("powrprof.dll")
+
+	procPowerRegisterSuspendResumeNotification   = modPowrprof.NewProc("PowerRegisterSuspendResumeNotification")
+	procPowerUnregisterSuspendResumeNotification = modPowrprof.NewProc("PowerUnregisterSuspendResumeNotification")
 
 	procGetModuleHandleW      = modKernel32.NewProc("GetModuleHandleW")
 	procRegisterClassExW      = modUser32.NewProc("RegisterClassExW")
@@ -285,10 +289,60 @@ func (h *Host) Stop() {
 	}
 }
 
+type deviceNotifySubscribeParams struct {
+	Callback uintptr
+	Context  uintptr
+}
+
+const deviceNotifyCallback = 2
+
+func registerModernStandbyNotification(h *Host) (uintptr, uintptr) {
+	if err := procPowerRegisterSuspendResumeNotification.Find(); err != nil {
+		return 0, 0
+	}
+	cb := windows.NewCallback(func(_ uintptr, powerType uint32, _ uintptr) uintptr {
+		switch powerType {
+		case pbtApmSuspend:
+			if h.callbacks.OnSuspend != nil {
+				go h.callbacks.OnSuspend()
+			}
+		case pbtApmResumeAuto, pbtApmResumeSusp:
+			if h.callbacks.OnWake != nil {
+				go h.callbacks.OnWake()
+			}
+		}
+		return 0
+	})
+	params := deviceNotifySubscribeParams{Callback: cb, Context: 0}
+	var regHandle uintptr
+	r1, _, _ := procPowerRegisterSuspendResumeNotification.Call(
+		deviceNotifyCallback,
+		uintptr(unsafe.Pointer(&params)),
+		uintptr(unsafe.Pointer(&regHandle)),
+	)
+	if r1 != 0 {
+		return 0, 0
+	}
+	return regHandle, cb
+}
+
+func unregisterModernStandbyNotification(regHandle uintptr) {
+	if regHandle == 0 {
+		return
+	}
+	if err := procPowerUnregisterSuspendResumeNotification.Find(); err != nil {
+		return
+	}
+	procPowerUnregisterSuspendResumeNotification.Call(regHandle)
+}
+
 func (h *Host) runMessageLoop(readyCh chan<- error, showTrayIcon bool) {
 	runtime.LockOSThread()
 	defer runtime.UnlockOSThread()
 	defer close(h.doneCh)
+
+	modernStandbyHandle, _ := registerModernStandbyNotification(h)
+	defer unregisterModernStandbyNotification(modernStandbyHandle)
 
 	hInst, _, _ := procGetModuleHandleW.Call(0)
 	clsName, _ := windows.UTF16PtrFromString(fmt.Sprintf("WireGuardPlusWinHost_%d", time.Now().UnixNano()))
