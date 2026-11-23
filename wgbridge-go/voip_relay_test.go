@@ -91,6 +91,13 @@ func TestVoipEndpointRelayUdpTcpDedupAndStop(t *testing.T) {
 		t.Fatalf("unexpected UDP reply %q", got)
 	}
 
+	deadline := time.Now().Add(1 * time.Second)
+	for time.Now().Before(deadline) {
+		if udpSocketsOpened.Load() > beforeOpen && udpPacketsTx.Load() > beforeTx && udpPacketsRx.Load() > beforeRx {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
 	if udpSocketsOpened.Load() <= beforeOpen || udpPacketsTx.Load() <= beforeTx || udpPacketsRx.Load() <= beforeRx {
 		t.Fatalf("expected UDP telemetry counters to increment (opened=%d->%d tx=%d->%d rx=%d->%d)",
 			beforeOpen, udpSocketsOpened.Load(),
