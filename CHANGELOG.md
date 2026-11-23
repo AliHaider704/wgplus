@@ -2,6 +2,27 @@
 
 All notable changes to **WireGuard Plus** (`Windows Desktop` & `Android org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [1.9.0] - 2026-11-23
+
+### Added
+- **Dedicated Telegram VoIP Call Relays (Android & Windows)**:
+  - **Android (`wgbridge-go/voip_relay.go`, `KeepaliveStatusProvider.java`, `XposedInit.java`)**: Added per-endpoint local `127.0.0.1` UDP/TCP VoIP relays (`StartVoipEndpointRelay`, 16-relay cap, 90s idle reaper) and targeted `Instance$Proxy` / endpoint rewriting for `tgcalls` so voice and video calls pass reliably without breaking connectivity.
+  - **Windows (`wgbridge-go/voip_tun_windows.go`, `desktop-win/internal/voiptun/`)**: Embedded official signed Wintun (`v0.14.1`) and added `StartWindowsVoipTun` (`WireGuardPlusCalls`, `10.254.254.2/30`, MTU `1280`) routing strictly the 9 official Telegram VoIP IPv4 CIDRs with endpoint-loop exclusion, full-cone NAT, and exact RFC 1071/768 checksums while leaving normal PC traffic and Tailscale/VPN routes untouched.
+- **In-App Diagnostics & Structured GitHub Issue Reporting (`wgbridge-go/diag.go`, `WgDiagnosticsLog.java`, `desktop-win/app.go`, `.github/ISSUE_TEMPLATE/bug_report.yml`)**: Added structured ring-buffer telemetry and a one-click diagnostic report copier formatted for GitHub bug reports.
+- **Mandatory Official Channel Prompt (`WireGuardDialog.java`, `ModuleLauncherActivity.java`, `desktop-win/frontend/dist/app.js`)**: Restored the first-launch official channel invitation modal (`@wgplus_official`) across both Android and Windows.
+
+### Fixed
+- **Telegram Voice & Video Calls Hanging / Disconnecting**: Resolved post-answer call handshake stalls and drops on both Android (universal, ARM64, and ARMv7 across Telegram/Plus/AyuGram) and Windows Desktop (`AyuGram.exe`, Telegram Desktop).
+- **Proxy Login Stalls & False Roaming Disconnects (`wgbridge-go/bridge.go`, `WireGuardManager.java`, `desktop-win/app.go`)**: Fixed hung loading states when signing into Telegram via the local proxy, prevented false tunnel teardowns on transient network-switch probes (`handleNetworkSwitch`), and improved Wi-Fi / Mobile Data continuity.
+- **One UI Adaptive & Monochrome Launcher Icon (`app/src/main/res/drawable/ic_launcher_*.xml`, `mipmap-anydpi-v26/`)**: Migrated legacy PNG icon foreground/monochrome layers to crisp adaptive vector drawables so the launcher icon renders cleanly across Samsung One UI and Material You launchers.
+
+### Security
+- **Mandatory Android Local SOCKS5 Auth (`WireGuardManager.java`, `wgbridge-go/bridge.go`)**: Enforced RFC 1929 local authentication (`performSocks5ClientAuth`) on Android loopback SOCKS5 connections with `SOCKS_AUTH`/`SOCKS_REJECT` diagnostic auditing.
+- **Android Keystore Fail-Closed Encryption (`WgKeystoreCrypto.java`)**: Eliminated plaintext storage fallback; keys now fall back strictly to a `0600` `noBackupFilesDir`-scoped AES-256-GCM key (`enc:v2:`) or fail closed.
+- **ContentProvider Caller Signature Verification (`KeepaliveStatusProvider.java`)**: Added SHA-256 signing certificate digest checks alongside package checks for cross-process IPC callers.
+- **Windows Loopback Process Guard Authenticode Validation (`desktop-win/internal/guard/process_guard_windows.go`)**: Added `WinVerifyTrust` Authenticode verification (`verifyAuthenticodeCached`) for basename-matched executables so spoofed binaries cannot bypass the strict loopback firewall.
+- **Fail-Closed Android Kill Switch & Redacted Backups (`XposedInit.java`, `WireGuardManager.java`, `WireGuardDialog.java`)**: Enforced port `9` blackhole fallback when Kill Switch is armed and the tunnel is down; stripped raw private/preshared keys from `MODE_WORLD_READABLE` sync bundles; switched multi-profile clipboard exports to passphrase-encrypted `wgplus-backup-v1` bundles (`exportEncryptedBackupV1`) flagged `IS_SENSITIVE` on Android 13+.
+
 ## [1.8.0] - 2026-11-23
 
 ### Added

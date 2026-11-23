@@ -1,10 +1,10 @@
 # End-User Installation & Troubleshooting Guide
 
-**WireGuard Plus** runs natively on **Windows 10/11 (x64)** with zero Administrator rights and no virtual network drivers, and on **Android 5.0+** (rootless via **LSPatch** or rooted via **LSPosed**).
+**WireGuard Plus** (`v1.9.0`) runs natively on **Windows 10/11 (x64)** (userspace proxy for Telegram chats/media plus an isolated `WireGuardPlusCalls` Wintun adapter scoped strictly to Telegram VoIP CIDRs) and on **Android 5.0+** (rootless via **LSPatch** or rooted via **LSPosed** / **Vector**).
 
 ---
 
-## Part 1: Windows Desktop & Portable (`v1.6.0`)
+## Part 1: Windows Desktop & Portable (`v1.9.0`)
 
 ### 1. Choosing Standard `.exe` vs Portable `.zip`
 
@@ -15,7 +15,7 @@
 
 ### 2. Adding Servers & Generating Free WARP (AWG 1.5)
 
-1. Launch `WireGuardPlus.exe` (zero UAC elevation prompt).
+1. Launch `WireGuardPlus.exe` (single executable; extracts embedded `wintun.dll` automatically when enabling `WireGuardPlusCalls` for Telegram voice/video calls).
 2. Add a WireGuard or AmneziaWG server using any method:
    - **Import `.conf`** (or drag-and-drop a `.conf` / QR image anywhere onto the window).
    - **Import QR** from an image file or **Paste (`Ctrl+V`)** raw `.conf` text or a copied QR screenshot straight from your clipboard.
@@ -36,14 +36,15 @@ To bind a client to your encrypted local SOCKS5 listener (`127.0.0.1:48729` with
 2. Click **Apply Proxy**: WireGuard Plus automatically copies the authenticated `tg://socks?...` link and dispatches it via the client's CLI/protocol handler. Click **Enable** inside the Telegram confirmation popup that appears.
 3. For USB/custom-folder portable clients that are currently closed, click **+ Add Portable `.exe`** once to browse to `Telegram.exe` or `AyuGram.exe`.
 
-> **Call Privacy Checklist (Required once on Windows Desktop):** Inside your Telegram desktop client, open **Settings -> Privacy and Security -> Calls -> Peer-to-Peer** and set it to **Nobody**. Otherwise, desktop Telegram may open a direct peer-to-peer UDP socket for voice/video calls instead of using the SOCKS5 UDP relay, revealing your ISP IP.
+> **Call Privacy Checklist (Required once on Windows Desktop):** Inside your Telegram desktop client, open **Settings -> Privacy and Security -> Calls -> Peer-to-Peer** and set it to **Nobody**. WireGuard Plus automatically starts the isolated `WireGuardPlusCalls` L3 adapter (`10.254.254.2/30`) scoped strictly to Telegram's 9 official VoIP IPv4 CIDRs so `tgcalls` voice/video media passes cleanly through your tunnel while keeping browsers, games, and Tailscale on your normal gateway. Setting **Peer-to-Peer: Nobody** prevents direct P2P IP exposure.
 
 ### 4. Loopback Armor, System Tray & Autostart
 
 - **Strict Loopback Kill Switch (ON by default):** Keeps `127.0.0.1:48729` bound and fails closed when disconnected so Telegram cannot fall back to direct connections.
-- **Loopback Process Firewall (`iphlpapi`):** Inspects the owning PID and executable path of every incoming loopback socket without requiring Admin privileges, blocking probes from unauthorized browsers or tools in `Strict (Telegram Clients Only)` mode.
-- **Sleep/Wake & Network Recovery:** Automatically listens for Windows `WM_POWERBROADCAST` resume events and `NotifyIpInterfaceChange` IP transitions to re-resolve endpoints and restore stale handshakes.
+- **Loopback Process Firewall (`iphlpapi` + Authenticode):** Inspects the owning PID and executable path of every incoming loopback socket and verifies Windows Authenticode signatures (`WinVerifyTrust`) for basename-matched executables, blocking unauthorized or spoofed processes in `Strict (Telegram Clients Only)` mode.
+- **Sleep/Wake & Network Recovery:** Automatically listens for Windows `WM_POWERBROADCAST` resume events and `NotifyIpInterfaceChange` IP transitions to re-resolve endpoints and restore stale handshakes without tearing down healthy sessions.
 - **Hide to Tray / Start with Windows:** Uses an optional pure-Go `HKCU\Software\Microsoft\Windows\CurrentVersion\Run` registry key (`--minimized`) that needs no Admin elevation.
+- **Copy Diagnostics & GitHub Issues:** Click **Copy Diagnostics** in the app (on Windows or Android) to generate a sanitized diagnostic report ready to paste into the structured [GitHub Bug Report form](../.github/ISSUE_TEMPLATE/bug_report.yml).
 
 ### 5. Windows Troubleshooting
 
@@ -64,7 +65,7 @@ To bind a client to your encrypted local SOCKS5 listener (`127.0.0.1:48729` with
 ### 1. Installation Methods
 
 #### Option A: Rootless Setup via LSPatch + One-Time Silent Continuity (Recommended)
-1. Install `WireGuardPlus-1.7.0.apk` directly on your phone.
+1. Install `WireGuardPlus-1.9.0-arm64-v8a.apk` (recommended for modern 64-bit phones), `WireGuardPlus-1.9.0-armeabi-v7a.apk`, or `WireGuardPlus-1.9.0.apk` directly on your phone.
 2. Install **LSPatch** ([JingMatrix fork](https://github.com/JingMatrix/LSPatch)), tap **Manage -> +**, and select your **Telegram Plus** (`org.telegram.plus`) or **Telegram** (`org.telegram.messenger`) APK (back up secret chats first if replacing an existing install with a different signature).
 3. Choose **Portable** (tick **Embed modules -> WireGuard Plus**, plus any other modules you use such as **TeleVip**) **or Local** mode (enable **WireGuard Plus** in **LSPatch -> Modules** and select Telegram in its scope).
 4. Tap **Start Patch** and install the patched Telegram APK.
@@ -72,8 +73,8 @@ To bind a client to your encrypted local SOCKS5 listener (`127.0.0.1:48729` with
 6. Enable **Wireless debugging** (choose *Always allow on this network* if prompted), tap **Pair device with pairing code**, pull down the notification shade, enter the **6-digit code** into the WireGuard Plus notification reply field, and tap Send.
 7. Done once: silent background protection stays active across **Wi-Fi**, **Mobile Data**, and **reboots** with zero ongoing notifications.
 
-#### Option B: Rooted Installation via LSPosed
-1. Install `WireGuardPlus-1.7.0.apk`.
+#### Option B: Rooted Installation via LSPosed / Vector
+1. Install `WireGuardPlus-1.9.0-arm64-v8a.apk` or `WireGuardPlus-1.9.0.apk`.
 2. Open **LSPosed Manager** -> **Modules** -> **WireGuard Plus**.
 3. Enable the module and check **Telegram Plus** (`org.telegram.plus`) and/or **Telegram** (`org.telegram.messenger`).
 4. Force-stop and reopen Telegram.
@@ -93,7 +94,7 @@ To bind a client to your encrypted local SOCKS5 listener (`127.0.0.1:48729` with
 
 - **Route voice and video calls through tunnel** (`تمرير المكالمات الصوتية والمرئية عبر النفق`) is enabled by default.
 - While enabled and connected:
-  - Both call signaling (`MTProto`) and real-time voice/video media (`tgcalls` UDP/TCP) pass through your encrypted WireGuard server.
+  - Both call signaling (`MTProto`) and real-time voice/video media (`tgcalls` UDP/TCP) pass through your encrypted WireGuard server via dedicated local `127.0.0.1` per-endpoint relays (`voip_relay.go`).
   - Direct peer-to-peer (`P2P`) UDP exposure is automatically disabled while the tunnel is active so your real ISP IP address is never revealed to the other party.
 - When you tap **Disconnect**, WireGuard Plus cleanly restores your previous Telegram proxy state.
 
@@ -110,6 +111,6 @@ Tap **Verify route & calls** (`فحص المسار والمكالمات`) at any
 |---------|-------|----------|
 | **Handshake timed out / Route check failed** | Expired VPN peer keys, or ISP blocking UDP port `51820` | Generate fresh WireGuard credentials, enable the **Client junk preset** under DPI Obfuscation, or choose a peer endpoint on an alternative UDP port (such as `443` or `53`). |
 | **Voice & video calls shows "TCP fallback only"** | Your VPN provider blocks outbound UDP port `53` inside the tunnel or restricts UDP forwarding | Calls still connect over Telegram's TCP reflector fallback through the tunnel; switching to a full-UDP WireGuard peer enables low-latency UDP media. |
-| **WireGuard button does not appear in Proxy Settings** | Module was not embedded or scoped in LSPatch/LSPosed | Re-patch Telegram in LSPatch Portable mode with `WireGuardPlus-1.7.0.apk` checked under **Embed modules** (or enable Telegram in **Modules** scope). |
+| **WireGuard button does not appear in Proxy Settings** | Module was not embedded or scoped in LSPatch/LSPosed | Re-patch Telegram in LSPatch Portable mode with `WireGuardPlus-1.9.0.apk` (or `-arm64-v8a.apk`) checked under **Embed modules** (or enable Telegram in **Modules** scope). |
 | **Persistent "Continuity Guard Active" notification still appears** | One-time silent continuity is not yet paired/activated, so safe foreground fallback is active | Open **WireGuard Plus**, ensure **Work silently in background without notification** is ON, tap **Activate protection & battery exemptions now**, and complete the one-time 6-digit Wireless Debugging pairing (or grant Root). |
 | **Wireless Debugging option missing** | Developer Options are hidden | Open Android **Settings -> About phone -> Software information**, tap **Build number** 7 times, then tap **Activate protection & battery exemptions now** inside WireGuard Plus again. |

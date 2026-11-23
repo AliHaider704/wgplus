@@ -29,7 +29,7 @@ Optional parameters:
 
 What `scripts/build-windows.ps1` executes:
 1. Runs `go vet ./...`, all Go engine tests inside `wgbridge-go/` (with `-race` if GCC is present), and `GOOS=android GOARCH=arm64 go build ./...` to guarantee shared-engine mobile compatibility.
-2. Runs `go vet ./...` and all package unit tests inside `desktop-win/` (`internal/clients`, `internal/config`, `internal/guard`, `internal/qr`, `internal/syswin`, `internal/vault`, `internal/warp`, `internal/watchdog`).
+2. Runs `go vet ./...` and all package unit tests inside `desktop-win/` (`internal/clients`, `internal/config`, `internal/guard`, `internal/qr`, `internal/syswin`, `internal/vault`, `internal/voiptun`, `internal/warp`, `internal/watchdog`).
 3. Builds `WireGuardPlus-Windows-x64.exe` via `wails build -clean -platform windows/amd64 -ldflags "-s -w"`.
 4. Packages `dist/WireGuardPlus-Windows-x64-Portable.zip` containing `WireGuardPlus.exe`, `portable.flag`, and `PORTABLE_README.txt`.
 5. Executes `WireGuardPlus-Windows-x64.exe --self-check`, verifying exit code `0` and `"ok": true`, then prints lowercase SHA-256 hashes for both release artifacts.
@@ -91,5 +91,5 @@ Upon completion the APK is copied to `dist/WireGuardPlus-<version>.apk`.
 #### Verify APK Signature Integrity
 
 ```powershell
-& "C:\Program Files (x86)\Android\android-sdk\build-tools\36.0.0\apksigner.bat" verify --verbose .\dist\WireGuardPlus-1.7.0.apk
+& "C:\Program Files (x86)\Android\android-sdk\build-tools\36.0.0\apksigner.bat" verify --verbose .\dist\WireGuardPlus-1.9.0.apk
 ```

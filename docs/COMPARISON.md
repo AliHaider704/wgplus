@@ -10,14 +10,14 @@ This page explains honestly how **WireGuard Plus** compares to regular **Telegra
 
 | Capability | WireGuard Plus (Windows) | Official WireGuard Windows | WireSock / TunnlTo | AmneziaVPN Desktop | Telegram MTProto / SOCKS5 Proxy |
 |------------|--------------------------|----------------------------|--------------------|--------------------|---------------------------------|
-| **Requires Admin / UAC elevation** | **No** (runs strictly `asInvoker`) | Yes (service + Wintun) | Yes (driver / service) | Yes (driver / service) | No |
-| **Installs Wintun / NDIS kernel driver** | **No** (pure userspace) | Yes (`wintun.dll`) | Yes (driver) | Yes (driver) | No |
-| **Conflict with Tailscale, AdGuard, or work VPNs** | **Zero** (leaves OS routing table untouched) | High (hijacks routes) | Moderate | High | Zero |
+| **Requires Admin / UAC elevation** | **Optional** (`asInvoker` for chats/media; scoped `WireGuardPlusCalls` adapter for calls) | Yes (service + Wintun) | Yes (driver / service) | Yes (driver / service) | No |
+| **Routes all system traffic via Wintun** | **No** (chats via SOCKS5; `WireGuardPlusCalls` scoped strictly to Telegram's 9 call CIDRs) | Yes (full/broad routes) | Yes (driver) | Yes (driver) | No |
+| **Conflict with Tailscale, AdGuard, or work VPNs** | **Zero** (leaves non-Telegram routes untouched) | High (hijacks routes) | Moderate | High | Zero |
 | **Portable USB / folder mode (zero AppData writes)** | **Yes** (`portable.flag` -> `./wgplus-data/`) | No | Limited | No | Inside client only |
 | **Portable Telegram, AyuGram, 64Gram, Unigram** | **Yes** (auto-detect + `+ Add Portable .exe` + `Apply Proxy`) | System-wide only | App path rules | App split-tunnel | Manual per client |
 | **AmneziaWG 1.5 (`I1`-`I5` QUIC mimicry) + Free WARP** | **Yes** (1-click generator + AWG 1.5) | No (standard WG only) | Limited | Yes | No |
-| **Zero-admin `iphlpapi` Loopback Process Firewall** | **Yes** (blocks unauthorized local probes by EXE) | N/A | N/A | N/A | None |
-| **Voice & video calls inside tunnel** | **Yes** (UDP + TCP; set P2P: Nobody in Telegram) | Yes | Yes | Yes | Breaks / IP leak |
+| **`iphlpapi` + Authenticode Loopback Process Firewall** | **Yes** (blocks unauthorized/spoofed local probes) | N/A | N/A | N/A | None |
+| **Voice & video calls inside tunnel** | **Yes** (isolated `WireGuardPlusCalls` Wintun L3 + SOCKS5 UDP; set P2P: Nobody in Telegram) | Yes | Yes | Yes | Breaks / IP leak |
 | **Bilingual Dark & Light UI** | **Yes** (English LTR + Arabic RTL) | Light system look | Dark/Basic | Complex setup UI | Built into Telegram |
 
 ---
@@ -52,9 +52,9 @@ This page explains honestly how **WireGuard Plus** compares to regular **Telegra
 - **Constant toggling:** Tunneling every background process wastes battery on mobile and breaks local workflows on PC whenever you switch between Telegram and everything else.
 
 ### 3. How WireGuard Plus Solves Both
-- Runs `wireguard-go` + `gVisor` netstack **strictly for Telegram** (`wgbridge-go` + `desktop-win/` on Windows; in-process on Android), leaving the rest of your PC or phone on its normal connection.
-- Requires **zero Admin on Windows** (portable USB folder supported) and **keeps Android's VPN slot free**.
-- Routes both messaging (`SOCKS5 CONNECT`) and real-time voice/video calls (`SOCKS5 UDP ASSOCIATE`) through your encrypted tunnel, armored on Windows by `iphlpapi` loopback process filtering and RFC 1929 authentication.
+- Runs `wireguard-go` + `gVisor` netstack **strictly for Telegram** (`wgbridge-go` + `desktop-win/` on Windows; in-process on Android), leaving browsers, games, banking apps, and Tailscale on their normal connection.
+- Keeps Android's single `VpnService` slot completely free and routes Android VoIP via local `127.0.0.1` UDP/TCP endpoint relays; on Windows, supports portable USB mode (`portable.flag`) while isolating calls cleanly via the `WireGuardPlusCalls` Wintun L3 adapter scoped strictly to Telegram's 9 IPv4 call CIDRs.
+- Armored on Windows by `iphlpapi` loopback filtering + `WinVerifyTrust` Authenticode checks + RFC 1929 authentication, and on Android by mandatory local SOCKS5 auth, caller signing-certificate validation, and fail-closed Keystore/Kill Switch protection.
 - Adds **AmneziaWG 1.0 / 1.5 DPI obfuscation** (`I1`-`I5` QUIC mimicry, junk bursts, padding, WARP `Reserved`) plus **DoH** endpoint resolution to survive networks that block standard WireGuard handshakes.
 
 ---
@@ -64,7 +64,7 @@ This page explains honestly how **WireGuard Plus** compares to regular **Telegra
 WireGuard Plus is **not** the right tool for every scenario. Pick another tool if:
 
 - **You need to unblock your browser, YouTube, Instagram, or the entire device:** WireGuard Plus intentionally tunnels **only Telegram**. Use a system-wide WireGuard or AmneziaWG client if you need device-wide tunneling.
-- **On Windows, you want zero app proxy configuration at the OS kernel level:** WireGuard Plus connects Telegram via a loopback SOCKS5 URI (1-click **Apply Proxy** button or copy-paste) specifically so it needs zero Admin/drivers. Also remember to set **Calls -> Peer-to-Peer: Nobody** inside desktop Telegram once so Telegram does not establish direct P2P UDP calls outside its proxy setting.
+- **On Windows, you cannot allow any Telegram client proxy or isolated VoIP adapter:** WireGuard Plus connects desktop Telegram chats via an authenticated `127.0.0.1` SOCKS5 URI and routes Telegram's 9 call IPv4 CIDRs through `WireGuardPlusCalls` (without touching non-Telegram routes). Remember to set **Calls -> Peer-to-Peer: Nobody** inside desktop Telegram once so Telegram never exposes your real IP via direct P2P.
 - **On Android, you cannot install a patched Telegram APK (LSPatch) and do not have Root (LSPosed):** Because Android's non-VpnService path operates inside the Telegram process, it requires LSPatch (rootless) or LSPosed (root).
 - **You only want a zero-setup 1-tap public proxy and never make Telegram calls:** A trusted MTProto proxy link requires no separate app if you only text and accept proxy limitations.
 
