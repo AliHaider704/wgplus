@@ -1259,47 +1259,52 @@ public final class WireGuardDialog {
                 quickWarpBtn.setText(WgStrings.quickWarpBtn(isAr, false));
             } else if (active && port > 0) {
                 showDisconnect = true;
-                if (sharedObserved) {
+                WireGuardManager.TunnelStats stats = sharedObserved
+                        ? new WireGuardManager.TunnelStats()
+                        : WireGuardManager.getLiveStats(ctx, moduleApkPath);
+                long hsSec = sharedObserved
+                        ? WireGuardManager.getSharedTunnelLastHandshakeSec(ctx)
+                        : stats.lastHandshakeSec;
+                stats.lastHandshakeSec = hsSec;
+                long nowEpoch = System.currentTimeMillis() / 1000L;
+                boolean recentHs = hsSec > 0L
+                        && Math.max(0L, nowEpoch - hsSec) < WireGuardManager.HANDSHAKE_HEALTHY_WINDOW_SEC;
+                final Runnable safeUiRefresh = () -> {
+                    if (dialog.isShowing() && latestStatsRefreshRef[0] != null) {
+                        latestStatsRefreshRef[0].run();
+                    }
+                };
+                if (recentHs) {
                     state.observedActiveNoHsAtMs = 0L;
                     statusDot.setBackground(WgTheme.statusDot(ctx, theme.activeDot));
                     statusHeadline.setText(WgStrings.statusActiveWithProfile(isAr, connectedName, port));
                     statusHeadline.setTextColor(theme.activeText);
-                    statusSubline.setText(WgStrings.sharedTunnelActiveSubline(isAr, port));
+                    statusSubline.setText(sharedObserved
+                            ? WgStrings.sharedTunnelActiveSubline(isAr, port)
+                            : WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec));
                     recoveryBox.setVisibility(View.GONE);
-                } else {
-                    WireGuardManager.TunnelStats stats = WireGuardManager.getLiveStats(ctx, moduleApkPath);
-                    long nowEpoch = System.currentTimeMillis() / 1000L;
-                    boolean recentHs = stats.lastHandshakeSec > 0
-                            && Math.max(0L, nowEpoch - stats.lastHandshakeSec) < 150L;
-                    if (recentHs) {
-                        state.observedActiveNoHsAtMs = 0L;
-                        statusDot.setBackground(WgTheme.statusDot(ctx, theme.activeDot));
-                        statusHeadline.setText(WgStrings.statusActiveWithProfile(isAr, connectedName, port));
-                        statusHeadline.setTextColor(theme.activeText);
-                        statusSubline.setText(WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec));
-                        recoveryBox.setVisibility(View.GONE);
-                    } else {
-                        long startedMs = WireGuardManager.getTunnelStartedAtMs();
-                        if (startedMs <= 0L) {
-                            if (state.observedActiveNoHsAtMs <= 0L) {
-                                state.observedActiveNoHsAtMs = SystemClock.elapsedRealtime();
-                            }
-                            startedMs = state.observedActiveNoHsAtMs;
-                        }
-                        long elapsedMs = Math.max(0L, SystemClock.elapsedRealtime() - startedMs);
-                        boolean staleOldHs = stats.lastHandshakeSec > 0 && (nowEpoch - stats.lastHandshakeSec) >= 150L;
-                        boolean stalled = elapsedMs >= 10_000L || staleOldHs;
-
-                        statusDot.setBackground(WgTheme.statusDot(ctx, theme.pendingDot));
-                        statusHeadline.setText(stalled
-                                ? WgStrings.statusStalledWithProfile(isAr, connectedName)
-                                : WgStrings.statusAwaitingHandshakeWithProfile(isAr, connectedName));
-                        statusHeadline.setTextColor(theme.pendingText);
-                        statusSubline.setText(stalled
-                                ? WgStrings.statusStalledHint(isAr)
-                                : WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec));
-                        recoveryBox.setVisibility(stalled ? View.VISIBLE : View.GONE);
+                    if (Math.max(0L, nowEpoch - hsSec) >= WireGuardManager.PROACTIVE_HANDSHAKE_NUDGE_AGE_SEC) {
+                        WireGuardManager.nudgeTunnelHandshakeAsync(ctx, moduleApkPath, safeUiRefresh);
                     }
+                } else {
+                    if (state.observedActiveNoHsAtMs <= 0L) {
+                        state.observedActiveNoHsAtMs = SystemClock.elapsedRealtime();
+                    }
+                    WireGuardManager.nudgeTunnelHandshakeAsync(ctx, moduleApkPath, safeUiRefresh);
+                    long elapsedMs = Math.max(0L, SystemClock.elapsedRealtime() - state.observedActiveNoHsAtMs);
+                    boolean stalled = elapsedMs >= 10_000L;
+
+                    statusDot.setBackground(WgTheme.statusDot(ctx, theme.pendingDot));
+                    statusHeadline.setText(stalled
+                            ? WgStrings.statusStalledWithProfile(isAr, connectedName)
+                            : WgStrings.statusAwaitingHandshakeWithProfile(isAr, connectedName));
+                    statusHeadline.setTextColor(theme.pendingText);
+                    statusSubline.setText(stalled
+                            ? WgStrings.statusStalledHint(isAr)
+                            : (sharedObserved
+                            ? WgStrings.sharedTunnelActiveSubline(isAr, port)
+                            : WgStrings.liveStatsLine(isAr, stats.rxBytes, stats.txBytes, stats.lastHandshakeSec)));
+                    recoveryBox.setVisibility(stalled ? View.VISIBLE : View.GONE);
                 }
                 connectBtn.setEnabled(true);
                 connectBtn.setText(viewingDifferentFromConnected

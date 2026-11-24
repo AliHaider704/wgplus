@@ -31,6 +31,7 @@ function Resolve-AdbExe {
     if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
         $candidates += (Join-Path $env:LOCALAPPDATA "Android\Sdk\platform-tools\adb.exe")
     }
+    $candidates += "C:\Program Files (x86)\Android\android-sdk\platform-tools\adb.exe"
     $candidates += "C:\Users\Ali\Downloads\Compressed\rootAVD-master\rootAVD-master\adb.exe"
     foreach ($c in $candidates) {
         if (-not [string]::IsNullOrWhiteSpace($c) -and (Test-Path $c)) {

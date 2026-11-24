@@ -301,7 +301,7 @@ func StartWindowsVoipTun(dllDir string) error {
 		dialer:  dialer,
 		ctx:     tunCtx,
 		cancel:  tunCancel,
-		writeCh: make(chan voipTunWriteItem, 512),
+		writeCh: make(chan voipTunWriteItem, 4096),
 		statEnt: trackClientConnStart(voipTunClientLabel),
 		nat:     make(map[voipTunNatKey]*voipTunNatEntry),
 	}

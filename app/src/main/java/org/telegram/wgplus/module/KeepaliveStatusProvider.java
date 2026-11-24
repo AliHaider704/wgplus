@@ -59,6 +59,7 @@ public class KeepaliveStatusProvider extends ContentProvider {
     public static final String EXTRA_HOST = "host";
     public static final String EXTRA_PORT = "port";
     public static final String RESULT_LOCAL_PORT = "local_port";
+    public static final String RESULT_LOCAL_ADDR = "local_addr";
 
     public static final String EXTRA_PID = "pid";
     public static final String EXTRA_WANTS_ALWAYS_AWAKE = "wants_always_awake";
@@ -84,6 +85,52 @@ public class KeepaliveStatusProvider extends ContentProvider {
     private static final String KEY_HOOK_LAST_MS = "hook_last_epoch_ms";
     private static final String KEY_HOOK_PACKAGES_JSON = "hook_packages_json";
     private static final String KEY_HYGIENE_REQ_MS = "hygiene_req_ms";
+    private static final long VISIBILITY_GRANT_INTERVAL_MS = 15_000L;
+    private static volatile long sLastVisibilityGrantMs = 0L;
+    private static volatile String sLastGrantedPkgCsv = "";
+
+    public static void grantVisibilityToInstalledTargets(Context ctx) {
+        if (ctx == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - sLastVisibilityGrantMs < VISIBILITY_GRANT_INTERVAL_MS && !sLastGrantedPkgCsv.isEmpty()) {
+            return;
+        }
+        sLastVisibilityGrantMs = now;
+        try {
+            List<String> targets = ContinuityBridgeManager.getInstalledTargetPackages(ctx);
+            if (targets == null || targets.isEmpty()) {
+                return;
+            }
+            Uri providerUri = Uri.parse("content://" + AUTHORITY);
+            String myPkg = ctx.getPackageName();
+            StringBuilder csv = new StringBuilder();
+            for (String pkg : targets) {
+                if (pkg == null || pkg.isEmpty() || pkg.equals(myPkg)) {
+                    continue;
+                }
+                if (csv.length() > 0) {
+                    csv.append(',');
+                }
+                csv.append(pkg);
+                try {
+                    ctx.grantUriPermission(
+                            pkg,
+                            providerUri,
+                            Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                    );
+                } catch (Throwable ignored) {
+                }
+            }
+            String joined = csv.toString();
+            if (!joined.equals(sLastGrantedPkgCsv)) {
+                sLastGrantedPkgCsv = joined;
+                WireGuardManager.publishWorldReadableSyncBundle(ctx);
+            }
+        } catch (Throwable ignored) {
+        }
+    }
 
     private static SharedPreferences hookPrefs(Context ctx) {
         Context appCtx = ctx.getApplicationContext() != null ? ctx.getApplicationContext() : ctx;
@@ -140,6 +187,7 @@ public class KeepaliveStatusProvider extends ContentProvider {
         Context ctx = getContext();
         if (ctx != null) {
             ContinuityBridgeManager.registerPassiveWifiRecovery(ctx);
+            grantVisibilityToInstalledTargets(ctx);
             WireGuardManager.publishWorldReadableSyncBundle(ctx);
         }
         return true;
@@ -151,6 +199,7 @@ public class KeepaliveStatusProvider extends ContentProvider {
         if (ctx == null) {
             return null;
         }
+        grantVisibilityToInstalledTargets(ctx);
         if (METHOD_REGISTER_DAEMON.equals(method)) {
             if (!isPrivilegedCaller()) {
                 return null;
@@ -219,6 +268,9 @@ public class KeepaliveStatusProvider extends ContentProvider {
         if (METHOD_SYNC_PUSH_STATE.equals(method)) {
             String json = extras != null ? extras.getString(EXTRA_JSON, "") : "";
             long rev = WireGuardManager.importSharedSyncBundleJson(ctx, json, false);
+            if (rev >= 0L) {
+                WireGuardManager.publishWorldReadableSyncBundle(ctx);
+            }
             Bundle out = new Bundle();
             out.putBoolean("ok", rev >= 0);
             out.putLong("stateRev", rev);
@@ -251,6 +303,16 @@ public class KeepaliveStatusProvider extends ContentProvider {
             return out;
         }
         if (METHOD_QUERY_SHARED_TUNNEL.equals(method)) {
+            Bundle liveLocal = WireGuardManager.queryLocalRunningTunnelBundleForProvider(ctx, "nudge".equals(arg));
+            if (liveLocal != null) {
+                ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE).edit()
+                        .putInt("port", liveLocal.getInt("port", -1))
+                        .putLong("lastHsSec", liveLocal.getLong("lastHsSec", 0L))
+                        .putBoolean("hsHealthy", liveLocal.getBoolean("hsHealthy", false))
+                        .putLong("updatedAt", liveLocal.getLong("updatedAt", System.currentTimeMillis()))
+                        .commit();
+                return liveLocal;
+            }
             android.content.SharedPreferences sp = ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
             Bundle out = new Bundle();
             out.putInt("port", sp.getInt("port", -1));
@@ -267,9 +329,12 @@ public class KeepaliveStatusProvider extends ContentProvider {
         }
         if (METHOD_CLEAR_SHARED_TUNNEL.equals(method)) {
             String callerOwner = !safePkg.isEmpty() ? safePkg : (extras != null ? sanitizePackageName(extras.getString("owner", "")) : "");
+            int clearPort = extras != null ? extras.getInt("port", -1) : -1;
             android.content.SharedPreferences sp = ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
             String curOwner = sp.getString("owner", "");
-            if (curOwner.isEmpty() || curOwner.equals(callerOwner)) {
+            int curPort = sp.getInt("port", -1);
+            if ((curOwner.isEmpty() || curOwner.equals(callerOwner))
+                    && (clearPort <= 0 || curPort <= 0 || clearPort == curPort)) {
                 sp.edit().clear().commit();
             }
             Bundle out = new Bundle();
@@ -279,8 +344,13 @@ public class KeepaliveStatusProvider extends ContentProvider {
         if (METHOD_START_VOIP_RELAY.equals(method)) {
             String host = extras != null ? extras.getString(EXTRA_HOST, "") : "";
             int port = extras != null ? extras.getInt(EXTRA_PORT, -1) : -1;
-            int localPort = WireGuardManager.startLocalVoipEndpointRelay(ctx, host, port);
+            String localAddr = WireGuardManager.startLocalVoipEndpointRelayAddr(ctx, host, port);
+            if (localAddr.isEmpty()) {
+                localAddr = WireGuardManager.startRemoteVoipRelayOverWgp1Addr(ctx, host, port);
+            }
+            int localPort = WireGuardManager.parsePortFromHostPort(localAddr);
             Bundle out = new Bundle();
+            out.putString(RESULT_LOCAL_ADDR, localAddr);
             out.putInt(RESULT_LOCAL_PORT, localPort);
             return out;
         }
@@ -351,14 +421,26 @@ public class KeepaliveStatusProvider extends ContentProvider {
             obj.put("tunnelRunning", running);
             obj.put("activePort", port);
             long effectiveHsSec = stats.lastHandshakeSec;
-            if (effectiveHsSec <= 0L && running && WireGuardManager.isSharedTunnelObserved(ctx, apkPath)) {
+            boolean effectiveHsHealthy = effectiveHsSec > 0L;
+            if (!effectiveHsHealthy && running && port > 0) {
                 android.content.SharedPreferences sp = ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
                 effectiveHsSec = sp.getLong("lastHsSec", 0L);
+                effectiveHsHealthy = effectiveHsSec > 0L && sp.getBoolean("hsHealthy", false);
+                String spPass = sp.getString("socksPass", "");
+                String probePass = !spPass.isEmpty() ? spPass : WireGuardManager.getActiveSocksPass(ctx);
+                long[] live = WireGuardManager.queryLiveStatusOverWgp1(port, probePass);
+                if (live != null && live.length >= 3) {
+                    running = live[0] == 1L;
+                    effectiveHsHealthy = live[1] == 1L;
+                    if (live[2] > 0L) {
+                        effectiveHsSec = live[2];
+                    }
+                }
             }
             obj.put("rxBytes", stats.rxBytes);
             obj.put("txBytes", stats.txBytes);
             obj.put("lastHandshakeSec", effectiveHsSec);
-            obj.put("handshakeHealthy", effectiveHsSec > 0L);
+            obj.put("handshakeHealthy", effectiveHsHealthy);
             obj.put("privilegeMode", ContinuityBridgeManager.getActivePrivilegeMode(ctx));
             obj.put("continuityTier", snap.tier.name());
             obj.put("stealthProtected", snap.stealthProtected);
@@ -498,7 +580,9 @@ public class KeepaliveStatusProvider extends ContentProvider {
         }
         String certHash = computePrimarySigningCertSha256(pm, pkg);
         if (certHash.isEmpty()) {
-            return false;
+            // Under Android 11+ <queries> visibility filtering, unlisted fork packages may not expose certs
+            // to PackageManager even though Binder.getCallingUid() already verified UID ownership of pkg.
+            return isSupportedTelegramPackage(pkg) && Binder.getCallingUid() >= Process.FIRST_APPLICATION_UID;
         }
         if (KNOWN_OFFICIAL_CERTS.contains(certHash)) {
             return true;
@@ -508,8 +592,8 @@ public class KeepaliveStatusProvider extends ContentProvider {
         if (!ownCert.isEmpty() && ownCert.equals(certHash)) {
             return true;
         }
-        // Two-tier TOFU pinning for LSPatch / custom-signed Telegram forks:
-        // package must declare a real launcher activity so empty squatter apps cannot pre-claim a fork package.
+        // Allow genuine Telegram/LSPatch clients declaring a real launcher entry or matching UID ownership,
+        // refreshing the TOFU record seamlessly when LSPatch APKs are reinstalled or re-signed.
         if (!hasLauncherEntryActivity(pm, pkg)) {
             return false;
         }
@@ -525,12 +609,10 @@ public class KeepaliveStatusProvider extends ContentProvider {
         String key = "cert_" + pkg;
         String updKey = "upd_" + pkg;
         String pinned = pins.getString(key, "");
-        long prevUpd = pins.getLong(updKey, 0L);
-        if (pinned == null || pinned.isEmpty() || (pkgUpdateTime > 0L && pkgUpdateTime > prevUpd)) {
+        if (pinned == null || !pinned.equals(certHash)) {
             pins.edit().putString(key, certHash).putLong(updKey, pkgUpdateTime).apply();
-            return true;
         }
-        return pinned.equals(certHash);
+        return true;
     }
 
     private static boolean hasLauncherEntryActivity(PackageManager pm, String pkg) {

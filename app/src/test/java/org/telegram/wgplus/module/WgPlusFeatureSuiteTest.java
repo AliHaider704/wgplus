@@ -730,6 +730,122 @@ public class WgPlusFeatureSuiteTest {
         assertTrue(sanitized.contains("[REDACTED]") || sanitized.contains("[KEY_REDACTED]"));
     }
 
+    @Test
+    public void testRewriteGroupCallJoinPayloadRelaysAndBlackholesSafely() throws Exception {
+        String samplePayload = "{"
+                + "\"transport\":{"
+                + "\"ufrag\":\"abc\",\"pwd\":\"xyz\","
+                + "\"candidates\":["
+                + "{\"ip\":\"149.154.167.220\",\"port\":\"1400\",\"protocol\":\"udp\"},"
+                + "{\"ip\":\"2001:67c:4e8::1\",\"port\":1401,\"protocol\":\"tcp\"},"
+                + "{\"ip\":\"127.0.0.1\",\"port\":\"5555\",\"protocol\":\"udp\"}"
+                + "]"
+                + "}"
+                + "}";
+
+        final java.util.concurrent.atomic.AtomicInteger calls = new java.util.concurrent.atomic.AtomicInteger(0);
+        String rewritten = WireGuardManager.rewriteGroupCallJoinPayload(
+                samplePayload,
+                (host, port) -> {
+                    calls.incrementAndGet();
+                    return port == 1400 ? 41100 : 41101;
+                },
+                false
+        );
+        assertEquals(2, calls.get());
+        org.json.JSONObject root = new org.json.JSONObject(rewritten);
+        org.json.JSONArray cands = root.getJSONObject("transport").getJSONArray("candidates");
+        assertEquals("127.0.0.1", cands.getJSONObject(0).getString("ip"));
+        assertEquals("41100", cands.getJSONObject(0).getString("port"));
+        assertEquals("127.0.0.1", cands.getJSONObject(1).getString("ip"));
+        assertEquals(41101, cands.getJSONObject(1).getInt("port"));
+        assertEquals("127.0.0.1", cands.getJSONObject(2).getString("ip"));
+        assertEquals("5555", cands.getJSONObject(2).getString("port"));
+
+        // Re-running on already-relayed payload must be idempotent (0 new relays).
+        calls.set(0);
+        String secondPass = WireGuardManager.rewriteGroupCallJoinPayload(rewritten, (h, p) -> {
+            calls.incrementAndGet();
+            return 49999;
+        }, false);
+        assertEquals(0, calls.get());
+        assertEquals(rewritten, secondPass);
+
+        // When tunnel is down and killSwitchBlackhole=true, external candidates map to 127.0.0.1:9.
+        String blackholed = WireGuardManager.rewriteGroupCallJoinPayload(samplePayload, (h, p) -> 0, true);
+        org.json.JSONArray bhCands = new org.json.JSONObject(blackholed)
+                .getJSONObject("transport").getJSONArray("candidates");
+        assertEquals("127.0.0.1", bhCands.getJSONObject(0).getString("ip"));
+        assertEquals("9", bhCands.getJSONObject(0).getString("port"));
+        assertEquals(9, bhCands.getJSONObject(1).getInt("port"));
+    }
+
+    @Test
+    public void testWgp1AndKeylessSyncRevProtection() throws Exception {
+        // Verify keyless XSharedPreferences bundles declare hasSecrets=false and carry no privateKey/socksPass
+        org.json.JSONObject fullBundle = new org.json.JSONObject();
+        fullBundle.put("stateRev", 5);
+        fullBundle.put("hasSecrets", true);
+        fullBundle.put("socksUser", "wg");
+        fullBundle.put("socksPass", "unified-secret");
+        org.json.JSONObject pFull = new org.json.JSONObject();
+        pFull.put("id", "p1");
+        pFull.put("endpoint", "engage.cloudflareclient.com:2408");
+        pFull.put("privateKey", SAMPLE_PRIV_B64);
+        fullBundle.put("profiles", new org.json.JSONArray().put(pFull));
+        assertTrue(fullBundle.getBoolean("hasSecrets"));
+        assertEquals("unified-secret", fullBundle.getString("socksPass"));
+
+        // Verify keyless bundle (hasSecrets=false) omits secrets
+        org.json.JSONObject stripped = new org.json.JSONObject(fullBundle.toString());
+        stripped.put("hasSecrets", false);
+        stripped.remove("socksUser");
+        stripped.remove("socksPass");
+        stripped.getJSONArray("profiles").getJSONObject(0).remove("privateKey");
+        assertFalse(stripped.has("socksPass"));
+        assertFalse(stripped.getJSONArray("profiles").getJSONObject(0).has("privateKey"));
+
+        // Verify WGP1 profile signature matching (shared-hub deduplication without ContentResolver)
+        assertTrue(WireGuardManager.wgp1ProfileSigMatches(null, "engage.cloudflareclient.com:2408|abc=", "engage.cloudflareclient.com:2408|abc="));
+        assertTrue(WireGuardManager.wgp1ProfileSigMatches(null, null, "engage.cloudflareclient.com:2408|abc="));
+        assertFalse(WireGuardManager.wgp1ProfileSigMatches(null, "engage.cloudflareclient.com:2408|abc=", "engage.cloudflareclient.com:2408|def="));
+        assertFalse(WireGuardManager.wgp1ProfileSigMatches(null, "engage.cloudflareclient.com:2408|abc=", ""));
+
+        // Verify PUBLIC_STATUS hash matching
+        String sigHash = WireGuardManager.computeProfileSigHash("engage.cloudflareclient.com:2408|abc=");
+        assertEquals(12, sigHash.length());
+        assertTrue(WireGuardManager.wgp1ProfileSigMatches(null, "engage.cloudflareclient.com:2408|abc=", "HASH:" + sigHash));
+        assertFalse(WireGuardManager.wgp1ProfileSigMatches(null, "engage.cloudflareclient.com:2408|abc=", "HASH:000000000000"));
+
+        // Verify deterministic HMAC-SHA256 loopback SOCKS secret derived from PrivateKey
+        String det1 = WireGuardManager.deriveProfileSocksPass(SAMPLE_PRIV_B64);
+        String det2 = WireGuardManager.deriveProfileSocksPass(WireGuardManager.normalizeKeyToHex(SAMPLE_PRIV_B64));
+        assertEquals(32, det1.length());
+        assertEquals(det1, det2);
+        assertFalse(det1.equals(WireGuardManager.deriveProfileSocksPass(SAMPLE_PUB_B64)));
+
+        // Verify 127.0.0.x port-preserving group-call rewrite + idempotence
+        String grpPayload = "{\"transport\":{\"candidates\":[{\"ip\":\"91.108.9.85\",\"port\":1400},{\"ip\":\"127.0.0.7\",\"port\":1400}]}}";
+        final java.util.concurrent.atomic.AtomicInteger grpCalls = new java.util.concurrent.atomic.AtomicInteger(0);
+        String grpOut = WireGuardManager.rewriteGroupCallJoinPayloadAddr(
+                grpPayload,
+                (host, port) -> {
+                    grpCalls.incrementAndGet();
+                    return "127.0.0.7:" + port;
+                },
+                false
+        );
+        assertEquals(1, grpCalls.get());
+        assertTrue(grpOut.contains("127.0.0.7"));
+    }
+
+    @Test
+    public void testHandshakeHealthWindowAlignedWithGoAndProactiveNudge() {
+        assertEquals(210L, WireGuardManager.HANDSHAKE_HEALTHY_WINDOW_SEC);
+        assertEquals(120L, WireGuardManager.PROACTIVE_HANDSHAKE_NUDGE_AGE_SEC);
+        assertTrue(WireGuardManager.PROACTIVE_HANDSHAKE_NUDGE_AGE_SEC < WireGuardManager.HANDSHAKE_HEALTHY_WINDOW_SEC);
+    }
+
     private static double contrastRatio(int rgb1, int rgb2) {
         double l1 = relativeLuminance(rgb1);
         double l2 = relativeLuminance(rgb2);

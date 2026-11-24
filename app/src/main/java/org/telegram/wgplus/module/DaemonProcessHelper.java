@@ -65,7 +65,8 @@ public final class DaemonProcessHelper {
             "GET_USAGE_STATS",
             "LOADER_USAGE_STATS",
             "ACTIVATE_VPN",
-            "ACTIVATE_PLATFORM_VPN"
+            "ACTIVATE_PLATFORM_VPN",
+            "QUERY_ALL_PACKAGES"
     };
 
     private static final Binder sDaemonToken = new Binder();

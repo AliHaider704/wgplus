@@ -32,7 +32,7 @@ public class ModuleLauncherActivity extends Activity {
 
     private static final int REQ_POST_NOTIFICATIONS = 7102;
     private static final long STALLED_HANDSHAKE_THRESHOLD_MS = 10_000L;
-    private static final long STALE_HANDSHAKE_THRESHOLD_SEC = 150L;
+    private static final long STALE_HANDSHAKE_THRESHOLD_SEC = WireGuardManager.HANDSHAKE_HEALTHY_WINDOW_SEC;
 
     private static volatile boolean sAutoContinuityAttemptedThisSession = false;
 
@@ -281,41 +281,35 @@ public class ModuleLauncherActivity extends Activity {
                 : new WireGuardManager.TunnelStats();
         int handshakeStateCode = 0; // 0=idle, 1=handshaking, 2=verified, 3=stalled
         if (active && port > 0) {
-            if (sharedObserved) {
-                long sharedHsSec = WireGuardManager.getSharedTunnelLastHandshakeSec(this);
-                long nowEpoch = System.currentTimeMillis() / 1000L;
-                boolean sharedRecent = sharedHsSec > 0L
-                        && Math.max(0L, nowEpoch - sharedHsSec) < STALE_HANDSHAKE_THRESHOLD_SEC;
-                stats.lastHandshakeSec = sharedHsSec;
-                if (sharedRecent) {
-                    mObservedActiveNoHsAtMs = 0L;
-                    handshakeStateCode = 2;
-                } else {
-                    if (mObservedActiveNoHsAtMs <= 0L) {
-                        mObservedActiveNoHsAtMs = SystemClock.elapsedRealtime();
-                    }
-                    long elapsedNoHs = Math.max(0L, SystemClock.elapsedRealtime() - mObservedActiveNoHsAtMs);
-                    handshakeStateCode = elapsedNoHs >= STALLED_HANDSHAKE_THRESHOLD_MS ? 3 : 1;
+            long hsSec = sharedObserved ? WireGuardManager.getSharedTunnelLastHandshakeSec(this) : stats.lastHandshakeSec;
+            stats.lastHandshakeSec = hsSec;
+            long nowEpoch = System.currentTimeMillis() / 1000L;
+            boolean recentHs = hsSec > 0L
+                    && Math.max(0L, nowEpoch - hsSec) < STALE_HANDSHAKE_THRESHOLD_SEC;
+            if (recentHs) {
+                mObservedActiveNoHsAtMs = 0L;
+                handshakeStateCode = 2;
+                if (Math.max(0L, nowEpoch - hsSec) >= WireGuardManager.PROACTIVE_HANDSHAKE_NUDGE_AGE_SEC) {
+                    WireGuardManager.nudgeTunnelHandshakeAsync(this, sourceApk, () -> {
+                        if (!mDestroyed) {
+                            renderScreen();
+                        }
+                    });
                 }
             } else {
-                long nowEpoch = System.currentTimeMillis() / 1000L;
-                boolean recentHs = stats.lastHandshakeSec > 0
-                        && Math.max(0L, nowEpoch - stats.lastHandshakeSec) < STALE_HANDSHAKE_THRESHOLD_SEC;
-                if (recentHs) {
-                    mObservedActiveNoHsAtMs = 0L;
-                    handshakeStateCode = 2;
-                } else {
-                    long startedAtMs = WireGuardManager.getTunnelStartedAtMs();
-                    if (startedAtMs <= 0L) {
-                        if (mObservedActiveNoHsAtMs <= 0L) {
-                            mObservedActiveNoHsAtMs = SystemClock.elapsedRealtime();
-                        }
-                        startedAtMs = mObservedActiveNoHsAtMs;
+                if (mObservedActiveNoHsAtMs <= 0L) {
+                    mObservedActiveNoHsAtMs = SystemClock.elapsedRealtime();
+                }
+                WireGuardManager.nudgeTunnelHandshakeAsync(this, sourceApk, () -> {
+                    if (!mDestroyed) {
+                        renderScreen();
                     }
-                    long elapsedNoHs = Math.max(0L, SystemClock.elapsedRealtime() - startedAtMs);
-                    boolean staleOldHs = stats.lastHandshakeSec > 0
-                            && (nowEpoch - stats.lastHandshakeSec) >= STALE_HANDSHAKE_THRESHOLD_SEC;
-                    handshakeStateCode = (elapsedNoHs >= STALLED_HANDSHAKE_THRESHOLD_MS || staleOldHs) ? 3 : 1;
+                });
+                long elapsedNoHs = Math.max(0L, SystemClock.elapsedRealtime() - mObservedActiveNoHsAtMs);
+                handshakeStateCode = elapsedNoHs >= STALLED_HANDSHAKE_THRESHOLD_MS ? 3 : 1;
+                if (mLiveRefreshTicker != null) {
+                    mUiHandler.removeCallbacks(mLiveRefreshTicker);
+                    mUiHandler.postDelayed(mLiveRefreshTicker, 2000L);
                 }
             }
         } else {

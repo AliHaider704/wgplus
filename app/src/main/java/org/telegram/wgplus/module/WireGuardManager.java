@@ -41,6 +41,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -57,6 +58,8 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import javax.net.ssl.HttpsURLConnection;
 import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLSocket;
@@ -96,6 +99,11 @@ public final class WireGuardManager {
     private static volatile boolean sLastStealthProtected;
     private static volatile boolean sLastStealthWantsAwake;
     private static volatile long sTunnelStartedAtMs;
+    public static final long HANDSHAKE_HEALTHY_WINDOW_SEC = 210L;
+    public static final long PROACTIVE_HANDSHAKE_NUDGE_AGE_SEC = 120L;
+    private static final java.util.concurrent.atomic.AtomicBoolean sHandshakeNudgeInFlight = new java.util.concurrent.atomic.AtomicBoolean(false);
+    private static volatile long sLastHandshakeNudgeMs = 0L;
+    private static volatile long sLastSharedTunnelHeartbeatMs = 0L;
     private static volatile long sLastRemoteHygieneCheckMs;
     private static volatile long sLastHandledHygieneReqMs;
     private static final String KEY_SHARED_STATE_REV = "wg_shared_state_rev";
@@ -143,6 +151,106 @@ public final class WireGuardManager {
         }
     }
 
+    interface EndpointRelayStarter {
+        int startRelay(String host, int port);
+    }
+
+    interface EndpointAddrRelayStarter {
+        String startRelayAddr(String host, int port);
+    }
+
+    /**
+     * Rewrites ICE/TURN transport candidate endpoints inside tgcalls group/conference call
+     * {@code setJoinResponsePayload(String)} JSON so media routes via local WireGuard relays.
+     */
+    static String rewriteGroupCallJoinPayload(
+            String payloadJson,
+            EndpointRelayStarter relayStarter,
+            boolean killSwitchBlackhole
+    ) {
+        if (relayStarter == null) {
+            return payloadJson;
+        }
+        return rewriteGroupCallJoinPayloadAddr(
+                payloadJson,
+                (host, port) -> {
+                    int lp = relayStarter.startRelay(host, port);
+                    return lp > 0 ? ("127.0.0.1:" + lp) : "";
+                },
+                killSwitchBlackhole
+        );
+    }
+
+    static String rewriteGroupCallJoinPayloadAddr(
+            String payloadJson,
+            EndpointAddrRelayStarter relayStarter,
+            boolean killSwitchBlackhole
+    ) {
+        if (payloadJson == null || payloadJson.isEmpty() || relayStarter == null) {
+            return payloadJson;
+        }
+        String trimmed = payloadJson.trim();
+        if (!trimmed.startsWith("{")) {
+            return payloadJson;
+        }
+        try {
+            JSONObject root = new JSONObject(trimmed);
+            JSONObject transport = root.optJSONObject("transport");
+            JSONArray candidates = transport != null ? transport.optJSONArray("candidates") : null;
+            if (candidates == null) {
+                candidates = root.optJSONArray("candidates");
+            }
+            if (candidates == null || candidates.length() == 0) {
+                return payloadJson;
+            }
+            boolean changed = false;
+            for (int i = 0; i < candidates.length(); i++) {
+                JSONObject cand = candidates.optJSONObject(i);
+                if (cand == null) {
+                    continue;
+                }
+                String ipField = cand.has("ip") ? "ip" : (cand.has("address") ? "address" : "ip");
+                String host = cand.optString(ipField, "").trim();
+                Object portObj = cand.opt("port");
+                int rawPort = -1;
+                if (portObj instanceof Number) {
+                    rawPort = ((Number) portObj).intValue();
+                } else if (portObj instanceof String) {
+                    try {
+                        rawPort = Integer.parseInt(((String) portObj).trim());
+                    } catch (NumberFormatException ignored) {
+                    }
+                }
+                if (host.isEmpty() || rawPort < 1 || rawPort > 65535) {
+                    continue;
+                }
+                if (host.startsWith("127.") || "::1".equals(host)) {
+                    continue;
+                }
+
+                String relayAddr = relayStarter.startRelayAddr(host, rawPort);
+                String relayIp = parseIpFromHostPort(relayAddr);
+                int localPort = parsePortFromHostPort(relayAddr);
+                if (localPort <= 0 && killSwitchBlackhole) {
+                    relayIp = "127.0.0.1";
+                    localPort = 9;
+                }
+                if (!relayIp.isEmpty() && localPort > 0) {
+                    cand.put(ipField, relayIp);
+                    if (portObj instanceof Number) {
+                        cand.put("port", localPort);
+                    } else {
+                        cand.put("port", String.valueOf(localPort));
+                    }
+                    changed = true;
+                }
+            }
+            return changed ? root.toString() : payloadJson;
+        } catch (Throwable ignored) {
+            return payloadJson;
+        }
+    }
+
     private static final String KEY_PERSISTED_SOCKS_USER = "wg_socks_user_v2";
     private static final String KEY_PERSISTED_SOCKS_PASS = "wg_socks_pass_v2";
     private static volatile Context sSocksPrefsCtx = null;
@@ -153,6 +261,83 @@ public final class WireGuardManager {
     private static volatile long sSharedLastHsSec = 0L;
     private static volatile boolean sSharedHsHealthy = false;
 
+    /**
+     * Derives deterministic 128-bit loopback SOCKS/WGP1 credentials from the active WireGuard
+     * private key via HMAC-SHA256 so every local Telegram app configured with the same profile
+     * authenticates identically without cross-sandbox race conditions or package-visibility failures.
+     */
+    static String deriveProfileSocksPass(String privateKey) {
+        String trimmed = safeTrim(privateKey);
+        if (trimmed.isEmpty()) {
+            return "";
+        }
+        try {
+            String privHex = normalizeKeyToHex(trimmed);
+            Mac mac = Mac.getInstance("HmacSHA256");
+            mac.init(new SecretKeySpec("wgplus-loopback-socks-v2".getBytes(StandardCharsets.UTF_8), "HmacSHA256"));
+            byte[] digest = mac.doFinal(privHex.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(32);
+            for (int i = 0; i < 16 && i < digest.length; i++) {
+                hex.append(String.format(Locale.US, "%02x", digest[i] & 0xff));
+            }
+            return hex.toString();
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    static String computeProfileSigHash(String profileSig) {
+        String trimmed = safeTrim(profileSig);
+        if (trimmed.isEmpty()) {
+            return "";
+        }
+        try {
+            MessageDigest md = MessageDigest.getInstance("SHA-256");
+            byte[] digest = md.digest(trimmed.getBytes(StandardCharsets.UTF_8));
+            StringBuilder hex = new StringBuilder(12);
+            for (int i = 0; i < 6 && i < digest.length; i++) {
+                hex.append(String.format(Locale.US, "%02x", digest[i] & 0xff));
+            }
+            return hex.toString();
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    private static synchronized void syncDeterministicSocksCredentialsForProfile(Context context, TunnelConfig cfg) {
+        if (context != null) {
+            Context app = context.getApplicationContext();
+            sSocksPrefsCtx = app != null ? app : context;
+        }
+        String detPass = cfg != null ? deriveProfileSocksPass(cfg.privateKey) : "";
+        if (detPass.isEmpty()) {
+            ensureSessionSocksCredentials(context);
+            return;
+        }
+        boolean changed = !"wg".equals(sSocksUser) || !detPass.equals(sSocksPass);
+        sSocksUser = "wg";
+        sSocksPass = detPass;
+        Context eff = context != null ? context : sSocksPrefsCtx;
+        if (eff != null && changed) {
+            try {
+                getPrefs(eff).edit()
+                        .putString(KEY_PERSISTED_SOCKS_USER, sSocksUser)
+                        .putString(KEY_PERSISTED_SOCKS_PASS, sSocksPass)
+                        .commit();
+            } catch (Throwable ignored) {
+            }
+        }
+        if (changed) {
+            try {
+                if (NativeBridgeLoader.isLoaded()) {
+                    Wgbridge.setSocksAuth(sSocksUser, sSocksPass);
+                    Wgbridge.resetSocksAuthRejectCount();
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
     private static synchronized void ensureSessionSocksCredentials() {
         ensureSessionSocksCredentials(sSocksPrefsCtx);
     }
@@ -162,35 +347,53 @@ public final class WireGuardManager {
             Context app = context.getApplicationContext();
             sSocksPrefsCtx = app != null ? app : context;
         }
+        Context eff = context != null ? context : sSocksPrefsCtx;
+        if (eff == null) {
+            // Never mint an unpersisted ephemeral password in memory before Application Context exists;
+            // otherwise mainconfig/proxyList desyncs from wg_plus_isolated_prefs.
+            return;
+        }
+        try {
+            TunnelConfig activeCfg = loadConfig(eff);
+            String detPass = deriveProfileSocksPass(activeCfg != null ? activeCfg.privateKey : "");
+            if (!detPass.isEmpty()) {
+                boolean changed = !"wg".equals(sSocksUser) || !detPass.equals(sSocksPass);
+                sSocksUser = "wg";
+                sSocksPass = detPass;
+                if (changed) {
+                    getPrefs(eff).edit()
+                            .putString(KEY_PERSISTED_SOCKS_USER, sSocksUser)
+                            .putString(KEY_PERSISTED_SOCKS_PASS, sSocksPass)
+                            .commit();
+                }
+                return;
+            }
+        } catch (Throwable ignored) {
+        }
         if (!sSocksUser.isEmpty() && !sSocksPass.isEmpty()) {
             return;
         }
-        Context eff = context != null ? context : sSocksPrefsCtx;
-        if (eff != null) {
-            try {
-                SharedPreferences sp = getPrefs(eff);
-                String u = sp.getString(KEY_PERSISTED_SOCKS_USER, "");
-                String p = sp.getString(KEY_PERSISTED_SOCKS_PASS, "");
-                if (u != null && !u.isEmpty() && p != null && !p.isEmpty()) {
-                    sSocksUser = u;
-                    sSocksPass = p;
-                    return;
-                }
-            } catch (Throwable ignored) {
+        try {
+            SharedPreferences sp = getPrefs(eff);
+            String u = sp.getString(KEY_PERSISTED_SOCKS_USER, "");
+            String p = sp.getString(KEY_PERSISTED_SOCKS_PASS, "");
+            if (u != null && !u.isEmpty() && p != null && !p.isEmpty()) {
+                sSocksUser = u;
+                sSocksPass = p;
+                return;
             }
+        } catch (Throwable ignored) {
         }
         byte[] raw = new byte[16];
         new SecureRandom().nextBytes(raw);
         sSocksUser = "wg";
         sSocksPass = android.util.Base64.encodeToString(raw, android.util.Base64.URL_SAFE | android.util.Base64.NO_WRAP | android.util.Base64.NO_PADDING);
-        if (eff != null) {
-            try {
-                getPrefs(eff).edit()
-                        .putString(KEY_PERSISTED_SOCKS_USER, sSocksUser)
-                        .putString(KEY_PERSISTED_SOCKS_PASS, sSocksPass)
-                        .commit();
-            } catch (Throwable ignored) {
-            }
+        try {
+            getPrefs(eff).edit()
+                    .putString(KEY_PERSISTED_SOCKS_USER, sSocksUser)
+                    .putString(KEY_PERSISTED_SOCKS_PASS, sSocksPass)
+                    .commit();
+        } catch (Throwable ignored) {
         }
     }
 
@@ -200,7 +403,7 @@ public final class WireGuardManager {
 
     public static String getActiveSocksUser(Context context) {
         if (!sIsSharedHubOwner) {
-            if (sSharedHubPort <= 0 && context != null) {
+            if ((sSharedHubPort <= 0 || sSharedSocksUser.isEmpty()) && context != null) {
                 queryAnyLiveSharedTunnelPort(context);
             }
             if (sSharedHubPort > 0 && !sSharedSocksUser.isEmpty()) {
@@ -217,7 +420,7 @@ public final class WireGuardManager {
 
     public static String getActiveSocksPass(Context context) {
         if (!sIsSharedHubOwner) {
-            if (sSharedHubPort <= 0 && context != null) {
+            if ((sSharedHubPort <= 0 || sSharedSocksPass.isEmpty()) && context != null) {
                 queryAnyLiveSharedTunnelPort(context);
             }
             if (sSharedHubPort > 0 && !sSharedSocksPass.isEmpty()) {
@@ -736,6 +939,7 @@ public final class WireGuardManager {
         JSONObject root = new JSONObject();
         try {
             root.put("stateRev", prefs.getLong(KEY_SHARED_STATE_REV, 0L));
+            root.put("hasSecrets", includeSecrets);
             root.put("activeProfileId", prefs.getString(KEY_ACTIVE_PROFILE_ID, ""));
             root.put("enabled", isAutoConnectEnabled(context));
             root.put("routeCalls", isRouteCallsEnabled(context));
@@ -745,6 +949,13 @@ public final class WireGuardManager {
             root.put("smartKeepalive", isSmartKeepaliveEnabled(context));
             root.put("uiLang", prefs.getString(KEY_UI_LANG, ""));
             root.put("uiDark", prefs.contains(KEY_UI_DARK) ? (prefs.getBoolean(KEY_UI_DARK, true) ? 1 : 0) : -1);
+            if (includeSecrets) {
+                ensureSessionSocksCredentials(context);
+                if (!sSocksUser.isEmpty() && !sSocksPass.isEmpty()) {
+                    root.put("socksUser", sSocksUser);
+                    root.put("socksPass", sSocksPass);
+                }
+            }
             JSONArray arr = new JSONArray();
             for (TunnelConfig cfg : profiles) {
                 JSONObject obj = configToJsonObject(cfg, false);
@@ -769,11 +980,16 @@ public final class WireGuardManager {
             SharedPreferences prefs = getPrefs(context);
             long localRev = prefs.getLong(KEY_SHARED_STATE_REV, 0L);
             long incomingRev = root.optLong("stateRev", 0L);
-            if (keepIncomingRev && incomingRev <= localRev && hasAnyConfiguredProfile(context)) {
+            String localActiveId = prefs.getString(KEY_ACTIVE_PROFILE_ID, "").trim();
+            String incomingActiveId = root.optString("activeProfileId", "").trim();
+            boolean equalRevProfileDrift = (incomingRev == localRev)
+                    && !incomingActiveId.isEmpty() && !incomingActiveId.equals(localActiveId);
+            if (keepIncomingRev && incomingRev <= localRev && !equalRevProfileDrift && hasAnyConfiguredProfile(context)) {
                 return localRev;
             }
             JSONArray arr = root.optJSONArray("profiles");
             List<TunnelConfig> profiles = new ArrayList<>();
+            boolean hasKeyedProfile = false;
             if (arr != null) {
                 for (int i = 0; i < arr.length(); i++) {
                     JSONObject item = arr.optJSONObject(i);
@@ -781,9 +997,16 @@ public final class WireGuardManager {
                         TunnelConfig cfg = configFromJsonObject(item, false);
                         if (cfg != null) {
                             profiles.add(cfg);
+                            if (!safeTrim(cfg.privateKey).isEmpty()) {
+                                hasKeyedProfile = true;
+                            }
                         }
                     }
                 }
+            }
+            boolean hasSecrets = root.optBoolean("hasSecrets", hasKeyedProfile);
+            if (keepIncomingRev && !hasSecrets && !profiles.isEmpty() && hasAnyConfiguredProfile(context)) {
+                return localRev;
             }
             long nextRev = keepIncomingRev ? incomingRev : Math.max(localRev + 1L, incomingRev + 1L);
             sSuppressSyncPush = true;
@@ -794,11 +1017,10 @@ public final class WireGuardManager {
                 if (activeId.isEmpty() && !profiles.isEmpty()) {
                     activeId = profiles.get(0).id;
                 }
-                if (!profiles.isEmpty()) {
+                if (hasSecrets || !profiles.isEmpty()) {
                     persistProfilesLocked(prefs, profiles, activeId, enabled, routeCalls);
                 }
                 SharedPreferences.Editor ed = prefs.edit()
-                        .putLong(KEY_SHARED_STATE_REV, nextRev)
                         .putBoolean(KEY_ENABLED, enabled)
                         .putBoolean(KEY_ROUTE_CALLS, routeCalls)
                         .putBoolean(KEY_KILL_SWITCH, root.optBoolean("killSwitch", false))
@@ -806,6 +1028,36 @@ public final class WireGuardManager {
                         .putBoolean(KEY_DOH_ENABLED, root.optBoolean("dohEnabled", true))
                         .putBoolean(KEY_SMART_KEEPALIVE, root.optBoolean("smartKeepalive", false))
                         .putBoolean(KEY_MIGRATED_FORCED_CONTINUITY_V1, true);
+                if (!keepIncomingRev || hasSecrets || profiles.isEmpty()) {
+                    ed.putLong(KEY_SHARED_STATE_REV, nextRev);
+                }
+                if (hasSecrets) {
+                    TunnelConfig selectedActive = null;
+                    for (TunnelConfig p : profiles) {
+                        if (activeId.equals(p.id)) {
+                            selectedActive = p;
+                            break;
+                        }
+                    }
+                    if (selectedActive == null && !profiles.isEmpty()) {
+                        selectedActive = profiles.get(0);
+                    }
+                    String detPass = selectedActive != null ? deriveProfileSocksPass(selectedActive.privateKey) : "";
+                    String syncUser = !detPass.isEmpty() ? "wg" : root.optString("socksUser", "").trim();
+                    String syncPass = !detPass.isEmpty() ? detPass : root.optString("socksPass", "").trim();
+                    if (!syncUser.isEmpty() && !syncPass.isEmpty()) {
+                        sSocksUser = syncUser;
+                        sSocksPass = syncPass;
+                        ed.putString(KEY_PERSISTED_SOCKS_USER, syncUser);
+                        ed.putString(KEY_PERSISTED_SOCKS_PASS, syncPass);
+                        try {
+                            if (NativeBridgeLoader.isLoaded() && Wgbridge.isRunning()) {
+                                Wgbridge.setSocksAuth(syncUser, syncPass);
+                            }
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
                 String uiLang = root.optString("uiLang", "");
                 if (!uiLang.isEmpty()) {
                     ed.putString(KEY_UI_LANG, uiLang);
@@ -848,11 +1100,12 @@ public final class WireGuardManager {
                 }
             } catch (Throwable ignored) {
             }
-            if (json == null || json.isEmpty()) {
-                json = readSyncBundleFromXSharedPrefs();
-            }
+            // Prefer full-secret local root mirror BEFORE XSharedPreferences (which strips keys).
             if (json == null || json.isEmpty()) {
                 json = readSyncBundleFromLocalMirrorFile(appCtx);
+            }
+            if (json == null || json.isEmpty()) {
+                json = readSyncBundleFromXSharedPrefs();
             }
             if (json == null || json.isEmpty()) {
                 return false;
@@ -860,6 +1113,10 @@ public final class WireGuardManager {
             JSONObject obj = new JSONObject(json);
             long remoteRev = obj.optLong("stateRev", 0L);
             long localRev = getPrefs(appCtx).getLong(KEY_SHARED_STATE_REV, 0L);
+            String remoteActiveId = obj.optString("activeProfileId", "").trim();
+            String localActiveId = getPrefs(appCtx).getString(KEY_ACTIVE_PROFILE_ID, "").trim();
+            boolean equalRevProfileDrift = (remoteRev == localRev)
+                    && !remoteActiveId.isEmpty() && !remoteActiveId.equals(localActiveId);
             JSONArray remoteProfiles = obj.optJSONArray("profiles");
             boolean remoteHasPeer = false;
             if (remoteProfiles != null) {
@@ -871,11 +1128,13 @@ public final class WireGuardManager {
                     }
                 }
             }
-            if (remoteRev > localRev || (remoteHasPeer && !hasAnyConfiguredProfile(appCtx))) {
+            if (remoteRev > localRev || equalRevProfileDrift || (remoteHasPeer && !hasAnyConfiguredProfile(appCtx))) {
                 long applied = importSharedSyncBundleJson(appCtx, json, true);
                 return applied >= 0L;
             }
-            if (remoteRev == 0L && !remoteHasPeer && hasAnyConfiguredProfile(appCtx)) {
+            if (localRev > remoteRev && hasAnyConfiguredProfile(appCtx)) {
+                scheduleSyncPushToProvider(appCtx);
+            } else if (remoteRev == 0L && !remoteHasPeer && hasAnyConfiguredProfile(appCtx)) {
                 scheduleSyncPushToProvider(appCtx);
             }
         } catch (Throwable ignored) {
@@ -904,14 +1163,21 @@ public final class WireGuardManager {
             try {
                 Bundle extras = new Bundle();
                 extras.putString(KeepaliveStatusProvider.EXTRA_JSON, exportSharedSyncBundleJson(appCtx));
-                appCtx.getContentResolver().call(
+                Bundle res = appCtx.getContentResolver().call(
                         STATUS_PROVIDER_URI,
                         KeepaliveStatusProvider.METHOD_SYNC_PUSH_STATE,
                         appCtx.getPackageName(),
                         extras
                 );
+                if (res != null) {
+                    long canonicalRev = res.getLong("stateRev", -1L);
+                    if (canonicalRev > 0L) {
+                        getPrefs(appCtx).edit().putLong(KEY_SHARED_STATE_REV, canonicalRev).apply();
+                    }
+                }
             } catch (Throwable ignored) {
             }
+            publishWorldReadableSyncBundle(appCtx);
         });
     }
 
@@ -1909,6 +2175,7 @@ public final class WireGuardManager {
         }
 
         persistProfilesLocked(prefs, profiles, updated.id, updated.enabled, updated.routeCalls);
+        syncDeterministicSocksCredentialsForProfile(context, updated);
     }
 
     public static synchronized TunnelConfig selectProfile(Context context, String profileId) {
@@ -1917,6 +2184,7 @@ public final class WireGuardManager {
         for (TunnelConfig p : profiles) {
             if (p.id.equals(profileId)) {
                 prefs.edit().putString(KEY_ACTIVE_PROFILE_ID, p.id).commit();
+                syncDeterministicSocksCredentialsForProfile(context, p);
                 scheduleSyncPushToProvider(context);
                 return p.copy();
             }
@@ -2554,6 +2822,7 @@ public final class WireGuardManager {
 
         sUserManuallyStopped = false;
         acquireForcedContinuityLocks(context);
+        syncDeterministicSocksCredentialsForProfile(context, cfg);
 
         // Reuse an already-running WireGuard tunnel hosted by another local Telegram client or module app
         // so multiple open Telegram clients share ONE WireGuard session with zero PrivateKey collisions.
@@ -2561,6 +2830,8 @@ public final class WireGuardManager {
         int sharedPort = queryLiveSharedTunnelPort(context, profileSig);
         if (sharedPort > 0) {
             try {
+                Wgbridge.setKillSwitchArmed(false);
+                Wgbridge.stopKillSwitchGuard();
                 if (Wgbridge.isRunning()) {
                     Wgbridge.stopTunnel();
                 }
@@ -2575,10 +2846,14 @@ public final class WireGuardManager {
             sLastRoamingUpdateMs = System.currentTimeMillis();
             sKeepalivePausedForIdle = false;
             sConsecutiveHealthFailures = 0;
+            String prevActiveId = getPrefs(context).getString(KEY_ACTIVE_PROFILE_ID, "");
             getPrefs(context).edit()
                     .putString(KEY_CONNECTED_PROFILE_ID, cfg.id)
                     .putString(KEY_ACTIVE_PROFILE_ID, cfg.id)
                     .commit();
+            if (cfg.id != null && !cfg.id.isEmpty() && !cfg.id.equals(prevActiveId)) {
+                scheduleSyncPushToProvider(context);
+            }
             sWatchdogRawEndpoint = cfg.endpoint;
             if (telegramClassLoader != null) {
                 postBindTelegramProxy(context, telegramClassLoader, true, sharedPort, isRouteCallsEnabled(context), true);
@@ -2684,10 +2959,14 @@ public final class WireGuardManager {
         sKeepalivePausedForIdle = false;
         sConsecutiveHealthFailures = 0;
         sLastReportedHsHealthy = isHandshakeHealthyNow(context, moduleApkPath);
+        String prevOwnerActiveId = getPrefs(context).getString(KEY_ACTIVE_PROFILE_ID, "");
         getPrefs(context).edit()
                 .putString(KEY_CONNECTED_PROFILE_ID, cfg.id)
                 .putString(KEY_ACTIVE_PROFILE_ID, cfg.id)
                 .commit();
+        if (cfg.id != null && !cfg.id.isEmpty() && !cfg.id.equals(prevOwnerActiveId)) {
+            scheduleSyncPushToProvider(context);
+        }
         sWatchdogRawEndpoint = cfg.endpoint;
         WgDiagnosticsLog.record("TUNNEL", "STARTED", "port=" + localPort + " mtu=" + mtu + " cellular=" + onCellular);
 
@@ -2770,46 +3049,62 @@ public final class WireGuardManager {
                 }
             }
             if (port > 0 && (myPkg == null || !myPkg.equals(owner))) {
-                sSharedSocksUser = sharedUser != null ? sharedUser : "";
-                sSharedSocksPass = sharedPass != null ? sharedPass : "";
-                sSharedLastHsSec = lastHsSec;
-                sSharedHsHealthy = hsHealthy;
-                if (onMain) {
-                    // Never open a Socket on the main UI thread (NetworkOnMainThreadException).
-                    // Trust recent registration and asynchronously probe loopback port on background thread.
-                    boolean recent = updatedAt <= 0L || Math.abs(System.currentTimeMillis() - updatedAt) < 300_000L;
-                    if (recent && !sSharedHubProbeInFlight) {
-                        final int probePort = port;
-                        sSharedHubProbeInFlight = true;
-                        SYNC_EXEC.execute(() -> {
-                            try {
-                                boolean open = isLocalLoopbackPortOpen(probePort, 160);
-                                sLastSharedHubCheckMs = SystemClock.elapsedRealtime();
-                                if (open) {
-                                    sSharedHubPort = probePort;
-                                    sCachedExternalSharedPort = probePort;
-                                } else {
-                                    sCachedExternalSharedPort = -1;
-                                }
-                            } finally {
-                                sSharedHubProbeInFlight = false;
-                            }
-                        });
-                    }
-                    if (sCachedExternalSharedPort == port || recent) {
-                        sSharedHubPort = port;
-                        sCachedExternalSharedPort = port;
-                        sLastSharedHubCheckMs = now;
-                        return port;
-                    }
-                } else if (isLocalLoopbackPortOpen(port, 160)) {
+                boolean recent = updatedAt <= 0L || Math.abs(System.currentTimeMillis() - updatedAt) < 300_000L;
+                Wgp1StatusResult liveRes = queryLiveStatusWithFallback(context, null, port, sharedPass, null);
+                if (liveRes != null && liveRes.running) {
+                    sSharedSocksUser = sharedUser != null ? sharedUser : "";
+                    sSharedSocksPass = sharedPass != null ? sharedPass : "";
+                    sSharedLastHsSec = liveRes.hsSec > 0L ? liveRes.hsSec : (liveRes.hsHealthy ? lastHsSec : 0L);
+                    sSharedHsHealthy = liveRes.hsHealthy;
                     sSharedHubPort = port;
                     sCachedExternalSharedPort = port;
                     sLastSharedHubCheckMs = now;
                     return port;
                 }
+                if (!onMain && !NativeBridgeLoader.isLoaded() && isLocalLoopbackPortOpen(port, 160)) {
+                    sSharedSocksUser = sharedUser != null ? sharedUser : "";
+                    sSharedSocksPass = sharedPass != null ? sharedPass : "";
+                    sSharedLastHsSec = lastHsSec;
+                    sSharedHsHealthy = hsHealthy;
+                    sSharedHubPort = port;
+                    sCachedExternalSharedPort = port;
+                    sLastSharedHubCheckMs = now;
+                    return port;
+                }
+                if (onMain && recent && !sSharedHubProbeInFlight) {
+                    final int probePort = port;
+                    final String candUser = sharedUser != null ? sharedUser : "";
+                    final String candPass = sharedPass != null ? sharedPass : "";
+                    final long candHsSec = lastHsSec;
+                    final boolean candHsHealthy = hsHealthy;
+                    sSharedHubProbeInFlight = true;
+                    SYNC_EXEC.execute(() -> {
+                        try {
+                            Wgp1StatusResult bgRes = queryLiveStatusWithFallback(context, null, probePort, candPass, null);
+                            sLastSharedHubCheckMs = SystemClock.elapsedRealtime();
+                            if (bgRes != null && bgRes.running) {
+                                sSharedSocksUser = candUser;
+                                sSharedSocksPass = candPass;
+                                sSharedLastHsSec = bgRes.hsSec > 0L ? bgRes.hsSec : candHsSec;
+                                sSharedHsHealthy = bgRes.hsHealthy || candHsHealthy;
+                                sSharedHubPort = probePort;
+                                sCachedExternalSharedPort = probePort;
+                            } else {
+                                sCachedExternalSharedPort = -1;
+                            }
+                        } finally {
+                            sSharedHubProbeInFlight = false;
+                        }
+                    });
+                }
             }
         } catch (Throwable ignored) {
+        }
+        // Fallback when package-visibility restrictions block ContentResolver IPC:
+        // probe localhost WGP1 mux ports directly via Go (safe on Main Thread too once libgojni is loaded).
+        int wgpPort = probeSharedTunnelOverWgp1(context, null);
+        if (wgpPort > 0) {
+            return wgpPort;
         }
         sLastSharedHubCheckMs = now;
         sCachedExternalSharedPort = -1;
@@ -2829,6 +3124,9 @@ public final class WireGuardManager {
 
     private static boolean isLocalLoopbackPortOpen(int port, int timeoutMs) {
         if (port <= 0 || port > 65535) return false;
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return false;
+        }
         try (java.net.Socket s = new java.net.Socket()) {
             s.connect(new java.net.InetSocketAddress("127.0.0.1", port), timeoutMs);
             return true;
@@ -2837,38 +3135,435 @@ public final class WireGuardManager {
         }
     }
 
-    /** Starts a local VoIP relay socket inside this process if its own Go tunnel is active. */
-    public static int startLocalVoipEndpointRelay(Context ctx, String targetHost, int targetPort) {
-        String host = targetHost != null ? targetHost.trim() : "";
-        if (host.isEmpty() || targetPort < 1 || targetPort > 65535) {
+    static String parseIpFromHostPort(String hostPort) {
+        if (hostPort == null) {
+            return "";
+        }
+        String s = hostPort.trim();
+        int idx = s.lastIndexOf(':');
+        if (idx <= 0 || idx >= s.length() - 1) {
+            return "";
+        }
+        return s.substring(0, idx).trim();
+    }
+
+    static int parsePortFromHostPort(String hostPort) {
+        if (hostPort == null) {
+            return 0;
+        }
+        String s = hostPort.trim();
+        int idx = s.lastIndexOf(':');
+        if (idx < 0 || idx >= s.length() - 1) {
             return 0;
         }
         try {
-            NativeBridgeLoader.ensureLoaded(ctx, null);
-            if (!Wgbridge.isRunning()) {
-                return 0;
-            }
-            return (int) Wgbridge.startVoipEndpointRelay(host, targetPort);
-        } catch (Throwable ignored) {
+            int p = Integer.parseInt(s.substring(idx + 1).trim());
+            return (p > 0 && p <= 65535) ? p : 0;
+        } catch (NumberFormatException ignored) {
             return 0;
         }
     }
 
-    /**
-     * Binds or reuses a local 127.0.0.1 UDP/TCP relay for a Telegram VoIP relay server,
-     * delegating via Binder IPC to the shared hub process when running in a hooked app.
-     */
-    public static int startVoipEndpointRelay(Context ctx, String moduleApkPath, String targetHost, int targetPort) {
+    /** Starts a local VoIP relay socket inside this process if its own Go tunnel is active. */
+    public static int startLocalVoipEndpointRelay(Context ctx, String targetHost, int targetPort) {
+        return parsePortFromHostPort(startLocalVoipEndpointRelayAddr(ctx, targetHost, targetPort));
+    }
+
+    public static String startLocalVoipEndpointRelayAddr(Context ctx, String targetHost, int targetPort) {
         String host = targetHost != null ? targetHost.trim() : "";
         if (host.isEmpty() || targetPort < 1 || targetPort > 65535) {
-            return 0;
+            return "";
+        }
+        try {
+            NativeBridgeLoader.ensureLoaded(ctx, null);
+            if (!Wgbridge.isRunning()) {
+                return "";
+            }
+            String addr = Wgbridge.startVoipEndpointRelayAddr(host, targetPort);
+            return addr != null ? addr.trim() : "";
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    /** Sends a single-line WGP1 control command over loopback via Go JNI (immune to NetworkOnMainThreadException). */
+    private static String sendWgp1ControlCommand(int muxPort, String socksPass, String command) {
+        if (muxPort < 1 || muxPort > 65535 || command == null || command.isEmpty()) {
+            return "";
+        }
+        String passTok = (socksPass != null && !socksPass.trim().isEmpty()) ? socksPass.trim() : "-";
+        try {
+            if (NativeBridgeLoader.isLoaded()) {
+                String resp = Wgbridge.sendLocalWgp1Command(muxPort, passTok, command, 350L);
+                if (resp != null) {
+                    return resp.trim();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return "";
+        }
+        String line = "WGP1 " + passTok + " " + command + "\n";
+        try (Socket sock = new Socket()) {
+            sock.connect(new InetSocketAddress("127.0.0.1", muxPort), 350);
+            sock.setSoTimeout(450);
+            OutputStream os = sock.getOutputStream();
+            os.write(line.getBytes(StandardCharsets.UTF_8));
+            os.flush();
+            BufferedReader br = new BufferedReader(new InputStreamReader(sock.getInputStream(), StandardCharsets.UTF_8));
+            String resp = br.readLine();
+            return resp != null ? resp.trim() : "";
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
+    /** Opens or reuses a local VoIP relay socket directly inside whichever local process owns {@code muxPort}. */
+    static int requestVoipRelayOverWgp1(int muxPort, String socksPass, String targetHost, int targetPort) {
+        return parsePortFromHostPort(requestVoipRelayOverWgp1Addr(muxPort, socksPass, targetHost, targetPort));
+    }
+
+    static String requestVoipRelayOverWgp1Addr(int muxPort, String socksPass, String targetHost, int targetPort) {
+        if (muxPort < 1 || muxPort > 65535 || targetHost == null || targetHost.trim().isEmpty()
+                || targetPort < 1 || targetPort > 65535) {
+            return "";
+        }
+        String host = targetHost.trim();
+        try {
+            if (NativeBridgeLoader.isLoaded()) {
+                String passTok = (socksPass != null && !socksPass.trim().isEmpty()) ? socksPass.trim() : "-";
+                String goAddr = Wgbridge.requestRemoteVoipRelayAddr(muxPort, passTok, host, targetPort);
+                if (goAddr != null && !goAddr.trim().isEmpty()) {
+                    return goAddr.trim();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        String resp = sendWgp1ControlCommand(muxPort, socksPass, "VOIP_RELAY_ADDR " + host + " " + targetPort);
+        if (resp.startsWith("OK ")) {
+            String addr = resp.substring(3).trim();
+            if (parsePortFromHostPort(addr) > 0 && !parseIpFromHostPort(addr).isEmpty()) {
+                return addr;
+            }
+        }
+        String respLegacy = sendWgp1ControlCommand(muxPort, socksPass, "VOIP_RELAY " + host + " " + targetPort);
+        if (respLegacy.startsWith("OK ")) {
+            try {
+                int port = Integer.parseInt(respLegacy.substring(3).trim());
+                if (port > 0 && port <= 65535) {
+                    return "127.0.0.1:" + port;
+                }
+            } catch (NumberFormatException ignored) {
+            }
+        }
+        return "";
+    }
+
+    static String startRemoteVoipRelayOverWgp1Addr(Context ctx, String targetHost, int targetPort) {
+        String host = targetHost != null ? targetHost.trim() : "";
+        if (host.isEmpty() || targetPort < 1 || targetPort > 65535) {
+            return "";
+        }
+        try {
+            NativeBridgeLoader.ensureLoaded(ctx, null);
+        } catch (Throwable ignored) {
+        }
+        int regPort = -1;
+        String regPass = "";
+        if (ctx != null && "org.telegram.wgplus.module".equals(ctx.getPackageName())) {
+            try {
+                SharedPreferences sp = ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
+                regPort = sp.getInt("port", -1);
+                regPass = sp.getString("socksPass", "");
+            } catch (Throwable ignored) {
+            }
+        }
+        String activePass = ctx != null ? getActiveSocksPass(ctx) : sSocksPass;
+        int[] ports = new int[]{regPort, 48729, 48730, 48731, 48732};
+        for (int p : ports) {
+            if (p <= 0) {
+                continue;
+            }
+            if (regPass != null && !regPass.isEmpty()) {
+                String a = requestVoipRelayOverWgp1Addr(p, regPass, host, targetPort);
+                if (!a.isEmpty()) {
+                    return a;
+                }
+            }
+            if (activePass != null && !activePass.isEmpty() && !activePass.equals(regPass)) {
+                String a = requestVoipRelayOverWgp1Addr(p, activePass, host, targetPort);
+                if (!a.isEmpty()) {
+                    return a;
+                }
+            }
+        }
+        return "";
+    }
+
+    static final class Wgp1StatusResult {
+        final boolean running;
+        final boolean hsHealthy;
+        final long hsSec;
+        final String profileSig;
+
+        Wgp1StatusResult(boolean running, boolean hsHealthy, long hsSec, String profileSig) {
+            this.running = running;
+            this.hsHealthy = hsHealthy;
+            this.hsSec = hsSec;
+            this.profileSig = profileSig != null ? profileSig : "";
+        }
+    }
+
+    /** Queries full status including optional 5th profileSig field from whichever process owns {@code muxPort}. */
+    static Wgp1StatusResult queryLiveStatusFullOverWgp1(int muxPort, String socksPass) {
+        return parseWgp1StatusLine(sendWgp1ControlCommand(muxPort, socksPass, "STATUS"), false);
+    }
+
+    static Wgp1StatusResult queryPublicStatusOverWgp1(int muxPort) {
+        return parseWgp1StatusLine(sendWgp1ControlCommand(muxPort, "-", "PUBLIC_STATUS"), true);
+    }
+
+    private static Wgp1StatusResult parseWgp1StatusLine(String resp, boolean isPublicHash) {
+        if (resp == null || !resp.startsWith("OK ")) {
+            return null;
+        }
+        String[] parts = resp.substring(3).trim().split("\\s+", 4);
+        if (parts.length < 3) {
+            return null;
+        }
+        try {
+            boolean up = "true".equals(parts[0]);
+            boolean hs = "true".equals(parts[1]);
+            long hsSec = Long.parseLong(parts[2]);
+            String rawSig = parts.length >= 4 ? parts[3].trim() : "";
+            String sig = isPublicHash
+                    ? ((!rawSig.isEmpty() && !"-".equals(rawSig)) ? ("HASH:" + rawSig) : "")
+                    : rawSig;
+            return new Wgp1StatusResult(up, hs, hsSec, sig);
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    static Wgp1StatusResult queryLiveStatusWithFallback(
+            Context ctx,
+            String moduleApkPath,
+            int muxPort,
+            String socksPass,
+            String requiredSig
+    ) {
+        if (muxPort < 1 || muxPort > 65535) {
+            return null;
+        }
+        if (ctx != null && !NativeBridgeLoader.isLoaded()) {
+            try {
+                NativeBridgeLoader.ensureLoaded(ctx, moduleApkPath);
+            } catch (Throwable ignored) {
+            }
+        }
+        if (socksPass != null && !socksPass.isEmpty()) {
+            Wgp1StatusResult full = queryLiveStatusFullOverWgp1(muxPort, socksPass);
+            if (full != null) {
+                return full;
+            }
+        }
+        Wgp1StatusResult pub = queryPublicStatusOverWgp1(muxPort);
+        if (pub != null && wgp1ProfileSigMatches(ctx, requiredSig, pub.profileSig)) {
+            return pub;
+        }
+        return null;
+    }
+
+    /** Queries live {running(0|1), handshakeHealthy(0|1), lastHandshakeSec} from whichever process owns {@code muxPort}. */
+    static long[] queryLiveStatusOverWgp1(int muxPort, String socksPass) {
+        Wgp1StatusResult res = queryLiveStatusFullOverWgp1(muxPort, socksPass);
+        if (res == null) {
+            return null;
+        }
+        return new long[]{res.running ? 1L : 0L, res.hsHealthy ? 1L : 0L, res.hsSec};
+    }
+
+    static boolean wgp1ProfileSigMatches(Context context, String requiredSig, String peerSig) {
+        if (requiredSig == null || requiredSig.isEmpty()) {
+            return true;
+        }
+        if (peerSig == null || peerSig.isEmpty()) {
+            return false;
+        }
+        if (peerSig.startsWith("HASH:")) {
+            String peerHash = peerSig.substring(5).trim();
+            if (peerHash.isEmpty()) {
+                return false;
+            }
+            if (peerHash.equalsIgnoreCase(computeProfileSigHash(requiredSig))) {
+                return true;
+            }
+            if (context != null && !isDohEnabled(context)) {
+                int reqBar = requiredSig.lastIndexOf('|');
+                if (reqBar > 0) {
+                    try {
+                        String pre = preResolveEndpoint(requiredSig.substring(0, reqBar).trim());
+                        if (pre != null && !pre.isEmpty()) {
+                            String altSig = pre + "|" + requiredSig.substring(reqBar + 1).trim();
+                            if (peerHash.equalsIgnoreCase(computeProfileSigHash(altSig))) {
+                                return true;
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+            return false;
+        }
+        if (requiredSig.equals(peerSig)) {
+            return true;
+        }
+        // When DoH is disabled, StartTunnelAdvanced receives preResolved IP instead of hostname;
+        // also accept an exact peer public key match when endpoints resolve identically.
+        int reqBar = requiredSig.lastIndexOf('|');
+        int peerBar = peerSig.lastIndexOf('|');
+        if (reqBar > 0 && peerBar > 0) {
+            String reqEp = requiredSig.substring(0, reqBar).trim();
+            String reqPub = requiredSig.substring(reqBar + 1).trim();
+            String peerEp = peerSig.substring(0, peerBar).trim();
+            String peerPub = peerSig.substring(peerBar + 1).trim();
+            if (!reqPub.isEmpty() && reqPub.equals(peerPub)) {
+                if (reqEp.equalsIgnoreCase(peerEp)) {
+                    return true;
+                }
+                if (context != null && !isDohEnabled(context)) {
+                    try {
+                        String pre = preResolveEndpoint(reqEp);
+                        if (pre != null && pre.equalsIgnoreCase(peerEp)) {
+                            return true;
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Loopback WGP1 shared-hub discovery fallback for hosts without QUERY_ALL_PACKAGES
+     * (e.g. official Telegram 13.3.1 on targetSdk 34+), preventing duplicate concurrent tunnels.
+     */
+    private static int probeSharedTunnelOverWgp1(Context context, String requiredProfileSig) {
+        if (context == null) {
+            return -1;
+        }
+        try {
+            NativeBridgeLoader.ensureLoaded(context, null);
+        } catch (Throwable ignored) {
+        }
+        if (Looper.myLooper() == Looper.getMainLooper() && !NativeBridgeLoader.isLoaded()) {
+            return -1;
+        }
+        ensureSessionSocksCredentials(context);
+        String user = sSocksUser;
+        String pass = sSocksPass;
+        if (pass == null || pass.isEmpty()) {
+            try {
+                SharedPreferences sp = getPrefs(context);
+                user = sp.getString(KEY_PERSISTED_SOCKS_USER, user);
+                pass = sp.getString(KEY_PERSISTED_SOCKS_PASS, "");
+            } catch (Throwable ignored) {
+            }
+        }
+
+        int myPort = -1;
+        try {
+            if (NativeBridgeLoader.isLoaded() && Wgbridge.isRunning()) {
+                myPort = (int) Wgbridge.getActivePort();
+            }
+        } catch (Throwable ignored) {
+        }
+
+        int[] candidatePorts = new int[]{48729, 48730, 48731, 48732};
+        for (int p : candidatePorts) {
+            if (p == myPort) {
+                continue;
+            }
+            Wgp1StatusResult res = queryLiveStatusWithFallback(context, null, p, pass, requiredProfileSig);
+            if (res != null && res.running && wgp1ProfileSigMatches(context, requiredProfileSig, res.profileSig)) {
+                if (user != null && !user.isEmpty() && pass != null && !pass.isEmpty()) {
+                    sSharedSocksUser = user;
+                    sSharedSocksPass = pass;
+                }
+                sSharedLastHsSec = res.hsSec;
+                sSharedHsHealthy = res.hsHealthy;
+                sSharedHubPort = p;
+                sCachedExternalSharedPort = p;
+                sLastSharedHubCheckMs = SystemClock.elapsedRealtime();
+                return p;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Binds or reuses a local loopback UDP/TCP relay for a Telegram VoIP relay server,
+     * preserving {@code targetPort} on {@code 127.0.0.x} when {@code targetPort >= 1024} so WebRTC
+     * {@code ReflectorPort} and {@code TurnPort} accept remote candidates seamlessly, and executing
+     * all WGP1 RPCs via Go JNI so Android's Main UI Thread never throws NetworkOnMainThreadException.
+     */
+    public static int startVoipEndpointRelay(Context ctx, String moduleApkPath, String targetHost, int targetPort) {
+        return parsePortFromHostPort(startVoipEndpointRelayAddr(ctx, moduleApkPath, targetHost, targetPort));
+    }
+
+    public static String startVoipEndpointRelayAddr(Context ctx, String moduleApkPath, String targetHost, int targetPort) {
+        String host = targetHost != null ? targetHost.trim() : "";
+        if (host.isEmpty() || targetPort < 1 || targetPort > 65535) {
+            return "";
         }
         try {
             NativeBridgeLoader.ensureLoaded(ctx, moduleApkPath);
             if (Wgbridge.isRunning()) {
-                int localPort = (int) Wgbridge.startVoipEndpointRelay(host, targetPort);
-                if (localPort > 0) {
-                    return localPort;
+                String localAddr = Wgbridge.startVoipEndpointRelayAddr(host, targetPort);
+                if (localAddr != null && !localAddr.trim().isEmpty()) {
+                    return localAddr.trim();
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            int activeMuxPort = getActivePort(ctx, moduleApkPath);
+            String pass = getActiveSocksPass(ctx);
+            String sharedPass = sSharedSocksPass;
+            String detPass = "";
+            if (ctx != null) {
+                try {
+                    TunnelConfig cfg = loadConfig(ctx);
+                    if (cfg != null && !safeTrim(cfg.privateKey).isEmpty()) {
+                        detPass = deriveProfileSocksPass(cfg.privateKey);
+                    }
+                } catch (Throwable ignored) {
+                }
+            }
+            int[] candidatePorts = new int[]{activeMuxPort, 48729, 48730, 48731, 48732};
+            for (int p : candidatePorts) {
+                if (p <= 0) {
+                    continue;
+                }
+                if (pass != null && !pass.isEmpty()) {
+                    String addr = requestVoipRelayOverWgp1Addr(p, pass, host, targetPort);
+                    if (!addr.isEmpty()) {
+                        return addr;
+                    }
+                }
+                if (sharedPass != null && !sharedPass.isEmpty() && !sharedPass.equals(pass)) {
+                    String addr = requestVoipRelayOverWgp1Addr(p, sharedPass, host, targetPort);
+                    if (!addr.isEmpty()) {
+                        return addr;
+                    }
+                }
+                if (!detPass.isEmpty() && !detPass.equals(pass) && !detPass.equals(sharedPass)) {
+                    String addr = requestVoipRelayOverWgp1Addr(p, detPass, host, targetPort);
+                    if (!addr.isEmpty()) {
+                        return addr;
+                    }
                 }
             }
         } catch (Throwable ignored) {
@@ -2885,17 +3580,28 @@ public final class WireGuardManager {
                         req
                 );
                 if (out != null) {
-                    return out.getInt(KeepaliveStatusProvider.RESULT_LOCAL_PORT, 0);
+                    String addr = out.getString(KeepaliveStatusProvider.RESULT_LOCAL_ADDR, "");
+                    if (addr != null && !addr.trim().isEmpty()) {
+                        return addr.trim();
+                    }
+                    int lp = out.getInt(KeepaliveStatusProvider.RESULT_LOCAL_PORT, 0);
+                    if (lp > 0) {
+                        return "127.0.0.1:" + lp;
+                    }
                 }
             } catch (Throwable t) {
-                Log.w(TAG, "startVoipEndpointRelay IPC warning: " + t.getMessage());
+                Log.w(TAG, "startVoipEndpointRelayAddr IPC warning: " + t.getMessage());
             }
         }
-        return 0;
+        return "";
     }
 
     private static int queryLiveSharedTunnelPort(Context context, String profileSig) {
         if (context == null || profileSig == null || profileSig.isEmpty()) return -1;
+        try {
+            NativeBridgeLoader.ensureLoaded(context, null);
+        } catch (Throwable ignored) {
+        }
         try {
             Bundle out = context.getContentResolver().call(
                     Uri.parse("content://" + KeepaliveStatusProvider.AUTHORITY),
@@ -2903,24 +3609,27 @@ public final class WireGuardManager {
                     null,
                     null
             );
-            if (out == null) return -1;
-            int port = out.getInt("port", -1);
-            String sig = out.getString("sig", "");
-            String owner = out.getString("owner", "");
-            String sharedUser = out.getString("socksUser", "");
-            String sharedPass = out.getString("socksPass", "");
-            String myPkg = context.getPackageName();
-            if (port > 0 && profileSig.equals(sig) && myPkg != null && !myPkg.equals(owner)
-                    && isLocalLoopbackPortOpen(port, 250)) {
-                sSharedSocksUser = sharedUser != null ? sharedUser : "";
-                sSharedSocksPass = sharedPass != null ? sharedPass : "";
-                sSharedLastHsSec = out.getLong("lastHsSec", 0L);
-                sSharedHsHealthy = out.getBoolean("hsHealthy", false);
-                return port;
+            if (out != null) {
+                int port = out.getInt("port", -1);
+                String sig = out.getString("sig", "");
+                String owner = out.getString("owner", "");
+                String sharedUser = out.getString("socksUser", "");
+                String sharedPass = out.getString("socksPass", "");
+                String myPkg = context.getPackageName();
+                if (port > 0 && wgp1ProfileSigMatches(context, profileSig, sig) && myPkg != null && !myPkg.equals(owner)) {
+                    Wgp1StatusResult live = queryLiveStatusWithFallback(context, null, port, sharedPass, profileSig);
+                    if ((live != null && live.running) || (!NativeBridgeLoader.isLoaded() && isLocalLoopbackPortOpen(port, 250))) {
+                        sSharedSocksUser = sharedUser != null ? sharedUser : "";
+                        sSharedSocksPass = sharedPass != null ? sharedPass : "";
+                        sSharedLastHsSec = live != null && live.hsSec > 0L ? live.hsSec : out.getLong("lastHsSec", 0L);
+                        sSharedHsHealthy = (live != null && live.hsHealthy) || out.getBoolean("hsHealthy", false);
+                        return port;
+                    }
+                }
             }
         } catch (Throwable ignored) {
         }
-        return -1;
+        return probeSharedTunnelOverWgp1(context, profileSig);
     }
 
     private static boolean isWarpOrAwgConfig(TunnelConfig cfg, String awgParams) {
@@ -2953,11 +3662,147 @@ public final class WireGuardManager {
         return false;
     }
 
+    static Bundle queryLocalRunningTunnelBundleForProvider(Context ctx, boolean nudgeIfAging) {
+        if (ctx == null) {
+            return null;
+        }
+        try {
+            String apkPath = ctx.getApplicationInfo() != null ? ctx.getApplicationInfo().sourceDir : null;
+            NativeBridgeLoader.ensureLoaded(ctx, apkPath);
+            if (!NativeBridgeLoader.isLoaded() || !Wgbridge.isRunning()) {
+                return null;
+            }
+            int port = (int) Wgbridge.getActivePort();
+            if (port <= 0) {
+                return null;
+            }
+            TunnelStats st = getLiveStats(ctx, apkPath);
+            boolean hsHealthy = Wgbridge.isHandshakeHealthy();
+            long nowSec = System.currentTimeMillis() / 1000L;
+            if (nudgeIfAging && (st.lastHandshakeSec <= 0L || Math.max(0L, nowSec - st.lastHandshakeSec) >= PROACTIVE_HANDSHAKE_NUDGE_AGE_SEC)) {
+                nudgeTunnelHandshakeAsync(ctx, apkPath, null);
+            }
+            SharedPreferences sp = ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
+            TunnelConfig cfg = getConnectedProfile(ctx, apkPath);
+            String sig = sp.getString("sig", "");
+            if (sig.isEmpty() && cfg != null && cfg.hasPeerConfigured()) {
+                sig = safeTrim(cfg.endpoint) + "|" + safeTrim(cfg.publicKey);
+            }
+            String profileId = sp.getString("profileId", "");
+            if (profileId.isEmpty() && cfg != null && cfg.id != null) {
+                profileId = cfg.id;
+            }
+            String profileName = sp.getString("profileName", "");
+            if (profileName.isEmpty() && cfg != null && cfg.name != null) {
+                profileName = cfg.name;
+            }
+            String socksUser = sSocksUser != null && !sSocksUser.isEmpty() ? sSocksUser : sp.getString("socksUser", "");
+            String socksPass = sSocksPass != null && !sSocksPass.isEmpty() ? sSocksPass : sp.getString("socksPass", "");
+
+            Bundle out = new Bundle();
+            out.putInt("port", port);
+            out.putString("sig", sig);
+            out.putString("owner", ctx.getPackageName());
+            out.putString("profileId", profileId);
+            out.putString("profileName", profileName);
+            out.putString("socksUser", socksUser);
+            out.putString("socksPass", socksPass);
+            out.putLong("lastHsSec", st.lastHandshakeSec);
+            out.putBoolean("hsHealthy", hsHealthy);
+            out.putLong("updatedAt", System.currentTimeMillis());
+            return out;
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    public static void nudgeTunnelHandshakeAsync(final Context context, final String moduleApkPath, final Runnable onUpdatedMain) {
+        if (context == null) {
+            return;
+        }
+        long nowElapsed = SystemClock.elapsedRealtime();
+        if ((nowElapsed - sLastHandshakeNudgeMs) < 2500L || !sHandshakeNudgeInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        sLastHandshakeNudgeMs = nowElapsed;
+        final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        SYNC_EXEC.execute(() -> {
+            try {
+                try {
+                    NativeBridgeLoader.ensureLoaded(appCtx, moduleApkPath);
+                } catch (Throwable ignored) {
+                }
+                if (NativeBridgeLoader.isLoaded() && Wgbridge.isRunning()) {
+                    Wgbridge.ensureTunnelAlive(1800L);
+                    int p = (int) Wgbridge.getActivePort();
+                    TunnelConfig cfg = getConnectedProfile(appCtx, moduleApkPath);
+                    if (p > 0) {
+                        String sig = (cfg != null && cfg.hasPeerConfigured())
+                                ? (safeTrim(cfg.endpoint) + "|" + safeTrim(cfg.publicKey))
+                                : "";
+                        registerSharedTunnel(
+                                appCtx,
+                                p,
+                                sig,
+                                cfg != null ? cfg.id : sConnectedProfileId,
+                                cfg != null ? cfg.name : "",
+                                sSocksUser,
+                                sSocksPass
+                        );
+                    }
+                } else {
+                    try {
+                        appCtx.getContentResolver().call(
+                                Uri.parse("content://" + KeepaliveStatusProvider.AUTHORITY),
+                                KeepaliveStatusProvider.METHOD_QUERY_SHARED_TUNNEL,
+                                "nudge",
+                                null
+                        );
+                    } catch (Throwable ignored) {
+                    }
+                    sLastSharedHubCheckMs = 0L;
+                    int p = queryAnyLiveSharedTunnelPort(appCtx);
+                    long nowSec = System.currentTimeMillis() / 1000L;
+                    if (p > 0 && (sSharedLastHsSec <= 0L || Math.max(0L, nowSec - sSharedLastHsSec) >= 135L)) {
+                        try (Socket ignoredSock = openSocks5Ipv4Socket(
+                                p,
+                                getActiveSocksUser(),
+                                getActiveSocksPass(appCtx),
+                                new byte[]{1, 1, 1, 1},
+                                443,
+                                1800
+                        )) {
+                            // Deliberately trigger Go awaitHandshakeReadyOrFail on owning mux process.
+                        } catch (Throwable ignored) {
+                        }
+                        try {
+                            Thread.sleep(350L);
+                        } catch (InterruptedException ie) {
+                            Thread.currentThread().interrupt();
+                        }
+                        sLastSharedHubCheckMs = 0L;
+                        queryAnyLiveSharedTunnelPort(appCtx);
+                    }
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                sHandshakeNudgeInFlight.set(false);
+                if (onUpdatedMain != null) {
+                    new Handler(Looper.getMainLooper()).post(onUpdatedMain);
+                }
+            }
+        });
+    }
+
     public static long getSharedTunnelLastHandshakeSec(Context context) {
         try {
+            if (context != null) {
+                NativeBridgeLoader.ensureLoaded(context, null);
+            }
             if (NativeBridgeLoader.isLoaded() && Wgbridge.isRunning()) {
                 TunnelStats st = getLiveStats(context, null);
-                if (st.lastHandshakeSec > 0L && Wgbridge.isHandshakeHealthy()) {
+                long nowSec = System.currentTimeMillis() / 1000L;
+                if (st.lastHandshakeSec > 0L && Math.max(0L, nowSec - st.lastHandshakeSec) < HANDSHAKE_HEALTHY_WINDOW_SEC) {
                     return st.lastHandshakeSec;
                 }
             }
@@ -2965,6 +3810,21 @@ public final class WireGuardManager {
         }
         if (context == null) {
             return 0L;
+        }
+        long nowSec = System.currentTimeMillis() / 1000L;
+        if (sSharedLastHsSec <= 0L
+                || Math.max(0L, nowSec - sSharedLastHsSec) >= PROACTIVE_HANDSHAKE_NUDGE_AGE_SEC
+                || (SystemClock.elapsedRealtime() - sLastSharedHubCheckMs) >= 2000L) {
+            sLastSharedHubCheckMs = 0L;
+        }
+        int livePort = queryAnyLiveSharedTunnelPort(context);
+        if (livePort > 0) {
+            if (sSharedLastHsSec > 0L) {
+                return sSharedLastHsSec;
+            }
+            if (sSharedHsHealthy) {
+                return nowSec;
+            }
         }
         try {
             int port = -1;
@@ -3132,6 +3992,43 @@ public final class WireGuardManager {
             }
         } catch (Throwable ignored) {
         }
+        // R8-obfuscated ProxySettings fallback (e.g., Telegram 13.3.1 where ProxySettings is renamed):
+        // discover the exact 2nd parameter type of ConnectionsManager.setProxySettings(boolean, <T>)
+        // and invoke its static SharedPreferences factory after mainconfig has been updated.
+        try {
+            Class<?> cmCls = XposedHelpers.findClassIfExists("org.telegram.tgnet.ConnectionsManager", cl);
+            Context appCtx = sSocksPrefsCtx;
+            if (cmCls != null && appCtx != null) {
+                Class<?> paramProxyCls = null;
+                for (java.lang.reflect.Method m : cmCls.getDeclaredMethods()) {
+                    if (!"setProxySettings".equals(m.getName())) {
+                        continue;
+                    }
+                    Class<?>[] pts = m.getParameterTypes();
+                    if (pts.length == 2 && pts[0] == boolean.class && !pts[1].isPrimitive()) {
+                        paramProxyCls = pts[1];
+                        break;
+                    }
+                }
+                if (paramProxyCls != null) {
+                    SharedPreferences mc = appCtx.getSharedPreferences(TG_MAINCONFIG, Context.MODE_PRIVATE);
+                    for (java.lang.reflect.Method m : paramProxyCls.getDeclaredMethods()) {
+                        Class<?>[] pts = m.getParameterTypes();
+                        if (java.lang.reflect.Modifier.isStatic(m.getModifiers())
+                                && pts.length == 1
+                                && SharedPreferences.class.isAssignableFrom(pts[0])
+                                && paramProxyCls.isAssignableFrom(m.getReturnType())) {
+                            m.setAccessible(true);
+                            Object obj = m.invoke(null, mc);
+                            if (obj != null) {
+                                return obj;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {
+        }
         return null;
     }
 
@@ -3175,15 +4072,23 @@ public final class WireGuardManager {
                     null,
                     b
             );
+            sLastSharedTunnelHeartbeatMs = System.currentTimeMillis();
         } catch (Throwable ignored) {
         }
     }
 
     private static void clearSharedTunnel(Context context) {
+        clearSharedTunnelForPort(context, -1);
+    }
+
+    private static void clearSharedTunnelForPort(Context context, int onlyPort) {
         if (context == null) return;
         try {
             Bundle b = new Bundle();
             b.putString("owner", context.getPackageName());
+            if (onlyPort > 0) {
+                b.putInt("port", onlyPort);
+            }
             context.getContentResolver().call(
                     Uri.parse("content://" + KeepaliveStatusProvider.AUTHORITY),
                     KeepaliveStatusProvider.METHOD_CLEAR_SHARED_TUNNEL,
@@ -3290,6 +4195,15 @@ public final class WireGuardManager {
             ClassLoader telegramClassLoader,
             int accountIdx
     ) {
+        reapplyProxyToAccountIfActive(context, telegramClassLoader, accountIdx, false);
+    }
+
+    public static void reapplyProxyToAccountIfActive(
+            Context context,
+            ClassLoader telegramClassLoader,
+            int accountIdx,
+            boolean force
+    ) {
         if (context == null || telegramClassLoader == null) {
             return;
         }
@@ -3301,7 +4215,7 @@ public final class WireGuardManager {
         }
         int port = getEffectiveProxyPort(context, null);
         if (port > 0) {
-            postBindTelegramProxy(context, telegramClassLoader, true, port, isRouteCallsEnabled(context) || isKillSwitchEnabled(context), false);
+            postBindTelegramProxy(context, telegramClassLoader, true, port, isRouteCallsEnabled(context) || isKillSwitchEnabled(context), force);
         } else if (isKillSwitchEnabled(context)) {
             preArmKillSwitchSync(context, telegramClassLoader);
         }
@@ -3742,6 +4656,20 @@ public final class WireGuardManager {
             return;
         }
 
+        if (syncPullSharedStateFromProvider(appCtx, false) && Wgbridge.isRunning()) {
+            String syncedActiveId = getPrefs(appCtx).getString(KEY_ACTIVE_PROFILE_ID, "");
+            if (!syncedActiveId.isEmpty() && !syncedActiveId.equals(sConnectedProfileId)) {
+                TunnelConfig nextCfg = loadConfig(appCtx);
+                if (nextCfg != null && nextCfg.hasPeerConfigured()) {
+                    try {
+                        startAndBindProfile(appCtx, nextCfg, moduleApkPath, telegramClassLoader);
+                        return;
+                    } catch (Throwable ignored) {
+                    }
+                }
+            }
+        }
+
         // 1. Self-heal if tunnel unexpectedly stopped while supposed to be active 24/7
         if (!Wgbridge.isRunning()) {
             if (isUsingSharedHub()) {
@@ -3773,6 +4701,39 @@ public final class WireGuardManager {
 
         acquireForcedContinuityLocks(appCtx);
 
+        // 1a. Multi-app single-tunnel convergence: if a cold-start race bound port > 48729 while
+        // canonical port 48729 already runs the same profile, yield immediately onto 48729 so
+        // only ONE WireGuard session owns the device PrivateKey.
+        try {
+            int myPort = (int) Wgbridge.getActivePort();
+            if (myPort > 48729) {
+                TunnelConfig activeCfg = getConnectedProfile(appCtx, moduleApkPath);
+                String requiredSig = (activeCfg != null && activeCfg.hasPeerConfigured())
+                        ? (safeTrim(activeCfg.endpoint) + "|" + safeTrim(activeCfg.publicKey))
+                        : "";
+                Wgp1StatusResult canon = queryLiveStatusWithFallback(appCtx, moduleApkPath, 48729, sSocksPass, requiredSig);
+                if (canon != null && canon.running && wgp1ProfileSigMatches(appCtx, requiredSig, canon.profileSig)) {
+                    Wgbridge.setKillSwitchArmed(false);
+                    Wgbridge.stopKillSwitchGuard();
+                    Wgbridge.stopTunnel();
+                    sIsSharedHubOwner = false;
+                    sSharedHubPort = 48729;
+                    sCachedExternalSharedPort = 48729;
+                    sLastSharedHubCheckMs = SystemClock.elapsedRealtime();
+                    sSharedLastHsSec = canon.hsSec;
+                    sSharedHsHealthy = canon.hsHealthy;
+                    clearSharedTunnelForPort(appCtx, myPort);
+                    if (telegramClassLoader != null) {
+                        postBindTelegramProxy(appCtx, telegramClassLoader, true, 48729, isRouteCallsEnabled(appCtx), true);
+                        XposedProxyReflector.nudgeTelegramConnections(telegramClassLoader, true);
+                    }
+                    WgDiagnosticsLog.record("TUNNEL", "CONVERGE_SHARED", "yielded port=" + myPort + " -> 48729");
+                    return;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+
         // 1b. Self-heal if SOCKS5 auth rejections spiked (stale Telegram mainconfig / SharedConfig creds)
         try {
             if (Wgbridge.getSocksAuthRejectCount() >= 3L) {
@@ -3800,7 +4761,8 @@ public final class WireGuardManager {
             sConsecutiveHealthFailures = 0;
             TunnelConfig activeCfg = getConnectedProfile(appCtx, moduleApkPath);
             boolean hsNow = isHandshakeHealthyNow(appCtx, moduleApkPath);
-            if (!sLastReportedHsHealthy && hsNow) {
+            if (hsNow && (!sLastReportedHsHealthy || Math.abs(System.currentTimeMillis() - sLastSharedTunnelHeartbeatMs) >= 60_000L)) {
+                boolean wasReportedHealthy = sLastReportedHsHealthy;
                 sLastReportedHsHealthy = true;
                 int activePort = 0;
                 try {
@@ -3820,7 +4782,7 @@ public final class WireGuardManager {
                             sSocksUser,
                             sSocksPass
                     );
-                    if (telegramClassLoader != null) {
+                    if (!wasReportedHealthy && telegramClassLoader != null) {
                         postBindTelegramProxy(appCtx, telegramClassLoader, true, activePort, isRouteCallsEnabled(appCtx), true);
                     }
                 }
@@ -4381,15 +5343,32 @@ public final class WireGuardManager {
                                 .apply();
                     }
                 }
+                String activeU = getActiveSocksUser(appCtx);
+                String activeP = getActiveSocksPass(appCtx);
                 mc.edit()
                         .putBoolean("proxy_enabled", true)
                         .putBoolean("proxy_enabled_calls", routeCalls)
                         .putString("proxy_ip", "127.0.0.1")
                         .putInt("proxy_port", localPort)
-                        .putString("proxy_user", getActiveSocksUser(appCtx))
-                        .putString("proxy_pass", getActiveSocksPass(appCtx))
+                        .putString("proxy_user", activeU)
+                        .putString("proxy_pass", activeP)
                         .putString("proxy_secret", "")
                         .apply();
+                for (int acc = 1; acc <= 3; acc++) {
+                    String mcName = TG_MAINCONFIG + acc;
+                    java.io.File mcFile = new java.io.File(new java.io.File(appCtx.getApplicationInfo().dataDir, "shared_prefs"), mcName + ".xml");
+                    if (mcFile.exists()) {
+                        appCtx.getSharedPreferences(mcName, Context.MODE_PRIVATE).edit()
+                                .putBoolean("proxy_enabled", true)
+                                .putBoolean("proxy_enabled_calls", routeCalls)
+                                .putString("proxy_ip", "127.0.0.1")
+                                .putInt("proxy_port", localPort)
+                                .putString("proxy_user", activeU)
+                                .putString("proxy_pass", activeP)
+                                .putString("proxy_secret", "")
+                                .apply();
+                    }
+                }
             } else {
                 if (wgPrefs.getBoolean(KEY_MC_SNAPSHOT_TAKEN, false)) {
                     mc.edit()
@@ -4689,7 +5668,9 @@ public final class WireGuardManager {
                 return true;
             }
             if (userConfigCls == null) {
-                return false;
+                // In R8-shrunk builds (e.g. Telegram 13.3.1), UserConfig is obfuscated;
+                // include slots 1..3 cleanly since ConnectionsManager.native_setProxySettings ignores unused slots.
+                return acc < 4;
             }
             try {
                 Object ucInst = XposedHelpers.callStaticMethod(userConfigCls, "getInstance", acc);
@@ -4816,7 +5797,7 @@ public final class WireGuardManager {
             Class<?> userConfigClass = XposedHelpers.findClassIfExists("org.telegram.messenger.UserConfig", classLoader);
             int maxAcc = resolveMaxAccountCount(classLoader);
             for (int acc = 0; acc < maxAcc; acc++) {
-                if (!isAccountActivated(userConfigClass, acc)) {
+                if (acc > 0 && !isAccountActivated(userConfigClass, acc)) {
                     continue;
                 }
                 try {

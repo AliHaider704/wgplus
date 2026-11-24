@@ -3,6 +3,7 @@ package wgbridge
 import (
 	"context"
 	"fmt"
+	"hash/fnv"
 	"net"
 	"net/netip"
 	"strconv"
@@ -13,7 +14,7 @@ import (
 )
 
 const (
-	maxVoipRelays     = 16
+	maxVoipRelays     = 48
 	voipRelayIdleTTL  = 90 * time.Second
 	voipRelayClientID = "voip-relay"
 )
@@ -39,6 +40,7 @@ type voipRelay struct {
 	targetKey       string
 	targetHost      string
 	targetPort      int
+	localIP         string
 	localPort       int
 	followActive    bool
 	parentCtx       context.Context
@@ -68,11 +70,25 @@ var (
 // socket that forwards packets for targetHost:targetPort directly through the active
 // WireGuard tunnel netstack. Returns the bound local loopback port, or 0 on failure.
 func StartVoipEndpointRelay(targetHost string, targetPort int) int {
-	trimmedHost := strings.TrimSpace(targetHost)
-	if trimmedHost == "" || targetPort < 1 || targetPort > 65535 {
+	ctx, dialer, ok := getActiveVoipDialer()
+	if !ok {
 		return 0
 	}
+	return startVoipEndpointRelayWithDialer(ctx, dialer, strings.TrimSpace(targetHost), targetPort)
+}
 
+// StartVoipEndpointRelayAddr binds or reuses a local loopback UDP/TCP relay socket for
+// targetHost:targetPort, preserving targetPort on a dedicated 127.0.0.x address when
+// targetPort >= 1024 (falling back to ephemeral 127.0.0.1:0 when needed). Returns "ip:port" or "".
+func StartVoipEndpointRelayAddr(targetHost string, targetPort int) string {
+	ctx, dialer, ok := getActiveVoipDialer()
+	if !ok {
+		return ""
+	}
+	return startVoipEndpointRelayAddrWithDialer(ctx, dialer, strings.TrimSpace(targetHost), targetPort)
+}
+
+func getActiveVoipDialer() (context.Context, udpDialer, bool) {
 	mu.Lock()
 	isUp := running
 	ctx := activeCtx
@@ -86,11 +102,21 @@ func StartVoipEndpointRelay(targetHost string, targetPort int) int {
 		var ok bool
 		ctx, dialer, ok = awaitMuxRouteReady(4 * time.Second)
 		if !ok || ctx == nil || dialer == nil {
-			return 0
+			return nil, nil, false
 		}
 	}
+	return ctx, dialer, true
+}
 
-	return startVoipEndpointRelayWithDialer(ctx, dialer, trimmedHost, targetPort)
+func (r *voipRelay) localAddrString() string {
+	if r == nil || r.localPort <= 0 {
+		return ""
+	}
+	ip := r.localIP
+	if ip == "" {
+		ip = "127.0.0.1"
+	}
+	return net.JoinHostPort(ip, strconv.Itoa(r.localPort))
 }
 
 // StopAllVoipRelays closes all active local VoIP endpoint relays and resets relay state.
@@ -109,25 +135,53 @@ func StopAllVoipRelays() {
 }
 
 func startVoipEndpointRelayWithDialer(ctx context.Context, dialer udpDialer, targetHost string, targetPort int) int {
+	_, port := startVoipEndpointRelayInternal(ctx, dialer, targetHost, targetPort, false)
+	return port
+}
+
+func startVoipEndpointRelayAddrWithDialer(ctx context.Context, dialer udpDialer, targetHost string, targetPort int) string {
+	ip, port := startVoipEndpointRelayInternal(ctx, dialer, targetHost, targetPort, true)
+	if ip == "" || port <= 0 {
+		return ""
+	}
+	return net.JoinHostPort(ip, strconv.Itoa(port))
+}
+
+func startVoipEndpointRelayInternal(
+	ctx context.Context,
+	dialer udpDialer,
+	targetHost string,
+	targetPort int,
+	preservePort bool,
+) (string, int) {
 	trimmedHost := strings.TrimSpace(targetHost)
 	if ctx == nil || dialer == nil || trimmedHost == "" || targetPort < 1 || targetPort > 65535 {
-		return 0
+		return "", 0
 	}
 	if ctx.Err() != nil {
-		return 0
+		return "", 0
 	}
 
 	_, followActive := dialer.(*fastNet)
-	targetKey := net.JoinHostPort(strings.ToLower(trimmedHost), strconv.Itoa(targetPort))
+	modePrefix := "e|"
+	if preservePort {
+		modePrefix = "p|"
+	}
+	baseHostPort := net.JoinHostPort(strings.ToLower(trimmedHost), strconv.Itoa(targetPort))
+	targetKey := modePrefix + baseHostPort
 	nowNano := time.Now().UnixNano()
 
 	voipRelaysMu.Lock()
 	if existing, ok := voipRelays[targetKey]; ok {
 		if !existing.closed.Load() && existing.ctx.Err() == nil && (followActive || existing.parentCtx == ctx) {
 			existing.lastActive.Store(nowNano)
+			ip := existing.localIP
+			if ip == "" {
+				ip = "127.0.0.1"
+			}
 			port := existing.localPort
 			voipRelaysMu.Unlock()
-			return port
+			return ip, port
 		}
 		delete(voipRelays, targetKey)
 		voipRelaysMu.Unlock()
@@ -158,10 +212,22 @@ func startVoipEndpointRelayWithDialer(ctx context.Context, dialer udpDialer, tar
 		r.close()
 	}
 
-	udpLn, tcpLn, localPort, err := bindVoipRelayLoopback()
+	var (
+		udpLn     *net.UDPConn
+		tcpLn     net.Listener
+		localIP   string
+		localPort int
+		err       error
+	)
+	if preservePort {
+		udpLn, tcpLn, localIP, localPort, err = bindVoipRelayLoopbackPreservePort(baseHostPort, targetPort)
+	} else {
+		udpLn, tcpLn, localPort, err = bindVoipRelayLoopback()
+		localIP = "127.0.0.1"
+	}
 	if err != nil {
-		RecordDiag("VOIP_RELAY", "BIND_ERR", fmt.Sprintf("target=%s err=%v", targetKey, err))
-		return 0
+		RecordDiag("VOIP_RELAY", "BIND_ERR", fmt.Sprintf("target=%s err=%v", baseHostPort, err))
+		return "", 0
 	}
 
 	sockBufSz := activeUdpSocketBufSize()
@@ -180,6 +246,7 @@ func startVoipEndpointRelayWithDialer(ctx context.Context, dialer udpDialer, tar
 		targetKey:    targetKey,
 		targetHost:   trimmedHost,
 		targetPort:   targetPort,
+		localIP:      localIP,
 		localPort:    localPort,
 		followActive: followActive,
 		parentCtx:    ctx,
@@ -198,17 +265,53 @@ func startVoipEndpointRelayWithDialer(ctx context.Context, dialer udpDialer, tar
 	// Check race: another goroutine may have created the same target while we were binding.
 	if existing, ok := voipRelays[targetKey]; ok && !existing.closed.Load() && existing.ctx.Err() == nil && (followActive || existing.parentCtx == ctx) {
 		existing.lastActive.Store(nowNano)
+		eip := existing.localIP
+		if eip == "" {
+			eip = "127.0.0.1"
+		}
 		port := existing.localPort
 		voipRelaysMu.Unlock()
 		r.close()
-		return port
+		return eip, port
 	}
 	voipRelays[targetKey] = r
 	voipRelaysMu.Unlock()
 
-	RecordDiag("VOIP_RELAY", "OPEN", fmt.Sprintf("target=%s localPort=%d tcp=%v", targetKey, localPort, tcpLn != nil))
+	RecordDiag("VOIP_RELAY", "OPEN", fmt.Sprintf("target=%s localAddr=%s tcp=%v", baseHostPort, r.localAddrString(), tcpLn != nil))
 	r.start()
-	return localPort
+	return localIP, localPort
+}
+
+func bindVoipRelayLoopbackPreservePort(targetKey string, targetPort int) (*net.UDPConn, net.Listener, string, int, error) {
+	if targetPort >= 1024 && (targetPort < 48729 || targetPort > 48735) {
+		h := fnv.New32a()
+		_, _ = h.Write([]byte(targetKey))
+		startOctet := 2 + int(h.Sum32()%248) // 2..249
+		for i := 0; i < 32; i++ {
+			octet := 2 + ((startOctet - 2 + i) % 248)
+			ip := net.IPv4(127, 0, 0, byte(octet))
+			ipStr := ip.String()
+			udpLn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: ip, Port: targetPort})
+			if err != nil {
+				continue
+			}
+			tcpLn, tcpErr := net.Listen("tcp4", net.JoinHostPort(ipStr, strconv.Itoa(targetPort)))
+			if tcpErr == nil {
+				return udpLn, tcpLn, ipStr, targetPort, nil
+			}
+			// On conflict on one octet, try next 127.0.0.x first; on final attempt keep UDP working.
+			if i < 4 {
+				_ = udpLn.Close()
+				continue
+			}
+			return udpLn, nil, ipStr, targetPort, nil
+		}
+	}
+	udpLn, tcpLn, port, err := bindVoipRelayLoopback()
+	if err != nil {
+		return nil, nil, "", 0, err
+	}
+	return udpLn, tcpLn, "127.0.0.1", port, nil
 }
 
 func bindVoipRelayLoopback() (*net.UDPConn, net.Listener, int, error) {
@@ -263,7 +366,7 @@ func (r *voipRelay) close() {
 		}
 		r.sessMu.Unlock()
 		trackClientConnEnd(r.statEnt)
-		RecordDiag("VOIP_RELAY", "CLOSE", fmt.Sprintf("target=%s localPort=%d", r.targetKey, r.localPort))
+		RecordDiag("VOIP_RELAY", "CLOSE", fmt.Sprintf("target=%s:%d localAddr=%s", r.targetHost, r.targetPort, r.localAddrString()))
 	})
 }
 
