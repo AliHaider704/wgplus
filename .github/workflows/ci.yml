@@ -17,6 +17,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: wgbridge-go/go.mod
+          cache-dependency-path: wgbridge-go/go.sum
       - run: go vet ./...
       # The DoH test also queries Cloudflare live, so it needs outbound HTTPS.
       - run: go test -v ./...
@@ -32,6 +33,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: desktop-win/go.mod
+          cache-dependency-path: desktop-win/go.sum
       - run: go vet ./...
       - run: go test -v ./...
 
@@ -44,16 +46,23 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: wgbridge-go/go.mod
-      - uses: actions/setup-java@v4
+          cache-dependency-path: wgbridge-go/go.sum
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
           cache: gradle
-      - uses: android-actions/setup-android@v3
-      - name: Install Android SDK & NDK components
+      - name: Configure Android SDK & NDK
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;36.0.0" "ndk;27.2.12479018"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          CMDLINE_BIN="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin 2>/dev/null | sort -V | tail -n 1)"
+          echo "$CMDLINE_BIN" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          export PATH="$CMDLINE_BIN:$SDK_ROOT/platform-tools:$PATH"
+          yes | sdkmanager --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+          sdkmanager --sdk_root="$SDK_ROOT" "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;27.2.12479018"
       - name: Build wgbridge.aar (arm64-v8a + armeabi-v7a)
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
@@ -86,16 +95,23 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: wgbridge-go/go.mod
-      - uses: actions/setup-java@v4
+          cache-dependency-path: wgbridge-go/go.sum
+      - uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '21'
           cache: gradle
-      - uses: android-actions/setup-android@v3
-      - name: Install NDK and SDK build tools for x86_64 CI bridge
+      - name: Configure Android SDK & NDK
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-35" "build-tools;36.0.0" "ndk;27.2.12479018"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          CMDLINE_BIN="$(ls -d "$SDK_ROOT"/cmdline-tools/*/bin 2>/dev/null | sort -V | tail -n 1)"
+          echo "$CMDLINE_BIN" >> "$GITHUB_PATH"
+          echo "$SDK_ROOT/platform-tools" >> "$GITHUB_PATH"
+          export PATH="$CMDLINE_BIN:$SDK_ROOT/platform-tools:$PATH"
+          yes | sdkmanager --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+          sdkmanager --sdk_root="$SDK_ROOT" "platform-tools" "platforms;android-35" "build-tools;36.0.0" "ndk;27.2.12479018"
       - name: Build CI-only x86_64 wgbridge.aar
         env:
           ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
