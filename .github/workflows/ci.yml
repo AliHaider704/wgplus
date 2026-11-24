@@ -134,10 +134,7 @@ jobs:
           disable-animations: true
           script: |
             adb logcat -c || true
-            if ! ./gradlew connectedDebugAndroidTest -PemulatorTestBuild=true --no-daemon; then
-              adb logcat -d -t 2000 > "logcat-api-${{ matrix.api-level }}.txt" || true
-              exit 1
-            fi
+            ./gradlew connectedDebugAndroidTest -PemulatorTestBuild=true --no-daemon || (adb logcat -d -t 2000 > "logcat-api-${{ matrix.api-level }}.txt" || true; exit 1)
       - name: Upload emulator failure diagnostics
         if: failure()
         uses: actions/upload-artifact@v4

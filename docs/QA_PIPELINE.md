@@ -32,7 +32,7 @@ WireGuard Plus (`wgplus`) validates Android and Windows builds across three comp
 
 1. Open [Firebase Console](https://console.firebase.google.com/), create or select a project (Spark free plan is sufficient — up to **5 physical** and **10 virtual** device tests per day).
 2. In [Google Cloud Console](https://console.cloud.google.com/), enable **Cloud Testing API** (`testing.googleapis.com`) and **Cloud Tool Results API** (`toolresults.googleapis.com`) for that project.
-3. Under **IAM & Admin -> Service Accounts**, create a service account with the **Firebase Test Lab Admin** (`roles/cloudtestservice.testAdmin`) role (or **Editor** scoped to the test project) and download its JSON key.
+3. Under **IAM & Admin -> Service Accounts**, create a service account with the **Editor** (`roles/editor`, scoped strictly to the dedicated QA project so `gcloud` can also upload APKs to Firebase's auto-provisioned free Spark `test-lab-*` bucket) and **Firebase Test Lab Admin** (`roles/cloudtestservice.testAdmin`) roles, then download its JSON key.
 4. In GitHub **Repository Settings -> Secrets and variables -> Actions**, add two secrets:
    - `GCP_PROJECT_ID`: Your Firebase / Google Cloud Project ID.
    - `FIREBASE_SERVICE_ACCOUNT_JSON`: Full contents of the downloaded JSON key file.

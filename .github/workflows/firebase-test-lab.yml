@@ -118,14 +118,26 @@ jobs:
               for m in models:
                   if m.get("form") != form:
                       continue
-                  vers = [int(v) for v in (m.get("supportedVersionIds") or []) if str(v).isdigit()]
-                  vers = [v for v in vers if v >= min_api]
-                  if not vers:
-                      continue
                   tags = m.get("tags") or []
                   if "deprecated" in tags or "directAccessOnly" in tags:
                       continue
-                  candidates.append((m.get("brand", ""), m.get("id", ""), max(vers)))
+                  per_ver = m.get("perAndroidVersionInfo") or []
+                  high_cap = [
+                      int(v["versionId"])
+                      for v in per_ver
+                      if str(v.get("versionId", "")).isdigit()
+                      and "HIGH" in str(v.get("deviceCapacity", "")).upper()
+                      and min_api <= int(v["versionId"]) <= 35
+                  ]
+                  if high_cap:
+                      best_api = max(high_cap)
+                  else:
+                      vers = [int(v) for v in (m.get("supportedVersionIds") or []) if str(v).isdigit() and int(v) >= min_api]
+                      if not vers:
+                          continue
+                      stable = [v for v in vers if v <= 35]
+                      best_api = max(stable) if stable else max(vers)
+                  candidates.append((m.get("brand", ""), m.get("id", ""), best_api))
 
               # Pick highest supported API for preferred OEM diversity first
               candidates.sort(key=lambda x: (-x[2], x[1]))
