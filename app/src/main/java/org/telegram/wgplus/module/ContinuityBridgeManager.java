@@ -10,6 +10,7 @@ import android.net.NetworkCapabilities;
 import android.net.NetworkRequest;
 import android.os.Build;
 import android.os.Process;
+import android.provider.Settings;
 import android.util.Log;
 
 import java.util.ArrayList;
@@ -50,7 +51,16 @@ public final class ContinuityBridgeManager {
             "ir.p2021.telegraph",
             "com.radolyn.ayugram",
             "org.thunderdog.challegram",
-            "xyz.nextalone.nagram"
+            "xyz.nextalone.nagram",
+            "uz.unnarsx.cherrygram",
+            "tw.nekomimi.nekogram",
+            "nekox.messenger",
+            "org.forkgram.messenger",
+            "org.forkclient.messenger",
+            "com.exteragram.messenger",
+            "it.octogram.android",
+            "com.iMe.android",
+            "app.nicegram"
     );
 
     private static final ExecutorService WORKER = Executors.newSingleThreadExecutor();
@@ -213,6 +223,35 @@ public final class ContinuityBridgeManager {
         return ContinuityTier.STANDARD_FGS;
     }
 
+    public static boolean isWirelessAdbUsable(Context context) {
+        if (context == null || !BuiltinAdbKeyManager.isPaired(context)) {
+            return false;
+        }
+        try {
+            boolean devEnabled = Settings.Global.getInt(
+                    context.getContentResolver(),
+                    Settings.Global.DEVELOPMENT_SETTINGS_ENABLED,
+                    0
+            ) == 1;
+            if (!devEnabled) {
+                return false;
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                boolean wifiAdb = Settings.Global.getInt(
+                        context.getContentResolver(),
+                        "adb_wifi_enabled",
+                        0
+                ) == 1;
+                return wifiAdb
+                        || PrivilegeBridge.hasSelfWriteSecureSettingsPermission(context)
+                        || BuiltinAdbKeyManager.getDynamicTcpPort(context) == 5555;
+            }
+            return true;
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
     public static String getActivePrivilegeMode(Context context) {
         if (context != null && PrivilegeBridge.isStandaloneDaemonAlive(context)) {
             return PrivilegeBridge.getLastDaemonUid() == 0 ? "ROOT_DAEMON" : "WGPLUS_DAEMON";
@@ -220,10 +259,11 @@ public final class ContinuityBridgeManager {
         if (PrivilegeBridge.isRootAvailablePassive(context)) {
             return "ROOT";
         }
+        boolean usableAdb = isWirelessAdbUsable(context);
         if (context != null && PrivilegeBridge.hasSelfProcessLimitPermission(context)) {
-            return BuiltinAdbKeyManager.isPaired(context) ? "BUILTIN_ADB_SELF" : "SELF_PRIVILEGED";
+            return usableAdb ? "BUILTIN_ADB_SELF" : "SELF_PRIVILEGED";
         }
-        if (context != null && BuiltinAdbKeyManager.isPaired(context)) {
+        if (usableAdb) {
             return "BUILTIN_ADB";
         }
         if (KeepaliveBridgeListenerService.isConnected()
@@ -242,7 +282,7 @@ public final class ContinuityBridgeManager {
         }
         return PrivilegeBridge.hasSelfProcessLimitPermission(context)
                 || PrivilegeBridge.isStandaloneDaemonAlive(context)
-                || BuiltinAdbKeyManager.isPaired(context)
+                || isWirelessAdbUsable(context)
                 || PrivilegeBridge.hasRootBinaryOnDisk();
     }
 
@@ -269,7 +309,7 @@ public final class ContinuityBridgeManager {
                     if (!isStealthHybridEnabled(appCtx)) {
                         return;
                     }
-                    if (!BuiltinAdbKeyManager.isPaired(appCtx) && !PrivilegeBridge.isRootAvailablePassive(appCtx)) {
+                    if (!isWirelessAdbUsable(appCtx) && !PrivilegeBridge.isRootAvailablePassive(appCtx)) {
                         return;
                     }
                     WORKER.execute(() -> {
@@ -333,7 +373,7 @@ public final class ContinuityBridgeManager {
         boolean daemonAlive = PrivilegeBridge.isStandaloneDaemonAlive(appCtx);
         boolean rootReady = PrivilegeBridge.isRootAvailablePassive(appCtx);
         boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
-        boolean builtinAdbPaired = BuiltinAdbKeyManager.isPaired(appCtx);
+        boolean builtinAdbPaired = isWirelessAdbUsable(appCtx);
         boolean privilegeReady = daemonAlive || rootReady || selfPrivileged || builtinAdbPaired;
 
         if (!stealthEnabled || !wantsAlwaysAwake) {
@@ -401,7 +441,7 @@ public final class ContinuityBridgeManager {
         boolean daemonAlive = PrivilegeBridge.isStandaloneDaemonAlive(appCtx);
         boolean rootReady = PrivilegeBridge.isRootAvailablePassive(appCtx);
         boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
-        boolean builtinAdbPaired = BuiltinAdbKeyManager.isPaired(appCtx);
+        boolean builtinAdbPaired = isWirelessAdbUsable(appCtx);
         boolean sovereignReady = daemonAlive || rootReady || selfPrivileged;
         boolean forcedImportant = sovereignReady && (!sElevatedPids.isEmpty() || daemonAlive || selfPrivileged);
         ContinuityTier tier = computeContinuityTier(stealthEnabled, sovereignReady, listenerConnected || listenerEnabled);
@@ -427,7 +467,7 @@ public final class ContinuityBridgeManager {
 
         boolean daemonAlive = PrivilegeBridge.isStandaloneDaemonAlive(appCtx);
         boolean selfPrivileged = PrivilegeBridge.hasSelfProcessLimitPermission(appCtx);
-        boolean builtinAdbPaired = BuiltinAdbKeyManager.isPaired(appCtx);
+        boolean builtinAdbPaired = isWirelessAdbUsable(appCtx);
         List<String> pkgs = collectInstalledTargetsAndModule(appCtx);
         String listenerComp = appCtx.getPackageName() + "/" + KeepaliveBridgeListenerService.class.getName();
 

@@ -17,7 +17,7 @@ import (
 )
 
 // AppVersion must match the release tag (without "v") of this build.
-const AppVersion = "1.9.0"
+const AppVersion = "2.0.0"
 
 // GetAppVersion returns the running desktop app version string.
 func (a *App) GetAppVersion() string {

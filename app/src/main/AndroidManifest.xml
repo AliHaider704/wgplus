@@ -31,6 +31,15 @@
         <package android:name="com.radolyn.ayugram" />
         <package android:name="org.thunderdog.challegram" />
         <package android:name="xyz.nextalone.nagram" />
+        <package android:name="uz.unnarsx.cherrygram" />
+        <package android:name="tw.nekomimi.nekogram" />
+        <package android:name="nekox.messenger" />
+        <package android:name="org.forkgram.messenger" />
+        <package android:name="org.forkclient.messenger" />
+        <package android:name="com.exteragram.messenger" />
+        <package android:name="it.octogram.android" />
+        <package android:name="com.iMe.android" />
+        <package android:name="app.nicegram" />
         <intent>
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="tg" />

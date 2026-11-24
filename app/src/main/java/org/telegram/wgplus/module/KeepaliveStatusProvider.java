@@ -232,6 +232,8 @@ public class KeepaliveStatusProvider extends ContentProvider {
             String profileName = extras != null ? extras.getString("profileName", "") : "";
             String socksUser = extras != null ? extras.getString("socksUser", "") : "";
             String socksPass = extras != null ? extras.getString("socksPass", "") : "";
+            long lastHsSec = extras != null ? extras.getLong("lastHsSec", 0L) : 0L;
+            boolean hsHealthy = extras != null && extras.getBoolean("hsHealthy", false);
             ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE).edit()
                     .putInt("port", port)
                     .putString("sig", sig != null ? sig : "")
@@ -240,6 +242,8 @@ public class KeepaliveStatusProvider extends ContentProvider {
                     .putString("profileName", profileName != null ? profileName : "")
                     .putString("socksUser", socksUser != null ? socksUser : "")
                     .putString("socksPass", socksPass != null ? socksPass : "")
+                    .putLong("lastHsSec", lastHsSec)
+                    .putBoolean("hsHealthy", hsHealthy)
                     .putLong("updatedAt", System.currentTimeMillis())
                     .commit();
             Bundle out = new Bundle();
@@ -256,6 +260,8 @@ public class KeepaliveStatusProvider extends ContentProvider {
             out.putString("profileName", sp.getString("profileName", ""));
             out.putString("socksUser", sp.getString("socksUser", ""));
             out.putString("socksPass", sp.getString("socksPass", ""));
+            out.putLong("lastHsSec", sp.getLong("lastHsSec", 0L));
+            out.putBoolean("hsHealthy", sp.getBoolean("hsHealthy", false));
             out.putLong("updatedAt", sp.getLong("updatedAt", 0L));
             return out;
         }
@@ -344,9 +350,15 @@ public class KeepaliveStatusProvider extends ContentProvider {
             obj.put("hasConfiguredProfile", WireGuardManager.hasAnyConfiguredProfile(ctx));
             obj.put("tunnelRunning", running);
             obj.put("activePort", port);
+            long effectiveHsSec = stats.lastHandshakeSec;
+            if (effectiveHsSec <= 0L && running && WireGuardManager.isSharedTunnelObserved(ctx, apkPath)) {
+                android.content.SharedPreferences sp = ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
+                effectiveHsSec = sp.getLong("lastHsSec", 0L);
+            }
             obj.put("rxBytes", stats.rxBytes);
             obj.put("txBytes", stats.txBytes);
-            obj.put("lastHandshakeSec", stats.lastHandshakeSec);
+            obj.put("lastHandshakeSec", effectiveHsSec);
+            obj.put("handshakeHealthy", effectiveHsSec > 0L);
             obj.put("privilegeMode", ContinuityBridgeManager.getActivePrivilegeMode(ctx));
             obj.put("continuityTier", snap.tier.name());
             obj.put("stealthProtected", snap.stealthProtected);
@@ -472,7 +484,12 @@ public class KeepaliveStatusProvider extends ContentProvider {
                 return true;
             }
         }
-        return false;
+        String low = pkg.toLowerCase(Locale.US);
+        return low.startsWith("org.telegram.")
+                || low.startsWith("com.radolyn.")
+                || low.startsWith("xyz.nextalone.")
+                || low.contains("gram")
+                || low.contains("telegraph");
     }
 
     static boolean verifyPackageSigningTrust(Context ctx, PackageManager pm, String pkg) {
@@ -496,11 +513,21 @@ public class KeepaliveStatusProvider extends ContentProvider {
         if (!hasLauncherEntryActivity(pm, pkg)) {
             return false;
         }
+        long pkgUpdateTime = 0L;
+        try {
+            PackageInfo pi = pm.getPackageInfo(pkg, 0);
+            if (pi != null) {
+                pkgUpdateTime = pi.lastUpdateTime;
+            }
+        } catch (Throwable ignored) {
+        }
         SharedPreferences pins = ctx.getSharedPreferences(CERT_PINS_PREFS, Context.MODE_PRIVATE);
         String key = "cert_" + pkg;
+        String updKey = "upd_" + pkg;
         String pinned = pins.getString(key, "");
-        if (pinned == null || pinned.isEmpty()) {
-            pins.edit().putString(key, certHash).apply();
+        long prevUpd = pins.getLong(updKey, 0L);
+        if (pinned == null || pinned.isEmpty() || (pkgUpdateTime > 0L && pkgUpdateTime > prevUpd)) {
+            pins.edit().putString(key, certHash).putLong(updKey, pkgUpdateTime).apply();
             return true;
         }
         return pinned.equals(certHash);

@@ -36,6 +36,8 @@ var (
 	mu                       sync.Mutex
 	rebindMu                 sync.Mutex
 	lastForceHopAt           time.Time
+	lastAppliedResolvedEp    string
+	socksAuthRejectCount     atomic.Int64
 	activeDev                *device.Device
 	activeCtx                context.Context
 	activeCancel             context.CancelFunc
@@ -313,18 +315,18 @@ func muxDeviceClosedOrReplaced(dev *device.Device) bool {
 	return activeDev != nil && activeDev != dev
 }
 
+const minHardHopInterval = 3500 * time.Millisecond
+
 // hopActivePeer forces wireguard-go onto a fresh OS ephemeral UDP port (listen_port=0) and,
 // when forcePeerReset is true, cleanly recreates the peer so stale lastSentHandshake (5s RekeyTimeout)
 // and stale wlan0 sticky PKTINFO source addresses are wiped before initiating a fresh Noise handshake.
 func hopActivePeer(hopPort bool, forcePeerReset bool) bool {
+	return hopActivePeerInternal(hopPort, forcePeerReset, false)
+}
+
+func hopActivePeerInternal(hopPort bool, forcePeerReset bool, bypassCooldown bool) bool {
 	rebindMu.Lock()
 	defer rebindMu.Unlock()
-
-	if forcePeerReset && !lastForceHopAt.IsZero() {
-		if elapsed := time.Since(lastForceHopAt); elapsed < 30*time.Millisecond {
-			time.Sleep(30*time.Millisecond - elapsed)
-		}
-	}
 
 	mu.Lock()
 	if !running || activeDev == nil || activePeerPubHex == "" {
@@ -339,6 +341,26 @@ func hopActivePeer(hopPort bool, forcePeerReset bool) bool {
 		keepAlive:  activeKeepAlive,
 	}
 	mu.Unlock()
+
+	epChanged := params.resolvedEp != "" && params.resolvedEp != lastAppliedResolvedEp
+
+	// Prevent parallel guardian/roaming/watchdog loops from wiping the peer back-to-back
+	// before a handshake response can return over high-latency mobile/CGNAT links.
+	if forcePeerReset && !bypassCooldown && !epChanged && !lastForceHopAt.IsZero() && time.Since(lastForceHopAt) < minHardHopInterval {
+		triggerPeerHandshakeDirect(dev, params.pubHex, true)
+		return true
+	}
+
+	// WireGuard TAI64N whitens timestamps to ~16.77ms buckets; ensure a hard peer reset
+	// advances into the next TAI64N tick so the peer does not drop the new initiation as a replay.
+	if forcePeerReset {
+		mu.Lock()
+		sinceStart := time.Since(activeStartTime)
+		mu.Unlock()
+		if sinceStart >= 0 && sinceStart < 22*time.Millisecond {
+			time.Sleep(22*time.Millisecond - sinceStart)
+		}
+	}
 
 	if hopPort {
 		for attempt := 0; attempt < 3; attempt++ {
@@ -367,6 +389,7 @@ func hopActivePeer(hopPort bool, forcePeerReset bool) bool {
 		err := applyPeerUapi(dev, params, "", true)
 		if err == nil {
 			dev.DisableSomeRoamingForBrokenMobileSemantics()
+			lastAppliedResolvedEp = params.resolvedEp
 		}
 		mu.Unlock()
 		lastForceHopAt = time.Now()
@@ -606,9 +629,9 @@ func StartTunnelAdvanced(
 // 2. Continuously monitors RX/TX progress (ignoring small 32B keepalive packets) and handshake freshness,
 //    automatically hopping ports and re-handshaking whenever a mobile CGNAT pinhole collapses or stalls.
 func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) {
-	// Phase 1: Initial handshake warmup. Escalate quickly (250ms, 450ms, 800ms) so lost initial
-	// UDP packets or blocked ephemeral ports recover in ~1.5s instead of waiting 4-5s.
-	retryDelays := []time.Duration{250 * time.Millisecond, 450 * time.Millisecond, 800 * time.Millisecond}
+	// Phase 1: Initial handshake warmup. Try soft retries first (350ms, 900ms), then perform
+	// at most one hard port hop at 2200ms only if no handshake has landed yet.
+	retryDelays := []time.Duration{350 * time.Millisecond, 900 * time.Millisecond, 2200 * time.Millisecond}
 	for idx, wait := range retryDelays {
 		if hasCompletedHandshake(dev) || !isActiveDevice(dev) {
 			break
@@ -628,13 +651,14 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 		}
 	}
 
-	// Phase 2: 24/7 continuous health & CGNAT pinhole guardian (3s ticks -> 6s stall recovery)
+	// Phase 2: 24/7 continuous health & CGNAT pinhole guardian (3s ticks -> 9s stall recovery)
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
 	lastRx, lastTx, _ := readActiveTotals(dev)
 	var stalledTicks int
 	var noHandshakeTicks int
+	var noHandshakeBackoffTicks = 3 // 9s -> 18s -> 30s
 	var lastHardHopAt time.Time
 
 	for {
@@ -660,13 +684,16 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 		txDelta := tx - lastTx
 		canHardHop := lastHardHopAt.IsZero() || time.Since(lastHardHopAt) >= 20*time.Second
 
-		// Case A1: Never completed a handshake; nudge with isRetry=true first, hard-hop after 9s.
+		// Case A1: Never completed a handshake; nudge softly and apply backed-off hard hops (9s -> 18s -> 30s).
 		if hsSec <= 0 {
 			noHandshakeTicks++
-			if noHandshakeTicks >= 3 && canHardHop {
+			if noHandshakeTicks >= noHandshakeBackoffTicks && canHardHop {
 				hopActivePeer(true, true)
 				lastHardHopAt = time.Now()
 				noHandshakeTicks = 0
+				if noHandshakeBackoffTicks < 10 {
+					noHandshakeBackoffTicks += 3
+				}
 				stalledTicks = 0
 				lastRx, lastTx, _ = readActiveTotals(dev)
 				continue
@@ -676,6 +703,7 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 			continue
 		}
 		noHandshakeTicks = 0
+		noHandshakeBackoffTicks = 3
 
 		// Case A2: Handshake aging (>135s while real traffic is flowing).
 		// Soft-rehandshake ONLY — never wipe the live peer session or hop UDP port here,
@@ -688,18 +716,14 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 			continue
 		}
 
-		// Case B: Outbound payload with zero inbound RX across 2 consecutive 3s intervals (6s).
-		// Lower threshold (64B) when active TCP/UDP flows exist so small TCP retransmissions and
-		// VoIP STUN/DTLS retries are caught in 6s instead of waiting 220s.
-		hasActiveFlows := activeTcpConns.Load() > 0 || activeUdpAssocs.Load() > 0
+		// Case B: Outbound payload (>=256B) with zero inbound RX across 3 consecutive 3s intervals (9s).
 		stalled := (txDelta >= 256 && rx == lastRx) ||
-			(hasActiveFlows && txDelta >= 64 && rx == lastRx) ||
-			(hsAge > 220 && txDelta >= 64 && rx == lastRx)
+			(hsAge > 220 && txDelta >= 128 && rx == lastRx)
 		if stalled {
 			stalledTicks++
-			if stalledTicks >= 2 && canHardHop {
+			if stalledTicks >= 3 && canHardHop {
 				watchdogRecoveries.Add(1)
-				RecordDiag("WATCHDOG", "STALL_HOP", fmt.Sprintf("txDelta=%d hsAge=%d flows=%v", txDelta, hsAge, hasActiveFlows))
+				RecordDiag("WATCHDOG", "STALL_HOP", fmt.Sprintf("txDelta=%d hsAge=%d", txDelta, hsAge))
 				hopActivePeer(true, true)
 				lastHardHopAt = time.Now()
 				stalledTicks = 0
@@ -754,34 +778,38 @@ func UpdatePeerEndpoint(endpoint string) error {
 	}
 	dev := activeDev
 	activeRawEp = endpoint
+	epChanged := false
 	if err == nil && resolved != "" {
+		epChanged = resolved != activeResolvedEp
 		activeResolvedEp = resolved
 	}
+	pubHex := activePeerPubHex
 	mu.Unlock()
 
-	if !hopActivePeer(true, true) {
+	if !hopActivePeerInternal(true, true, epChanged) {
 		return errors.New("tunnel is not running")
 	}
-	if waitForHandshakeQuick(dev, 700*time.Millisecond) {
+	if waitForHandshakeQuick(dev, 1400*time.Millisecond) {
 		return nil
 	}
-	// Second attempt after 180ms in case Android netd switched cellular routes asynchronously
+	// Soft re-nudge after 180ms in case Android netd switched routes asynchronously
 	time.Sleep(180 * time.Millisecond)
 	if !isActiveDevice(dev) {
 		return nil
 	}
-	hopActivePeer(true, true)
-	_ = waitForHandshakeQuick(dev, 850*time.Millisecond)
+	triggerPeerHandshakeDirect(dev, pubHex, true)
+	_ = waitForHandshakeQuick(dev, 900*time.Millisecond)
 	return nil
 }
 
 // ForceRebindAndHandshake hops to a fresh OS ephemeral UDP source port (:0) on the active network interface,
-// forces an immediate cryptographic re-handshake (bypassing 5s RekeyTimeout), and verifies completion.
+// forces an immediate cryptographic re-handshake (within cooldown limits), and verifies completion.
 func ForceRebindAndHandshake() bool {
 	mu.Lock()
 	dev := activeDev
 	rawEp := activeRawEp
 	useDoH := activeUseDoH
+	pubHex := activePeerPubHex
 	isUp := running
 	mu.Unlock()
 
@@ -789,33 +817,35 @@ func ForceRebindAndHandshake() bool {
 		return false
 	}
 
+	epChanged := false
 	if strings.TrimSpace(rawEp) != "" {
 		ClearDnsCache()
 		if resolved, err := ResolveEndpointDoH(rawEp, useDoH); err == nil && resolved != "" {
 			mu.Lock()
 			if running && activeDev == dev {
+				epChanged = resolved != activeResolvedEp
 				activeResolvedEp = resolved
 			}
 			mu.Unlock()
 		}
 	}
 
-	if !hopActivePeer(true, true) {
+	if !hopActivePeerInternal(true, true, epChanged) {
 		return false
 	}
-	if waitForHandshakeQuick(dev, 800*time.Millisecond) {
+	if waitForHandshakeQuick(dev, 1800*time.Millisecond) {
 		return true
 	}
-	// Second port hop if first packet was dropped during cellular radio state transition
-	if !hopActivePeer(true, true) {
+	if !isActiveDevice(dev) {
 		return false
 	}
-	return waitForHandshakeQuick(dev, 1000*time.Millisecond)
+	triggerPeerHandshakeDirect(dev, pubHex, true)
+	return waitForHandshakeQuick(dev, 900*time.Millisecond)
 }
 
 // EnsureTunnelAlive verifies the active tunnel is genuinely responsive without disturbing
 // healthy WireGuard sessions (RekeyAfterTime=120s). Only if the handshake is missing or >=120s old
-// does it attempt a non-disruptive soft handshake first, escalating to a port hop on actual failure.
+// does it attempt a non-disruptive soft handshake first, escalating to at most ONE port hop on actual failure.
 func EnsureTunnelAlive(timeoutMs int) bool {
 	mu.Lock()
 	dev := activeDev
@@ -834,13 +864,13 @@ func EnsureTunnelAlive(timeoutMs int) bool {
 	}
 
 	if timeoutMs <= 0 {
-		timeoutMs = 1500
+		timeoutMs = 1800
 	}
 	if timeoutMs > 5000 {
 		timeoutMs = 5000
 	}
 
-	if hsSec > 0 && pubHex != "" {
+	if pubHex != "" {
 		prevHs := hsSec
 		triggerPeerHandshakeDirect(dev, pubHex, true)
 		probeWait := time.Duration(timeoutMs) * time.Millisecond
@@ -850,7 +880,7 @@ func EnsureTunnelAlive(timeoutMs int) bool {
 		deadline := time.Now().Add(probeWait)
 		for time.Now().Before(deadline) {
 			curRx, _, curHs := readDeviceCounters(dev)
-			if curHs > prevHs || curRx > prevRx {
+			if curHs > 0 && (curHs > prevHs || curRx > prevRx) {
 				return true
 			}
 			if muxDeviceClosedOrReplaced(dev) {
@@ -864,17 +894,11 @@ func EnsureTunnelAlive(timeoutMs int) bool {
 	if !hopActivePeer(true, true) {
 		return false
 	}
-	half := time.Duration(timeoutMs/2) * time.Millisecond
-	if half < 350*time.Millisecond {
-		half = 350 * time.Millisecond
+	waitDur := time.Duration(timeoutMs) * time.Millisecond
+	if waitDur < 1500*time.Millisecond {
+		waitDur = 1500 * time.Millisecond
 	}
-	if waitForHandshakeQuick(dev, half) {
-		return true
-	}
-	if !hopActivePeer(true, true) {
-		return false
-	}
-	return waitForHandshakeQuick(dev, half)
+	return waitForHandshakeQuick(dev, waitDur)
 }
 
 // SetPeerKeepalive dynamically adjusts persistent_keepalive_interval on the active peer.
@@ -1073,34 +1097,70 @@ func readSocks5Target(r io.Reader, atyp byte) (host string, port uint16, err err
 	return host, port, nil
 }
 
-func awaitInitialHandshakeBeforeDial(ctx context.Context) {
+// IsHandshakeHealthy returns true only when the tunnel is running and has completed
+// a fresh WireGuard Noise handshake (last_handshake_time_sec > 0 and < 210s old).
+func IsHandshakeHealthy() bool {
+	mu.Lock()
+	dev := activeDev
+	isUp := running
+	mu.Unlock()
+	if !isUp || dev == nil {
+		return false
+	}
+	_, _, hsSec := readDeviceCounters(dev)
+	if hsSec <= 0 {
+		return false
+	}
+	return (time.Now().Unix() - hsSec) < 210
+}
+
+// GetSocksAuthRejectCount returns the number of rejected local SOCKS5 authentication attempts.
+func GetSocksAuthRejectCount() int64 {
+	return socksAuthRejectCount.Load()
+}
+
+// ResetSocksAuthRejectCount resets the SOCKS5 auth rejection counter (e.g., after credential sync).
+func ResetSocksAuthRejectCount() {
+	socksAuthRejectCount.Store(0)
+}
+
+func awaitHandshakeReadyOrFail(ctx context.Context, dialer udpDialer, maxWait time.Duration) bool {
+	if _, isWgNet := dialer.(*fastNet); !isWgNet {
+		return true
+	}
 	mu.Lock()
 	dev := activeDev
 	pubHex := activePeerPubHex
+	isUp := running
 	mu.Unlock()
 
-	if dev == nil || pubHex == "" {
-		return
+	if !isUp || dev == nil || pubHex == "" {
+		return false
 	}
 	_, _, hsSec := readDeviceCounters(dev)
 	if hsSec > 0 {
 		if time.Now().Unix()-hsSec > 135 {
 			triggerPeerHandshakeDirect(dev, pubHex, true)
 		}
-		return
+		return true
 	}
-	// Handshake not yet completed: nudge with isRetry=true and wait up to 900ms before firing TCP SYN
+	// Handshake not yet completed: nudge softly with isRetry=true and wait up to maxWait before failing fast.
 	triggerPeerHandshakeDirect(dev, pubHex, true)
-	deadline := time.Now().Add(900 * time.Millisecond)
+	deadline := time.Now().Add(maxWait)
 	for time.Now().Before(deadline) {
-		if ctx.Err() != nil || hasCompletedHandshake(dev) {
-			return
+		if ctx != nil && ctx.Err() != nil {
+			return false
 		}
-		time.Sleep(15 * time.Millisecond)
+		if hasCompletedHandshake(dev) {
+			return true
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
+	return hasCompletedHandshake(dev)
 }
 
 func recordSocksAuthReject(reason string) {
+	socksAuthRejectCount.Add(1)
 	nowNano := time.Now().UnixNano()
 	prev := lastSocksAuthDiagNano.Load()
 	if nowNano-prev > int64(3*time.Second) && lastSocksAuthDiagNano.CompareAndSwap(prev, nowNano) {
@@ -1324,7 +1384,10 @@ func handleTcpConnectTracked(ctx context.Context, client net.Conn, dialer udpDia
 		}
 	}
 
-	awaitInitialHandshakeBeforeDial(ctx)
+	if !awaitHandshakeReadyOrFail(ctx, dialer, 2500*time.Millisecond) {
+		_, _ = client.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
 
 	targetAddr := net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
 
@@ -1383,6 +1446,16 @@ func relayTcpBidirectional(ctx context.Context, client, remote net.Conn, statEnt
 		done <- struct{}{}
 	}()
 	<-done
+	// Allow the reverse direction up to 10s to flush remaining half-closed frames cleanly.
+	drainTimer := time.NewTimer(10 * time.Second)
+	select {
+	case <-done:
+		drainTimer.Stop()
+	case <-drainTimer.C:
+		_ = client.Close()
+		_ = remote.Close()
+		<-done
+	}
 }
 
 type udpClientSession struct {
@@ -1561,7 +1634,10 @@ func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDial
 }
 
 func handleUdpAssociateTracked(ctx context.Context, tcpControl net.Conn, dialer udpDialer, clientLabel string) {
-	awaitInitialHandshakeBeforeDial(ctx)
+	if !awaitHandshakeReadyOrFail(ctx, dialer, 2500*time.Millisecond) {
+		_, _ = tcpControl.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
 
 	udpLn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	if err != nil {
@@ -1686,24 +1762,32 @@ func handleUdpAssociateTracked(ctx context.Context, tcpControl net.Conn, dialer 
 			if rErr != nil {
 				return
 			}
-			if srcAddr == nil || !srcAddr.IP.IsLoopback() {
+			// Do NOT reject non-127.0.0.1 srcAddr.IP here: on Android, tgcalls commonly binds to wlan0/rmnet
+			// and sends to 127.0.0.1 over Linux table local; listening strictly on 127.0.0.1 blocks external traffic.
+			if srcAddr == nil || srcAddr.Port <= 0 {
 				continue
 			}
 
 			nowNano := time.Now().UnixNano()
 			dec, hasDec := guardCache[srcAddr.Port]
-			if !hasDec || nowNano >= dec.expiresNano {
-				allowed := invokeUdpPeerGuard(srcAddr, clientLabel)
-				dec = udpGuardDecision{
-					allowed:     allowed,
-					expiresNano: nowNano + int64(10*time.Second),
+			var allowed bool
+			if hasDec && dec.allowed && nowNano < dec.expiresNano {
+				allowed = true
+			} else {
+				allowed = invokeUdpPeerGuard(srcAddr, clientLabel)
+				// Only cache positive allow decisions; never lock out a new socket for 10s
+				// if GetExtendedUdpTable missed it on the very first STUN packet.
+				if allowed {
+					if len(guardCache) > 256 {
+						clear(guardCache)
+					}
+					guardCache[srcAddr.Port] = udpGuardDecision{
+						allowed:     true,
+						expiresNano: nowNano + int64(10*time.Second),
+					}
 				}
-				if len(guardCache) > 256 {
-					clear(guardCache)
-				}
-				guardCache[srcAddr.Port] = dec
 			}
-			if !dec.allowed {
+			if !allowed {
 				blockedLocalAttempts.Add(1)
 				udpGuardDrops.Add(1)
 				prevDiag := lastGuardDiagNano.Load()

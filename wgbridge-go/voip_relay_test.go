@@ -2,6 +2,7 @@ package wgbridge
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"net"
 	"strconv"
@@ -142,3 +143,85 @@ func TestVoipEndpointRelayUdpTcpDedupAndStop(t *testing.T) {
 		t.Fatalf("expected 0 for port 0, got %d", p)
 	}
 }
+
+func TestVoipRelaySurvivesTunnelRebindAcrossEpoch(t *testing.T) {
+	StopKillSwitchGuard()
+	StopTunnel()
+	defer StopTunnel()
+
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	srv := startLocalWgServer(t, "10.98.0.1", 1280, clientPub, "", "")
+	defer srv.closeAll()
+
+	udpSrv, err := srv.tnet.ListenUDP(&net.UDPAddr{IP: net.IPv4(10, 98, 0, 1), Port: 5444})
+	if err != nil {
+		t.Fatalf("ListenUDP on server failed: %v", err)
+	}
+	defer udpSrv.Close()
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, rErr := udpSrv.ReadFrom(buf)
+			if rErr != nil {
+				return
+			}
+			_, _ = udpSrv.WriteTo(append([]byte("echo:"), buf[:n]...), addr)
+		}
+	}()
+
+	_, err = StartTunnelAdvanced(
+		clientPriv,
+		"",
+		"10.98.0.2/32",
+		"1.1.1.1",
+		srv.pubHex,
+		fmt.Sprintf("127.0.0.1:%d", srv.udpPort),
+		20,
+		1280,
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced failed: %v", err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && !IsHandshakeHealthy() {
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	localPort := StartVoipEndpointRelay("10.98.0.1", 5444)
+	if localPort <= 0 {
+		t.Fatalf("expected valid local relay port, got %d", localPort)
+	}
+
+	cli, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: localPort})
+	if err != nil {
+		t.Fatalf("DialUDP failed: %v", err)
+	}
+	defer cli.Close()
+	_ = cli.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = cli.Write([]byte("before-hop"))
+	rx := make([]byte, 128)
+	rn, err := cli.Read(rx)
+	if err != nil || string(rx[:rn]) != "echo:before-hop" {
+		t.Fatalf("pre-hop UDP echo failed: rn=%d err=%v got=%q", rn, err, string(rx[:rn]))
+	}
+
+	// Simulate roaming peer reset; relay port MUST stay alive and recover automatically!
+	_ = hopActivePeerInternal(true, true, true)
+	hsDeadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(hsDeadline) && !IsHandshakeHealthy() {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !IsHandshakeHealthy() {
+		t.Fatalf("tunnel did not re-handshake after hopActivePeerInternal; stats=%q", GetTunnelStats())
+	}
+
+	_ = cli.SetDeadline(time.Now().Add(3 * time.Second))
+	_, _ = cli.Write([]byte("after-hop"))
+	rn, err = cli.Read(rx)
+	if err != nil || string(rx[:rn]) != "echo:after-hop" {
+		t.Fatalf("post-hop UDP echo failed: rn=%d err=%v got=%q stats=%q", rn, err, string(rx[:rn]), GetTunnelStats())
+	}
+}
+

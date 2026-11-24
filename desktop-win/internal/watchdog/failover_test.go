@@ -128,3 +128,32 @@ func TestMonitorDetectsTxWithoutRxStallQuickly(t *testing.T) {
 		t.Fatalf("expected fast TX-without-RX stall failover to b, got %q", switchedTo)
 	}
 }
+
+func TestMonitorStallRecoveryResetsCounterWhenForceRebindSucceeds(t *testing.T) {
+	var rebindCalls atomic.Int32
+	var switched atomic.Bool
+	m := NewMonitor(Dependencies{
+		IsRunning:     func() bool { return true },
+		TunnelUptime:  func() time.Duration { return 30 * time.Second },
+		SnapshotStats: func() (int64, uint64) { return 200, 4096 },
+		ForceRebind: func() bool {
+			rebindCalls.Add(1)
+			return true
+		},
+		IsAutoFailover: func() bool { return true },
+		ListProfiles: func() (string, []config.ServerProfile) {
+			return "a", []config.ServerProfile{{ID: "a"}, {ID: "b"}}
+		},
+		ProbeProfile:    func(_ context.Context, _ config.ServerProfile) (int, error) { return 15, nil },
+		SwitchToProfile: func(_ string) error { switched.Store(true); return nil },
+	}, time.Second)
+
+	m.Step(context.Background())
+	m.Step(context.Background())
+	if rebindCalls.Load() != 2 {
+		t.Fatalf("expected 2 ForceRebind recovery attempts, got %d", rebindCalls.Load())
+	}
+	if switched.Load() {
+		t.Fatalf("expected ForceRebind recovery to prevent unnecessary backup switchover")
+	}
+}

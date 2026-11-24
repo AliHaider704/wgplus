@@ -1407,4 +1407,99 @@ func TestIpv6FastFailOnIpv4OnlyTunnel(t *testing.T) {
 	}
 }
 
+func TestHopCooldownIsHandshakeHealthyAndFailFast(t *testing.T) {
+	StopKillSwitchGuard()
+	StopTunnel()
+	defer StopTunnel()
+
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	_, deadPeerPub := generateTestKeypairHex(t)
+
+	// Start tunnel against a non-responsive blackhole port so hsSec remains 0.
+	socksPort, err := StartTunnelAdvanced(
+		clientPriv,
+		"",
+		"10.97.0.2/32",
+		"1.1.1.1",
+		deadPeerPub,
+		"127.0.0.1:9",
+		20,
+		1280,
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced dead peer failed: %v", err)
+	}
+	if IsHandshakeHealthy() {
+		t.Fatal("expected IsHandshakeHealthy() == false when no handshake completed")
+	}
+
+	// Rapid hopActivePeer calls must be throttled by minHardHopInterval cooldown.
+	epochStart := GetRecoveryEpoch()
+	_ = hopActivePeer(true, true)
+	epochAfterFirst := GetRecoveryEpoch()
+	_ = hopActivePeer(true, true)
+	_ = hopActivePeer(true, true)
+	epochAfterBursts := GetRecoveryEpoch()
+	if epochAfterFirst <= epochStart {
+		t.Fatalf("expected first hopActivePeer to increment epoch (%d -> %d)", epochStart, epochAfterFirst)
+	}
+	if epochAfterBursts != epochAfterFirst {
+		t.Fatalf("expected cooldown to block immediate burst hops, epoch went %d -> %d", epochAfterFirst, epochAfterBursts)
+	}
+
+	// SOCKS5 CONNECT must fail fast with 0x04 when handshake is absent (instead of hanging 12s).
+	start := time.Now()
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", socksPort), 2*time.Second)
+	if err != nil {
+		t.Fatalf("SOCKS5 dial failed: %v", err)
+	}
+	_, _ = c.Write([]byte{0x05, 0x01, 0x00})
+	greet := make([]byte, 2)
+	_, _ = io.ReadFull(c, greet)
+	_, _ = c.Write([]byte{0x05, 0x01, 0x00, 0x01, 1, 1, 1, 1, 0x01, 0xbb})
+	resp := make([]byte, 10)
+	if _, err := io.ReadFull(c, resp); err != nil {
+		_ = c.Close()
+		t.Fatalf("failed reading SOCKS5 fail-fast response: %v", err)
+	}
+	_ = c.Close()
+	if resp[1] != 0x04 {
+		t.Fatalf("expected SOCKS5 host unreachable 0x04 when handshake missing, got 0x%02x", resp[1])
+	}
+	if elapsed := time.Since(start); elapsed > 4500*time.Millisecond {
+		t.Fatalf("expected fail-fast SOCKS5 rejection <=4.5s, took %v", elapsed)
+	}
+
+	StopTunnel()
+
+	// Now connect to a live peer and confirm IsHandshakeHealthy() == true.
+	srv := startLocalWgServer(t, "10.97.0.1", 1280, clientPub, "", "")
+	defer srv.closeAll()
+	_, err = StartTunnelAdvanced(
+		clientPriv,
+		"",
+		"10.97.0.2/32",
+		"1.1.1.1",
+		srv.pubHex,
+		fmt.Sprintf("127.0.0.1:%d", srv.udpPort),
+		20,
+		1280,
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced live peer failed: %v", err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && !IsHandshakeHealthy() {
+		time.Sleep(25 * time.Millisecond)
+	}
+	if !IsHandshakeHealthy() {
+		t.Fatal("expected IsHandshakeHealthy() == true on connected live peer")
+	}
+}
+
+
 

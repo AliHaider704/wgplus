@@ -60,7 +60,7 @@ final class UpdateGate {
             }
         } catch (Throwable ignored) {
         }
-        return "1.9.0";
+        return "2.0.0";
     }
 
     private static Activity unwrapActivity(Context ctx) {
@@ -147,7 +147,12 @@ final class UpdateGate {
                 if (newer(r.version, cur)) {
                     sUpdateBlocked = true;
                     try {
-                        WireGuardManager.stopAndUnbind(act, null, null);
+                        ClassLoader hostCl = act.getClassLoader();
+                        if (WireGuardManager.isKillSwitchEnabled(act)) {
+                            WireGuardManager.enforceKillSwitchIfDisconnected(act, null, hostCl);
+                        } else {
+                            WireGuardManager.stopAndUnbind(act, null, hostCl);
+                        }
                     } catch (Throwable ignored) {
                     }
                     new Handler(Looper.getMainLooper()).post(() -> {

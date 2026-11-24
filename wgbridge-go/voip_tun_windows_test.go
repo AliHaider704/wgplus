@@ -4,10 +4,23 @@ package wgbridge
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
+	"io"
+	"net"
 	"net/netip"
 	"testing"
+	"time"
 	"unsafe"
+
+	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 )
 
 func TestVoipTunWindowsMibStructInitialization(t *testing.T) {
@@ -97,3 +110,135 @@ func TestFilterTelegramCidrsExcludesActiveEndpointLoop(t *testing.T) {
 		}
 	}
 }
+
+type redirectDialer struct {
+	targetAddr string
+}
+
+func (d redirectDialer) DialContext(ctx context.Context, network, _ string) (net.Conn, error) {
+	var netd net.Dialer
+	return netd.DialContext(ctx, network, d.targetAddr)
+}
+
+func TestVoipTunTcpForwarderLoopback(t *testing.T) {
+	echoLn, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen tcp4 failed: %v", err)
+	}
+	defer echoLn.Close()
+	echoAddr := echoLn.Addr().String()
+	echoPort := echoLn.Addr().(*net.TCPAddr).Port
+
+	go func() {
+		for {
+			c, aErr := echoLn.Accept()
+			if aErr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create a client gVisor stack acting as the Windows OS TCP/IP stack attached to Wintun.
+	cliOpts := stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol},
+	}
+	cliStack := stack.New(cliOpts)
+	defer cliStack.Close()
+	cliEp := channel.New(256, voipTunMTU, "")
+	if tcpipErr := cliStack.CreateNIC(1, cliEp); tcpipErr != nil {
+		t.Fatalf("cliStack CreateNIC: %v", tcpipErr)
+	}
+	_ = cliStack.AddProtocolAddress(1, tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddrFrom4(voipTunLocalIPv4).WithPrefix(),
+	}, stack.AddressProperties{})
+	cliStack.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: 1})
+
+	sess := &winVoipTunSession{
+		dialer:  redirectDialer{targetAddr: echoAddr},
+		ctx:     ctx,
+		cancel:  cancel,
+		writeCh: make(chan voipTunWriteItem, 128),
+		statEnt: trackClientConnStart(voipTunClientLabel),
+		nat:     make(map[voipTunNatKey]*voipTunNatEntry),
+	}
+	defer trackClientConnEnd(sess.statEnt)
+	sess.initTcpForwarder()
+	if sess.tcpEp == nil {
+		t.Fatal("initTcpForwarder failed to initialize gVisor TCP endpoint")
+	}
+	defer func() {
+		sess.closed.Store(true)
+		sess.tcpStack.Close()
+		sess.tcpEp.Close()
+	}()
+
+	// Pump IPv4 packets between cliEp (simulated OS) <-> sess.tcpEp (VoIP TUN forwarder).
+	go func() {
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case item := <-sess.writeCh:
+				if item.bufPtr == nil {
+					continue
+				}
+				raw := append([]byte(nil), (*item.bufPtr)[:item.n]...)
+				voipTunPktPool.Put(item.bufPtr)
+				pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(raw)})
+				cliEp.InjectInbound(header.IPv4ProtocolNumber, pkt)
+				pkt.DecRef()
+			}
+		}
+	}()
+	go func() {
+		for {
+			pkt := cliEp.ReadContext(ctx)
+			if pkt == nil {
+				return
+			}
+			view := pkt.ToView()
+			pkt.DecRef()
+			raw := append([]byte(nil), view.AsSlice()...)
+			view.Release()
+			inPkt := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(raw)})
+			sess.tcpEp.InjectInbound(header.IPv4ProtocolNumber, inPkt)
+			inPkt.DecRef()
+		}
+	}()
+
+	dialCtx, dialCancel := context.WithTimeout(ctx, 4*time.Second)
+	defer dialCancel()
+	fa := tcpip.FullAddress{
+		NIC:  1,
+		Addr: tcpip.AddrFrom4([4]byte{149, 154, 167, 51}),
+		Port: uint16(echoPort),
+	}
+	conn, err := gonet.DialContextTCP(dialCtx, cliStack, fa, ipv4.ProtocolNumber)
+	if err != nil {
+		t.Fatalf("DialContextTCP over VoipTun forwarder failed: %v", err)
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(3 * time.Second))
+
+	msg := []byte("tgcalls-tcp-reflector-ok")
+	if _, err := conn.Write(msg); err != nil {
+		t.Fatalf("conn.Write: %v", err)
+	}
+	got := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, got); err != nil {
+		t.Fatalf("io.ReadFull: %v", err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("unexpected TCP payload: got %q want %q", got, msg)
+	}
+}
+

@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/netip"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,16 @@ import (
 
 	"golang.org/x/sys/windows"
 	"golang.zx2c4.com/wireguard/tun"
+	"gvisor.dev/gvisor/pkg/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip"
+	"gvisor.dev/gvisor/pkg/tcpip/adapters/gonet"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
+	"gvisor.dev/gvisor/pkg/tcpip/link/channel"
+	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
+	"gvisor.dev/gvisor/pkg/tcpip/stack"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
+	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 const (
@@ -25,7 +36,7 @@ const (
 	voipTunMTU           = 1280
 	voipTunRouteMetric   = 5
 	voipTunIdleTTL       = 90 * time.Second
-	maxVoipTunNatEntries = 64
+	maxVoipTunNatEntries = 256
 	voipTunClientLabel   = "voip-tun-win"
 	winErrObjExists      = windows.Errno(5010)
 )
@@ -170,10 +181,16 @@ type winMibIPInterfaceRow struct {
 	DisableDefaultRoutes                 bool
 }
 
+type voipTunNatKey struct {
+	clientIP [4]byte
+	srcPort  uint16
+}
+
 type voipTunNatEntry struct {
 	clientIP   [4]byte
 	clientPort uint16
 	pConn      net.PacketConn
+	dialer     udpDialer
 	lastActive atomic.Int64
 	closeOnce  sync.Once
 }
@@ -186,19 +203,35 @@ func (e *voipTunNatEntry) close() {
 	})
 }
 
+type voipTunWriteItem struct {
+	bufPtr *[]byte
+	n      int
+}
+
+var voipTunPktPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 65535)
+		return &b
+	},
+}
+
 type winVoipTunSession struct {
 	tunDev    tun.Device
 	dialer    udpDialer
 	ctx       context.Context
 	cancel    context.CancelFunc
-	writeCh   chan []byte
+	writeCh   chan voipTunWriteItem
 	statEnt   *clientStatEntry
 	closed    atomic.Bool
 	closeOnce sync.Once
 	ipID      atomic.Uint32
 
+	tcpStack  *stack.Stack
+	tcpEp     *channel.Endpoint
+	tcpNotify *channel.NotificationHandle
+
 	natMu sync.RWMutex
-	nat   map[uint16]*voipTunNatEntry
+	nat   map[voipTunNatKey]*voipTunNatEntry
 }
 
 var (
@@ -268,10 +301,11 @@ func StartWindowsVoipTun(dllDir string) error {
 		dialer:  dialer,
 		ctx:     tunCtx,
 		cancel:  tunCancel,
-		writeCh: make(chan []byte, 256),
+		writeCh: make(chan voipTunWriteItem, 512),
 		statEnt: trackClientConnStart(voipTunClientLabel),
-		nat:     make(map[uint16]*voipTunNatEntry),
+		nat:     make(map[voipTunNatKey]*voipTunNatEntry),
 	}
+	sess.initTcpForwarder()
 
 	voipTunMu.Lock()
 	activeVoipTun = sess
@@ -439,6 +473,115 @@ func flushVoipTunIPv4(luid uint64) {
 	}
 }
 
+func (s *winVoipTunSession) getLiveDialer() (context.Context, udpDialer, int64) {
+	mu.Lock()
+	isUp := running
+	tnet := activeTnet
+	tCtx := activeCtx
+	mu.Unlock()
+	if isUp && tnet != nil && tCtx != nil && tCtx.Err() == nil {
+		return tCtx, tnet, recoveryEpoch.Load()
+	}
+	return s.ctx, s.dialer, recoveryEpoch.Load()
+}
+
+func (s *winVoipTunSession) initTcpForwarder() {
+	opts := stack.Options{
+		NetworkProtocols:   []stack.NetworkProtocolFactory{ipv4.NewProtocol},
+		TransportProtocols: []stack.TransportProtocolFactory{tcp.NewProtocol, icmp.NewProtocol4},
+	}
+	st := stack.New(opts)
+	sackOpt := tcpip.TCPSACKEnabled(true)
+	_ = st.SetTransportProtocolOption(tcp.ProtocolNumber, &sackOpt)
+	noDelayOpt := tcpip.TCPDelayEnabled(false)
+	_ = st.SetTransportProtocolOption(tcp.ProtocolNumber, &noDelayOpt)
+	ccOpt := tcpip.CongestionControlOption("reno")
+	_ = st.SetTransportProtocolOption(tcp.ProtocolNumber, &ccOpt)
+	modOpt := tcpip.TCPModerateReceiveBufferOption(true)
+	_ = st.SetTransportProtocolOption(tcp.ProtocolNumber, &modOpt)
+
+	ep := channel.New(2048, uint32(voipTunMTU), "")
+	if tcpipErr := st.CreateNIC(1, ep); tcpipErr != nil {
+		ep.Close()
+		st.Close()
+		return
+	}
+	protoAddr := tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: tcpip.AddrFrom4(voipTunLocalIPv4).WithPrefix(),
+	}
+	_ = st.AddProtocolAddress(1, protoAddr, stack.AddressProperties{})
+	st.AddRoute(tcpip.Route{Destination: header.IPv4EmptySubnet, NIC: 1})
+	_ = st.SetPromiscuousMode(1, true)
+	_ = st.SetSpoofing(1, true)
+
+	s.tcpEp = ep
+	s.tcpStack = st
+	s.tcpNotify = ep.AddNotify(s)
+
+	fwd := tcp.NewForwarder(st, 256*1024, 256, func(r *tcp.ForwarderRequest) {
+		id := r.ID()
+		if s.closed.Load() {
+			r.Complete(true)
+			return
+		}
+		go func(req *tcp.ForwarderRequest, connID stack.TransportEndpointID) {
+			liveCtx, liveDialer, _ := s.getLiveDialer()
+			if liveDialer == nil || !awaitHandshakeReadyOrFail(liveCtx, liveDialer, 2500*time.Millisecond) {
+				req.Complete(true)
+				return
+			}
+			dstAddr := net.JoinHostPort(connID.LocalAddress.String(), strconv.Itoa(int(connID.LocalPort)))
+			dialCtx, cancel := context.WithTimeout(liveCtx, 10*time.Second)
+			remote, dErr := liveDialer.DialContext(dialCtx, "tcp4", dstAddr)
+			cancel()
+			if dErr != nil {
+				req.Complete(true)
+				return
+			}
+			var wq waiter.Queue
+			tEp, cErr := req.CreateEndpoint(&wq)
+			if cErr != nil {
+				_ = remote.Close()
+				req.Complete(true)
+				return
+			}
+			req.Complete(false)
+			clientConn := gonet.NewTCPConn(&wq, tEp)
+			activeTcpConns.Add(1)
+			defer func() {
+				_ = clientConn.Close()
+				_ = remote.Close()
+				activeTcpConns.Add(-1)
+			}()
+			RecordDiag("VOIP_TUN", "TCP_FWD", dstAddr)
+			relayTcpBidirectional(s.ctx, clientConn, remote, s.statEnt)
+		}(r, id)
+	})
+	st.SetTransportProtocolHandler(tcp.ProtocolNumber, fwd.HandlePacket)
+}
+
+func (s *winVoipTunSession) WriteNotify() {
+	if s.tcpEp == nil || s.closed.Load() {
+		return
+	}
+	for {
+		pkt := s.tcpEp.Read()
+		if pkt == nil {
+			return
+		}
+		view := pkt.ToView()
+		pkt.DecRef()
+		raw := view.AsSlice()
+		if len(raw) > 0 && len(raw) <= 65535 {
+			bufPtr := voipTunPktPool.Get().(*[]byte)
+			copy(*bufPtr, raw)
+			s.enqueuePooledReplyPacket(bufPtr, len(raw))
+		}
+		view.Release()
+	}
+}
+
 func (s *winVoipTunSession) start() {
 	go func() {
 		<-s.ctx.Done()
@@ -458,6 +601,16 @@ func (s *winVoipTunSession) close() {
 	s.closeOnce.Do(func() {
 		s.closed.Store(true)
 		s.cancel()
+		if s.tcpStack != nil {
+			s.tcpStack.RemoveNIC(1)
+			s.tcpStack.Close()
+		}
+		if s.tcpEp != nil {
+			if s.tcpNotify != nil {
+				s.tcpEp.RemoveNotify(s.tcpNotify)
+			}
+			s.tcpEp.Close()
+		}
 		if s.tunDev != nil {
 			_ = s.tunDev.Close()
 		}
@@ -500,29 +653,39 @@ func (s *winVoipTunSession) runWriteLoop() {
 		select {
 		case <-s.ctx.Done():
 			return
-		case pkt := <-s.writeCh:
-			if len(pkt) == 0 || s.closed.Load() {
+		case item := <-s.writeCh:
+			if item.bufPtr == nil {
 				continue
 			}
-			bufs[0] = pkt
-			if _, err := s.tunDev.Write(bufs, 0); err != nil {
-				if s.closed.Load() {
-					return
+			if item.n > 0 && item.n <= len(*item.bufPtr) && !s.closed.Load() {
+				bufs[0] = (*item.bufPtr)[:item.n]
+				if _, err := s.tunDev.Write(bufs, 0); err != nil {
+					if s.closed.Load() {
+						voipTunPktPool.Put(item.bufPtr)
+						return
+					}
 				}
 			}
+			voipTunPktPool.Put(item.bufPtr)
 		}
 	}
 }
 
-func (s *winVoipTunSession) enqueueReplyPacket(pkt []byte) {
-	if s.closed.Load() || len(pkt) == 0 {
+func (s *winVoipTunSession) enqueuePooledReplyPacket(bufPtr *[]byte, n int) {
+	if bufPtr == nil {
+		return
+	}
+	if s.closed.Load() || n <= 0 {
+		voipTunPktPool.Put(bufPtr)
 		return
 	}
 	select {
-	case s.writeCh <- pkt:
+	case s.writeCh <- voipTunWriteItem{bufPtr: bufPtr, n: n}:
 	case <-s.ctx.Done():
+		voipTunPktPool.Put(bufPtr)
 	default:
 		// Drop packet rather than blocking NAT read pump on ring saturation.
+		voipTunPktPool.Put(bufPtr)
 	}
 }
 
@@ -540,6 +703,21 @@ func (s *winVoipTunSession) runReadLoop() {
 			continue
 		}
 		pkt := buf[:sizes[0]]
+		if len(pkt) < 20 || (pkt[0]>>4) != 4 {
+			continue
+		}
+
+		if pkt[9] == 6 && s.tcpEp != nil {
+			var dstIP [4]byte
+			copy(dstIP[:], pkt[16:20])
+			if dstIP == ([4]byte{0, 0, 0, 0}) || dstIP == ([4]byte{255, 255, 255, 255}) || (dstIP[0]&0xf0) == 0xe0 {
+				continue
+			}
+			pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(pkt)})
+			s.tcpEp.InjectInbound(header.IPv4ProtocolNumber, pkb)
+			pkb.DecRef()
+			continue
+		}
 
 		srcIP, dstIP, srcPort, dstPort, payload, ok := parseIPv4UDP(pkt)
 		if !ok || len(payload) == 0 {
@@ -549,8 +727,9 @@ func (s *winVoipTunSession) runReadLoop() {
 			continue
 		}
 
+		_, liveDialer, _ := s.getLiveDialer()
 		nowNano := time.Now().UnixNano()
-		entry, nErr := s.getOrCreateNatEntry(srcIP, dstIP, srcPort, dstPort, nowNano)
+		entry, nErr := s.getOrCreateNatEntry(srcIP, dstIP, srcPort, dstPort, liveDialer, nowNano)
 		if nErr != nil {
 			udpSendErrors.Add(1)
 			continue
@@ -560,11 +739,26 @@ func (s *winVoipTunSession) runReadLoop() {
 			IP:   net.IP(dstIP[:]),
 			Port: int(dstPort),
 		}
-		if nw, wErr := entry.pConn.WriteTo(payload, dstAddr); wErr == nil {
+		if nw, wErr := entry.pConn.WriteTo(payload, dstAddr); wErr != nil {
+			key := voipTunNatKey{clientIP: srcIP, srcPort: srcPort}
+			s.natMu.Lock()
+			if cur, ok := s.nat[key]; ok && cur == entry {
+				cur.close()
+				delete(s.nat, key)
+			}
+			s.natMu.Unlock()
+			_, liveDialer, _ = s.getLiveDialer()
+			if fresh, fErr := s.getOrCreateNatEntry(srcIP, dstIP, srcPort, dstPort, liveDialer, nowNano); fErr == nil {
+				if nw2, wErr2 := fresh.pConn.WriteTo(payload, dstAddr); wErr2 == nil {
+					udpPacketsTx.Add(1)
+					recordClientTx(s.statEnt, nw2)
+					continue
+				}
+			}
+			udpSendErrors.Add(1)
+		} else {
 			udpPacketsTx.Add(1)
 			recordClientTx(s.statEnt, nw)
-		} else {
-			udpSendErrors.Add(1)
 		}
 	}
 }
@@ -574,42 +768,53 @@ func (s *winVoipTunSession) getOrCreateNatEntry(
 	dstIP [4]byte,
 	srcPort uint16,
 	dstPort uint16,
+	dialer udpDialer,
 	nowNano int64,
 ) (*voipTunNatEntry, error) {
+	key := voipTunNatKey{clientIP: clientIP, srcPort: srcPort}
+
 	s.natMu.RLock()
-	entry, exists := s.nat[srcPort]
+	entry, exists := s.nat[key]
 	s.natMu.RUnlock()
-	if exists {
+	if exists && entry.dialer == dialer {
 		entry.lastActive.Store(nowNano)
 		return entry, nil
 	}
 
+	var stale *voipTunNatEntry
 	s.natMu.Lock()
-	if entry, exists = s.nat[srcPort]; exists {
-		s.natMu.Unlock()
-		entry.lastActive.Store(nowNano)
-		return entry, nil
+	if entry, exists = s.nat[key]; exists {
+		if entry.dialer == dialer {
+			s.natMu.Unlock()
+			entry.lastActive.Store(nowNano)
+			return entry, nil
+		}
+		stale = entry
+		delete(s.nat, key)
 	}
 	if len(s.nat) >= maxVoipTunNatEntries {
-		var oldestPort uint16
+		var oldestKey voipTunNatKey
 		var oldestTs int64 = nowNano
 		var hasOldest bool
 		for k, cand := range s.nat {
 			ts := cand.lastActive.Load()
 			if !hasOldest || ts < oldestTs {
-				oldestPort = k
+				oldestKey = k
 				oldestTs = ts
 				hasOldest = true
 			}
 		}
 		if hasOldest {
-			s.nat[oldestPort].close()
-			delete(s.nat, oldestPort)
+			s.nat[oldestKey].close()
+			delete(s.nat, oldestKey)
 		}
 	}
 	s.natMu.Unlock()
+	if stale != nil {
+		stale.close()
+	}
 
-	pConn, err := openFullConePacketConn(s.dialer, false)
+	pConn, err := openFullConePacketConn(dialer, false)
 	if err != nil {
 		return nil, err
 	}
@@ -618,6 +823,7 @@ func (s *winVoipTunSession) getOrCreateNatEntry(
 		clientIP:   clientIP,
 		clientPort: srcPort,
 		pConn:      pConn,
+		dialer:     dialer,
 	}
 	newEntry.lastActive.Store(nowNano)
 
@@ -627,13 +833,13 @@ func (s *winVoipTunSession) getOrCreateNatEntry(
 		newEntry.close()
 		return nil, net.ErrClosed
 	}
-	if cur, raceWon := s.nat[srcPort]; raceWon {
+	if cur, raceWon := s.nat[key]; raceWon {
 		s.natMu.Unlock()
 		newEntry.close()
 		cur.lastActive.Store(nowNano)
 		return cur, nil
 	}
-	s.nat[srcPort] = newEntry
+	s.nat[key] = newEntry
 	s.natMu.Unlock()
 
 	udpSocketsOpened.Add(1)
@@ -652,7 +858,7 @@ func (s *winVoipTunSession) runNatReturnPump(e *voipTunNatEntry) {
 		if err != nil {
 			return
 		}
-		if rn <= 0 {
+		if rn <= 0 || rn > 65500 {
 			continue
 		}
 		udpAddr, ok := rAddr.(*net.UDPAddr)
@@ -666,15 +872,16 @@ func (s *winVoipTunSession) runNatReturnPump(e *voipTunNatEntry) {
 
 		var srcIP4 [4]byte
 		copy(srcIP4[:], remoteIP4)
-		pkt := make([]byte, 28+rn)
-		n, bErr := buildIPv4UDPPacket(pkt, srcIP4, e.clientIP, uint16(udpAddr.Port), e.clientPort, respBuf[:rn], uint16(s.ipID.Add(1)))
+		pktPtr := voipTunPktPool.Get().(*[]byte)
+		n, bErr := buildIPv4UDPPacket(*pktPtr, srcIP4, e.clientIP, uint16(udpAddr.Port), e.clientPort, respBuf[:rn], uint16(s.ipID.Add(1)))
 		if bErr != nil {
+			voipTunPktPool.Put(pktPtr)
 			continue
 		}
 		e.lastActive.Store(time.Now().UnixNano())
 		udpPacketsRx.Add(1)
 		recordClientRx(s.statEnt, rn)
-		s.enqueueReplyPacket(pkt[:n])
+		s.enqueuePooledReplyPacket(pktPtr, n)
 	}
 }
 

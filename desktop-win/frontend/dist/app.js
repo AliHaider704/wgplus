@@ -86,6 +86,8 @@ function applyStaticLabels() {
   el("lbl-recovery-hint").textContent = tr.recoveryHint;
   el("btn-recovery-awg").textContent = tr.recoverAwgBtn;
   el("btn-recovery-warp").textContent = tr.recoverWarpBtn;
+  el("lbl-voip-admin").textContent = tr.voipAdminHint;
+  el("btn-voip-admin").textContent = tr.voipAdminBtn;
   el("btn-quick-apply-tg").textContent = tr.quickBindBtn;
 
   el("lbl-rx-total").textContent = tr.rxTotal;
@@ -259,9 +261,10 @@ function renderStatusAndTelemetry() {
     titleText = tr.statusConnecting;
   } else if (state.connected) {
     const hsAge = typeof s.handshakeAgeSec === "number" ? s.handshakeAgeSec : -1;
+    const hsHealthy = typeof s.handshakeHealthy === "boolean" ? s.handshakeHealthy : (hsAge >= 0 && hsAge < 150);
     const nowSec = Math.floor(Date.now() / 1000);
     const connElapsed = state.connectedSinceUnix > 0 ? Math.max(0, nowSec - state.connectedSinceUnix) : 0;
-    if (hsAge >= 0 && hsAge < 150) {
+    if (hsHealthy && hsAge >= 0 && hsAge < 150) {
       dotClass = "dot-connected";
       titleText = tr.statusConnected;
     } else if ((hsAge < 0 && connElapsed >= 10) || hsAge >= 150) {
@@ -287,6 +290,10 @@ function renderStatusAndTelemetry() {
   el("recovery-banner").classList.toggle("hidden", !showRecovery);
   el("btn-recovery-awg").disabled = recoveringAwg || generatingWarp || state.connecting;
   el("btn-recovery-warp").disabled = recoveringAwg || generatingWarp || state.connecting;
+
+  const showVoipAdmin = !!(state.connected && s.voipTunActive === false);
+  el("voip-admin-banner").classList.toggle("hidden", !showVoipAdmin);
+  el("btn-voip-admin").disabled = state.connecting;
 
   const runningClients = (state.clients || []).filter((c) => c.running && c.enabled !== false);
   const showQuickBind = !!(state.connected && runningClients.length > 0);
@@ -323,7 +330,8 @@ function renderStatusAndTelemetry() {
   el("val-rx-total").textContent = formatBytes(s.rxBytes, tr);
   el("val-tx-total").textContent = formatBytes(s.txBytes, tr);
   el("val-live-speed").textContent = `${formatBytes(s.rxBps, tr)}/${tr.unitsSec} | ${formatBytes(s.txBps, tr)}/${tr.unitsSec}`;
-  el("val-voip-calls").textContent = String(s.activeUdpAssocs || 0);
+  const voipModeTag = s.voipTunActive ? tr.voipTunTag : tr.voipRelayTag;
+  el("val-voip-calls").textContent = `${s.activeUdpAssocs || 0} (${voipModeTag})`;
   el("val-handshake-age").textContent =
     s.handshakeAgeSec >= 0 ? tr.handshakeAge(s.handshakeAgeSec) : tr.handshakeNever;
 
@@ -984,6 +992,13 @@ function wireEvents() {
       const target = runningClients[0];
       const res = await api().ApplyProxyToClient(target.id);
       showToast(res.clipboardCopied ? t().toastAppliedCopy(target.displayName) : t().toastApplied(target.displayName));
+    } catch (err) {
+      showError(String(err));
+    }
+  });
+  el("btn-voip-admin").addEventListener("click", async () => {
+    try {
+      await api().EnableVoipTunAdmin();
     } catch (err) {
       showError(String(err));
     }

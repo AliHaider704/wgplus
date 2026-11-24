@@ -3,6 +3,8 @@ package syswin
 import (
 	"fmt"
 	"net"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -151,4 +153,25 @@ func (h *Host) stopNetworkWatcher() {
 	if handle != 0 {
 		procCancelMibChangeNotify2.Call(uintptr(handle))
 	}
+}
+
+// RelaunchElevated prompts Windows UAC to start a fresh Administrator instance of this app.
+func RelaunchElevated() error {
+	exePath, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	verbPtr, err := windows.UTF16PtrFromString("runas")
+	if err != nil {
+		return err
+	}
+	exePtr, err := windows.UTF16PtrFromString(exePath)
+	if err != nil {
+		return err
+	}
+	dirPtr, err := windows.UTF16PtrFromString(filepath.Dir(exePath))
+	if err != nil {
+		return err
+	}
+	return windows.ShellExecute(0, verbPtr, exePtr, nil, dirPtr, windows.SW_SHOWNORMAL)
 }

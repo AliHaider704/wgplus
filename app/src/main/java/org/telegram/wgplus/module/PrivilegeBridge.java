@@ -256,7 +256,7 @@ public final class PrivilegeBridge {
             return false;
         }
         String cmd = "echo -800 > /proc/" + pid + "/oom_score_adj 2>/dev/null; "
-                + "echo " + pid + " > /dev/cpuset/foreground/tasks 2>/dev/null || true";
+                + "[ -w /dev/cpuset/foreground/tasks ] && echo " + pid + " > /dev/cpuset/foreground/tasks 2>/dev/null || true";
         return runRootCommand(cmd, 2500).ok;
     }
 

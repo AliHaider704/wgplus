@@ -147,3 +147,30 @@ func TestStrictGuardRejectsSignedNonTelegramLolbinAndAllowsRealTelegram(t *testi
 		}
 	}
 }
+
+func TestDefaultAllowedTelegramForksRecognized(t *testing.T) {
+	pg := NewProcessGuard()
+	expected := []string{
+		"telegram.exe",
+		"ayugram.exe",
+		"64gram.exe",
+		"unigram.exe",
+		"forkgram.exe",
+		"kotatogram.exe",
+		"materialgram.exe",
+		"exteragram.exe",
+		"cherrygram.exe",
+		"ime.exe",
+		"nicegram.exe",
+	}
+	for _, exe := range expected {
+		if !pg.allowedNames[exe] {
+			t.Fatalf("expected %q to be in default allowlisted fork names", exe)
+		}
+	}
+	for _, pub := range []string{"exteraGram", "Cherrygram", "materialgram", "Nicegram"} {
+		if !isTrustedTelegramPublisher(pub, `C:\Apps\client.exe`) {
+			t.Fatalf("expected publisher %q to be trusted", pub)
+		}
+	}
+}

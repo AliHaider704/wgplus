@@ -54,6 +54,9 @@ type BridgeStats struct {
 	ActiveTcpConns       int64               `json:"activeTcpConns"`
 	ActiveUdpAssocs      int64               `json:"activeUdpAssocs"`
 	BlockedLocalAttempts uint64              `json:"blockedLocalAttempts"`
+	VoipTunActive        bool                `json:"voipTunActive"`
+	HandshakeHealthy     bool                `json:"handshakeHealthy"`
+	SocksAuthRejectCount int64               `json:"socksAuthRejectCount"`
 	ResolvedEndpoint     string              `json:"resolvedEndpoint"`
 	Clients              []ClientTrafficStat `json:"clients"`
 }
@@ -209,6 +212,7 @@ func (a *App) startup(ctx context.Context) {
 	a.bgCtx, a.bgCancel = context.WithCancel(context.Background())
 
 	wgbridge.SetDesktopMode(true)
+	a.runVersionHygiene()
 	a.applyCoreSettings()
 
 	wgbridge.SetClientGuard(a.procGuard.CheckTcpClient)
@@ -439,9 +443,24 @@ func (a *App) syncMonitoredPorts() {
 	a.procGuard.SetMonitoredPorts(ports...)
 }
 
+func (a *App) runVersionHygiene() {
+	if a.store == nil {
+		return
+	}
+	verPath := filepath.Join(a.store.DataDir(), "last_running_version")
+	prevRaw, _ := os.ReadFile(verPath)
+	prev := strings.TrimSpace(string(prevRaw))
+	if prev != AppVersion {
+		wgbridge.ResetSocksAuthRejectCount()
+		_ = os.WriteFile(verPath, []byte(AppVersion), 0o600)
+		wgbridge.RecordDiag("HYGIENE", "VERSION_UPGRADE", fmt.Sprintf("%s->%s", prev, AppVersion))
+	}
+}
+
 func (a *App) readBridgeStats() BridgeStats {
 	var st BridgeStats
 	_ = json.Unmarshal([]byte(wgbridge.GetDetailedStatsJSON()), &st)
+	st.VoipTunActive = wgbridge.IsWindowsVoipTunActive()
 	return st
 }
 
@@ -472,12 +491,18 @@ func (a *App) telemetryLoop(ctx context.Context) {
 	ticker := time.NewTicker(1 * time.Second)
 	defer ticker.Stop()
 
+	lastHsHealthy := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			stats := a.readBridgeStats()
+			if stats.SocksAuthRejectCount >= 3 {
+				wgbridge.ResetSocksAuthRejectCount()
+				a.applyCoreSettings()
+				wgbridge.RecordDiag("HYGIENE", "SOCKS_AUTH_RESYNC", fmt.Sprintf("rejects=%d", stats.SocksAuthRejectCount))
+			}
 			a.mu.Lock()
 			if len(a.rxHistory) >= historyCap {
 				a.rxHistory = append(a.rxHistory[1:], stats.RxBps)
@@ -489,13 +514,20 @@ func (a *App) telemetryLoop(ctx context.Context) {
 			} else {
 				a.txHistory = append(a.txHistory, stats.TxBps)
 			}
+			hsChanged := a.connected && (stats.HandshakeHealthy != lastHsHealthy)
+			if hsChanged {
+				lastHsHealthy = stats.HandshakeHealthy
+			} else if !a.connected {
+				lastHsHealthy = false
+			}
 			visible := a.windowVisible.Load() && a.ctx != nil
+			var snap TelemetrySnapshot
 			if visible {
 				var sinceUnix int64
 				if a.connected && !a.startedAt.IsZero() {
 					sinceUnix = a.startedAt.Unix()
 				}
-				snap := TelemetrySnapshot{
+				snap = TelemetrySnapshot{
 					Connected:          a.connected,
 					Connecting:         a.connecting,
 					ConnectedSinceUnix: sinceUnix,
@@ -507,10 +539,13 @@ func (a *App) telemetryLoop(ctx context.Context) {
 					RxHistory:          append([]uint64(nil), a.rxHistory...),
 					TxHistory:          append([]uint64(nil), a.txHistory...),
 				}
-				a.mu.Unlock()
+			}
+			a.mu.Unlock()
+			if hsChanged {
+				a.refreshTray()
+			}
+			if visible {
 				runtime.EventsEmit(a.ctx, "telemetry", snap)
-			} else {
-				a.mu.Unlock()
 			}
 		}
 	}
@@ -663,17 +698,26 @@ func (a *App) traySnapshot() (string, syswin.TrayVisualState, string, bool, []sy
 		tip = "نفق وايرجارد بلس - متوقف"
 	}
 	if conn {
-		vis = syswin.TrayConnected
-		if activeName != "" {
-			if lang == "ar" {
-				tip = "نفق وايرجارد بلس - " + activeName
+		if wgbridge.IsHandshakeHealthy() {
+			vis = syswin.TrayConnected
+			if activeName != "" {
+				if lang == "ar" {
+					tip = "نفق وايرجارد بلس - " + activeName
+				} else {
+					tip = "WireGuard Plus - " + activeName
+				}
+			} else if lang == "ar" {
+				tip = "نفق وايرجارد بلس - متصل"
 			} else {
-				tip = "WireGuard Plus - " + activeName
+				tip = "WireGuard Plus - Connected"
 			}
-		} else if lang == "ar" {
-			tip = "نفق وايرجارد بلس - متصل"
 		} else {
-			tip = "WireGuard Plus - Connected"
+			vis = syswin.TrayKillSwitch
+			if lang == "ar" {
+				tip = "نفق وايرجارد بلس - جارٍ إتمام المصافحة..."
+			} else {
+				tip = "WireGuard Plus - Establishing handshake..."
+			}
 		}
 	} else if ks {
 		vis = syswin.TrayKillSwitch
@@ -752,6 +796,19 @@ func (a *App) QuitApp() {
 	if a.ctx != nil {
 		runtime.Quit(a.ctx)
 	}
+}
+
+// EnableVoipTunAdmin relaunches WireGuard Plus with Administrator rights so the local Wintun
+// call router can intercept Telegram desktop voice/video UDP media directly.
+func (a *App) EnableVoipTunAdmin() error {
+	if err := syswin.RelaunchElevated(); err != nil {
+		return err
+	}
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		a.QuitApp()
+	}()
+	return nil
 }
 
 // GetBootstrapState returns the complete initial/refreshed state snapshot for the UI.
@@ -845,6 +902,17 @@ func (a *App) Connect(profileID string) error {
 		wgbridge.SetTunnelStartupPending(true)
 	}
 
+	effectiveMTU := prof.MTU
+	lowEp := strings.ToLower(strings.TrimSpace(prof.Endpoint))
+	isWarpOrAwg := prof.IsWarp ||
+		strings.TrimSpace(prof.AwgParams) != "" ||
+		strings.Contains(lowEp, "cloudflareclient") ||
+		strings.HasPrefix(lowEp, "162.159.")
+	if isWarpOrAwg && (effectiveMTU <= 0 || effectiveMTU > 1280) {
+		effectiveMTU = 1280
+	}
+
+	wgbridge.ResetSocksAuthRejectCount()
 	a.applyCoreSettings()
 	port, err := wgbridge.StartTunnelAdvanced(
 		prof.PrivateKey,
@@ -854,7 +922,7 @@ func (a *App) Connect(profileID string) error {
 		prof.PeerPublicKey,
 		prof.Endpoint,
 		prof.KeepAlive,
-		prof.MTU,
+		effectiveMTU,
 		prof.AwgParams,
 		useDoH,
 	)

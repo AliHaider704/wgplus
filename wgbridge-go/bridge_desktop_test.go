@@ -725,3 +725,90 @@ func TestVerifyRouteAndCallsLocalRelay(t *testing.T) {
 		t.Fatalf("expected DC1 probe ok, got %+v", report.DcLatencies)
 	}
 }
+
+func TestUdpPeerGuardDoesNotCacheReject(t *testing.T) {
+	defer resetGlobalDesktopBridgeState()
+
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	srv := startLocalWgServer(t, "10.82.0.1", 1280, clientPub, "", "")
+	defer srv.closeAll()
+
+	udpSrv, err := srv.tnet.ListenUDP(&net.UDPAddr{IP: net.IPv4(10, 82, 0, 1), Port: 5499})
+	if err != nil {
+		t.Fatalf("ListenUDP server: %v", err)
+	}
+	defer udpSrv.Close()
+	go func() {
+		buf := make([]byte, 1024)
+		for {
+			n, rAddr, rErr := udpSrv.ReadFrom(buf)
+			if rErr != nil {
+				return
+			}
+			_, _ = udpSrv.WriteTo(append([]byte("ok:"), buf[:n]...), rAddr)
+		}
+	}()
+
+	var calls atomic.Int32
+	SetUdpPeerGuard(func(_ *net.UDPAddr, _ string) bool {
+		// Reject only the very first packet (simulating Windows UDP table race); allow all subsequent packets!
+		return calls.Add(1) > 1
+	})
+
+	socksPort, err := StartTunnelAdvanced(
+		clientPriv, "", "10.82.0.2/32", "1.1.1.1", srv.pubHex, fmt.Sprintf("127.0.0.1:%d", srv.udpPort), 25, 1280, "", false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced failed: %v", err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && !IsHandshakeHealthy() {
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	ctrl, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", socksPort), 3*time.Second)
+	if err != nil {
+		t.Fatalf("Dial SOCKS5 failed: %v", err)
+	}
+	defer ctrl.Close()
+	_ = ctrl.SetDeadline(time.Now().Add(4 * time.Second))
+	_, relayPort, err := performSocks5Handshake(ctrl, "", "", 0x03, "0.0.0.0", 0)
+	if err != nil {
+		t.Fatalf("UDP ASSOCIATE handshake failed: %v", err)
+	}
+
+	uConn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: int(relayPort)})
+	if err != nil {
+		t.Fatalf("DialUDP relay failed: %v", err)
+	}
+	defer uConn.Close()
+
+	makeSocksPkt := func(payload string) []byte {
+		p := make([]byte, 10+len(payload))
+		p[3] = 0x01
+		copy(p[4:8], []byte{10, 82, 0, 1})
+		binary.BigEndian.PutUint16(p[8:10], 5499)
+		copy(p[10:], payload)
+		return p
+	}
+
+	// 1st packet is intentionally dropped by SetUdpPeerGuard.
+	_, _ = uConn.Write(makeSocksPkt("first-race"))
+	time.Sleep(80 * time.Millisecond)
+
+	// 2nd packet from the EXACT same UDP source port must NOT hit a 10s negative cache!
+	_ = uConn.SetDeadline(time.Now().Add(2 * time.Second))
+	if _, err := uConn.Write(makeSocksPkt("second-ok")); err != nil {
+		t.Fatalf("Write second UDP packet failed: %v", err)
+	}
+	resp := make([]byte, 256)
+	rn, err := uConn.Read(resp)
+	if err != nil {
+		t.Fatalf("Expected second UDP packet from same port to pass guard immediately (no negative cache), got err=%v (guard calls=%d)", err, calls.Load())
+	}
+	_, _, payload, err := parseSocks5UdpDatagram(resp[:rn])
+	if err != nil || string(payload) != "ok:second-ok" {
+		t.Fatalf("Unexpected UDP payload %q err=%v", string(payload), err)
+	}
+}
+

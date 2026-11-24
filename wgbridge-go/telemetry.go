@@ -42,6 +42,8 @@ type detailedTunnelStats struct {
 	ActiveTcpConns       int64               `json:"activeTcpConns"`
 	ActiveUdpAssocs      int64               `json:"activeUdpAssocs"`
 	BlockedLocalAttempts uint64              `json:"blockedLocalAttempts"`
+	HandshakeHealthy     bool                `json:"handshakeHealthy"`
+	SocksAuthRejectCount int64               `json:"socksAuthRejectCount"`
 	ResolvedEndpoint     string              `json:"resolvedEndpoint"`
 	Clients              []clientTrafficStat `json:"clients"`
 }
@@ -232,6 +234,8 @@ func GetDetailedStatsJSON() string {
 		ActiveTcpConns:       activeTcpConns.Load(),
 		ActiveUdpAssocs:      activeUdpAssocs.Load(),
 		BlockedLocalAttempts: blockedLocalAttempts.Load(),
+		HandshakeHealthy:     IsHandshakeHealthy(),
+		SocksAuthRejectCount: GetSocksAuthRejectCount(),
 		ResolvedEndpoint:     resolvedEp,
 		Clients:              clients,
 	}

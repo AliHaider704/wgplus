@@ -12,7 +12,7 @@ public final class WgStrings {
 
     public static final String LANG_AR = "ar";
     public static final String LANG_EN = "en";
-    public static final String VERSION_LABEL = "1.9.0";
+    public static final String VERSION_LABEL = "2.0.0";
 
     private static final Map<String, String> AR_COUNTRIES = new HashMap<>();
 

@@ -274,11 +274,14 @@ public final class NativeBridgeLoader {
                 return false;
             }
             long expectedSize = matchedEntry.getSize();
-            if (targetSo.exists() && expectedSize > 0 && targetSo.length() == expectedSize) {
+            long expectedCrc = matchedEntry.getCrc();
+            if (targetSo.exists() && expectedSize > 0 && targetSo.length() == expectedSize
+                    && matchesExtractedEntryVersionAndCrc(targetSo, expectedCrc)) {
                 return true;
             }
             try (InputStream in = zip.getInputStream(matchedEntry)) {
                 writeStreamAtomically(in, targetSo);
+                writeExtractedCrcMarker(targetSo, expectedCrc);
             }
             return true;
         } catch (Throwable t) {
@@ -331,10 +334,13 @@ public final class NativeBridgeLoader {
                 for (String wanted : candidatePaths) {
                     if (wanted.equals(entryName)) {
                         long expectedSize = ze.getSize();
-                        if (expectedSize > 0 && targetSo.exists() && targetSo.length() == expectedSize) {
+                        long expectedCrc = ze.getCrc();
+                        if (expectedSize > 0 && targetSo.exists() && targetSo.length() == expectedSize
+                                && matchesExtractedEntryVersionAndCrc(targetSo, expectedCrc)) {
                             return true;
                         }
                         writeStreamAtomically(zis, targetSo);
+                        writeExtractedCrcMarker(targetSo, expectedCrc);
                         return true;
                     }
                 }
@@ -342,6 +348,35 @@ public final class NativeBridgeLoader {
         } catch (Throwable ignored) {
         }
         return false;
+    }
+
+    private static boolean matchesExtractedEntryVersionAndCrc(File targetSo, long expectedCrc) {
+        if (targetSo == null || !targetSo.exists()) {
+            return false;
+        }
+        File crcFile = new File(targetSo.getParentFile(), LIB_NAME + ".crc");
+        if (!crcFile.exists()) {
+            return false;
+        }
+        try (BufferedReader br = new BufferedReader(new FileReader(crcFile))) {
+            String line = br.readLine();
+            String want = BuildConfigSafeVersion() + "|" + expectedCrc;
+            return want.equals(line != null ? line.trim() : "");
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private static void writeExtractedCrcMarker(File targetSo, long expectedCrc) {
+        if (targetSo == null) {
+            return;
+        }
+        File crcFile = new File(targetSo.getParentFile(), LIB_NAME + ".crc");
+        try (OutputStreamWriter ow = new OutputStreamWriter(new FileOutputStream(crcFile, false), StandardCharsets.UTF_8)) {
+            ow.write(BuildConfigSafeVersion() + "|" + expectedCrc);
+            ow.flush();
+        } catch (Throwable ignored) {
+        }
     }
 
     private static void writeStreamAtomically(InputStream in, File targetSo) throws Exception {

@@ -282,8 +282,21 @@ public class ModuleLauncherActivity extends Activity {
         int handshakeStateCode = 0; // 0=idle, 1=handshaking, 2=verified, 3=stalled
         if (active && port > 0) {
             if (sharedObserved) {
-                mObservedActiveNoHsAtMs = 0L;
-                handshakeStateCode = 2;
+                long sharedHsSec = WireGuardManager.getSharedTunnelLastHandshakeSec(this);
+                long nowEpoch = System.currentTimeMillis() / 1000L;
+                boolean sharedRecent = sharedHsSec > 0L
+                        && Math.max(0L, nowEpoch - sharedHsSec) < STALE_HANDSHAKE_THRESHOLD_SEC;
+                stats.lastHandshakeSec = sharedHsSec;
+                if (sharedRecent) {
+                    mObservedActiveNoHsAtMs = 0L;
+                    handshakeStateCode = 2;
+                } else {
+                    if (mObservedActiveNoHsAtMs <= 0L) {
+                        mObservedActiveNoHsAtMs = SystemClock.elapsedRealtime();
+                    }
+                    long elapsedNoHs = Math.max(0L, SystemClock.elapsedRealtime() - mObservedActiveNoHsAtMs);
+                    handshakeStateCode = elapsedNoHs >= STALLED_HANDSHAKE_THRESHOLD_MS ? 3 : 1;
+                }
             } else {
                 long nowEpoch = System.currentTimeMillis() / 1000L;
                 boolean recentHs = stats.lastHandshakeSec > 0

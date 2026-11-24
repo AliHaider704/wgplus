@@ -11,6 +11,7 @@ import (
 	"math/big"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -583,8 +584,26 @@ func (b *awgBind) BatchSize() int {
 	return b.inner.BatchSize()
 }
 
+var awgOutFramePool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 2048)
+		return &b
+	},
+}
+
 func (b *awgBind) Send(bufs [][]byte, ep conn.Endpoint) error {
-	var out [][]byte
+	var stackOut [64][]byte
+	out := stackOut[:0]
+	if len(bufs) > len(stackOut) {
+		out = make([][]byte, 0, len(bufs))
+	}
+	var borrowed []*[]byte
+	defer func() {
+		for _, p := range borrowed {
+			awgOutFramePool.Put(p)
+		}
+	}()
+
 	for _, pkt := range bufs {
 		if len(pkt) < 4 {
 			out = append(out, pkt)
@@ -632,7 +651,10 @@ func (b *awgBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 			}
 		}
 
-		obf := b.obfuscateOutbound(pkt)
+		obf, pooledPtr := b.obfuscateOutboundPooled(pkt)
+		if pooledPtr != nil {
+			borrowed = append(borrowed, pooledPtr)
+		}
 		out = append(out, obf)
 	}
 
@@ -650,6 +672,23 @@ func (b *awgBind) Send(bufs [][]byte, ep conn.Endpoint) error {
 		}
 	}
 	return nil
+}
+
+func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
+	obf, _ := b.obfuscateOutboundWithAlloc(pkt, nil)
+	return obf
+}
+
+func (b *awgBind) obfuscateOutboundPooled(pkt []byte) ([]byte, *[]byte) {
+	return b.obfuscateOutboundWithAlloc(pkt, &awgOutFramePool)
+}
+
+func allocAwgBuf(totalLen int, pool *sync.Pool) ([]byte, *[]byte) {
+	if pool != nil && totalLen <= 2048 {
+		ptr := pool.Get().(*[]byte)
+		return (*ptr)[:totalLen], ptr
+	}
+	return make([]byte, totalLen), nil
 }
 
 func matchesHeaderWithReserved(hr HeaderRange, cand []byte, defaultType uint32, hasReserved bool, reserved [3]byte) bool {
@@ -670,9 +709,9 @@ func matchesHeaderWithReserved(hr HeaderRange, cand []byte, defaultType uint32, 
 	return binary.LittleEndian.Uint32(cand[0:4]) == defaultType
 }
 
-func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
+func (b *awgBind) obfuscateOutboundWithAlloc(pkt []byte, pool *sync.Pool) ([]byte, *[]byte) {
 	if len(pkt) < 4 {
-		return pkt
+		return pkt, nil
 	}
 	msgType := binary.LittleEndian.Uint32(pkt[0:4])
 
@@ -682,9 +721,9 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 		hVal := b.cfg.H1.Pick(wgMsgInitiationType)
 		stampReserved := b.cfg.HasReserved && !b.cfg.H1.Configured
 		if pad == 0 && hVal == wgMsgInitiationType && !stampReserved {
-			return pkt
+			return pkt, nil
 		}
-		res := make([]byte, pad+wgMsgInitiationSize)
+		res, pPtr := allocAwgBuf(pad+wgMsgInitiationSize, pool)
 		if pad > 0 {
 			_, _ = rand.Read(res[:pad])
 		}
@@ -702,16 +741,16 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 			// without modifying MAC1 or MAC2 (edge strips them before MAC1 verification).
 			copy(inner[1:4], b.cfg.Reserved[:])
 		}
-		return res
+		return res, pPtr
 
 	case msgType == wgMsgResponseType && len(pkt) == wgMsgResponseSize:
 		pad := b.cfg.S2
 		hVal := b.cfg.H2.Pick(wgMsgResponseType)
 		stampReserved := b.cfg.HasReserved && !b.cfg.H2.Configured
 		if pad == 0 && hVal == wgMsgResponseType && !stampReserved {
-			return pkt
+			return pkt, nil
 		}
-		res := make([]byte, pad+wgMsgResponseSize)
+		res, pPtr := allocAwgBuf(pad+wgMsgResponseSize, pool)
 		if pad > 0 {
 			_, _ = rand.Read(res[:pad])
 		}
@@ -726,16 +765,16 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 		} else if stampReserved {
 			copy(inner[1:4], b.cfg.Reserved[:])
 		}
-		return res
+		return res, pPtr
 
 	case msgType == wgMsgCookieReplyType && len(pkt) == wgMsgCookieReplySize:
 		pad := b.cfg.S3
 		hVal := b.cfg.H3.Pick(wgMsgCookieReplyType)
 		stampReserved := b.cfg.HasReserved && !b.cfg.H3.Configured
 		if pad == 0 && hVal == wgMsgCookieReplyType && !stampReserved {
-			return pkt
+			return pkt, nil
 		}
-		res := make([]byte, pad+wgMsgCookieReplySize)
+		res, pPtr := allocAwgBuf(pad+wgMsgCookieReplySize, pool)
 		if pad > 0 {
 			_, _ = rand.Read(res[:pad])
 		}
@@ -746,16 +785,16 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 		} else if stampReserved {
 			copy(inner[1:4], b.cfg.Reserved[:])
 		}
-		return res
+		return res, pPtr
 
 	case msgType == wgMsgTransportType && len(pkt) >= wgMsgTransportMin:
 		pad := b.cfg.S4
 		hVal := b.cfg.H4.Pick(wgMsgTransportType)
 		stampReserved := b.cfg.HasReserved && !b.cfg.H4.Configured
 		if pad == 0 && hVal == wgMsgTransportType && !stampReserved {
-			return pkt
+			return pkt, nil
 		}
-		res := make([]byte, pad+len(pkt))
+		res, pPtr := allocAwgBuf(pad+len(pkt), pool)
 		if pad > 0 {
 			_, _ = rand.Read(res[:pad])
 		}
@@ -766,10 +805,10 @@ func (b *awgBind) obfuscateOutbound(pkt []byte) []byte {
 		} else if stampReserved {
 			copy(inner[1:4], b.cfg.Reserved[:])
 		}
-		return res
+		return res, pPtr
 
 	default:
-		return pkt
+		return pkt, nil
 	}
 }
 

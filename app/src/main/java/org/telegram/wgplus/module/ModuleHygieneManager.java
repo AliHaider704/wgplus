@@ -23,10 +23,12 @@ public final class ModuleHygieneManager {
     private static final String TAG = "WGPlusHygiene";
     private static final String HYGIENE_PREFS = "wg_plus_hygiene_prefs";
     private static final String KEY_LAST_RUN_MS = "last_auto_hygiene_ms";
+    private static final String KEY_LAST_MODULE_VER = "last_module_version";
     private static final long AUTO_INTERVAL_MS = 24L * 60L * 60L * 1000L;
     private static final long AUTO_THRESHOLD_BYTES = 150L * 1024L * 1024L;
     private static final long AUTO_MIN_AGE_MS = 2L * 60L * 60L * 1000L;
     private static final long MANUAL_MIN_AGE_MS = 5L * 60L * 1000L;
+    private static final long DESYNC_COOLDOWN_MS = 60L * 1000L;
 
     private static final ExecutorService HYGIENE_EXEC = Executors.newSingleThreadExecutor(r -> {
         Thread t = new Thread(() -> {
@@ -41,7 +43,9 @@ public final class ModuleHygieneManager {
     });
 
     private static final AtomicBoolean sAutoQueued = new AtomicBoolean(false);
+    private static final AtomicBoolean sVersionHygieneChecked = new AtomicBoolean(false);
     private static volatile long sLastAutoMemMs = 0L;
+    private static volatile long sLastDesyncRecoveryMs = 0L;
 
     public static final class HygieneReport {
         public final long freedBytes;
@@ -116,6 +120,62 @@ public final class ModuleHygieneManager {
         } catch (Throwable ignored) {
         }
         return trimmed;
+    }
+
+    public static void runStartupVersionHygieneIfNeeded(
+            final Context hostCtx,
+            final String moduleApkPath,
+            final ClassLoader telegramClassLoader
+    ) {
+        if (hostCtx == null || !sVersionHygieneChecked.compareAndSet(false, true)) {
+            return;
+        }
+        final Context appCtx = hostCtx.getApplicationContext() != null ? hostCtx.getApplicationContext() : hostCtx;
+        try {
+            SharedPreferences prefs = appCtx.getSharedPreferences(HYGIENE_PREFS, Context.MODE_PRIVATE);
+            String prev = prefs.getString(KEY_LAST_MODULE_VER, "");
+            if (!WgStrings.VERSION_LABEL.equals(prev)) {
+                prefs.edit().putString(KEY_LAST_MODULE_VER, WgStrings.VERSION_LABEL).apply();
+                if (prev != null && !prev.isEmpty()) {
+                    cleanCachesSafely(appCtx, true);
+                    WireGuardManager.onModuleVersionUpgraded(appCtx, telegramClassLoader);
+                    WgDiagnosticsLog.record("HYGIENE", "UPGRADE", prev + "->" + WgStrings.VERSION_LABEL);
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "Version hygiene warning: " + t.getMessage());
+        }
+    }
+
+    public static void triggerDesyncRecoveryHygiene(
+            final Context hostCtx,
+            final ClassLoader telegramClassLoader,
+            final String reason
+    ) {
+        if (hostCtx == null) {
+            return;
+        }
+        long now = android.os.SystemClock.elapsedRealtime();
+        if (now - sLastDesyncRecoveryMs < DESYNC_COOLDOWN_MS) {
+            return;
+        }
+        sLastDesyncRecoveryMs = now;
+        final Context appCtx = hostCtx.getApplicationContext() != null ? hostCtx.getApplicationContext() : hostCtx;
+        HYGIENE_EXEC.execute(() -> {
+            try {
+                cleanCachesSafely(appCtx, true);
+                try {
+                    if (NativeBridgeLoader.isLoaded()) {
+                        Wgbridge.resetSocksAuthRejectCount();
+                    }
+                } catch (Throwable ignored) {
+                }
+                WireGuardManager.reapplyProxyToAccountIfActive(appCtx, telegramClassLoader, 0);
+                WgDiagnosticsLog.record("HYGIENE", "DESYNC_RESET", reason != null ? reason : "auto");
+            } catch (Throwable t) {
+                Log.w(TAG, "Desync recovery warning: " + t.getMessage());
+            }
+        });
     }
 
     public static void runAutoHygieneIfDueAsync(final Context hostCtx) {

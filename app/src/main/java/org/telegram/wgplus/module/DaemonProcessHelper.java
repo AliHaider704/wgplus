@@ -439,7 +439,9 @@ public final class DaemonProcessHelper {
             return;
         }
         writeSysFile("/proc/" + pid + "/oom_score_adj", "-800");
-        writeSysFile("/dev/cpuset/foreground/tasks", Integer.toString(pid));
+        if (new java.io.File("/dev/cpuset/foreground/tasks").exists()) {
+            writeSysFile("/dev/cpuset/foreground/tasks", Integer.toString(pid));
+        }
     }
 
     private static void writeSysFile(String path, String value) {

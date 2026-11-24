@@ -75,7 +75,17 @@ func snapshotRunningProcesses() []runningProc {
 	for {
 		baseName := windows.UTF16ToString(entry.ExeFile[:])
 		low := strings.ToLower(baseName)
-		if low == "telegram.exe" || low == "ayugram.exe" || low == "64gram.exe" || low == "unigram.exe" || low == "forkgram.exe" {
+		if low == "telegram.exe" ||
+			low == "ayugram.exe" ||
+			low == "64gram.exe" ||
+			low == "unigram.exe" ||
+			low == "forkgram.exe" ||
+			low == "kotatogram.exe" ||
+			low == "materialgram.exe" ||
+			low == "exteragram.exe" ||
+			low == "cherrygram.exe" ||
+			low == "ime.exe" ||
+			low == "nicegram.exe" {
 			var fullPath string
 			if hProc, pErr := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, entry.ProcessID); pErr == nil {
 				var buf [windows.MAX_PATH * 2]uint16
@@ -119,6 +129,36 @@ func classifyExecutable(exePath string, baseName string) (kind string, displayNa
 			return "forkgram", "Forkgram Portable", true, false
 		}
 		return "forkgram", "Forkgram", false, false
+	case "kotatogram.exe":
+		if portable {
+			return "kotatogram", "Kotatogram Portable", true, false
+		}
+		return "kotatogram", "Kotatogram", false, false
+	case "materialgram.exe":
+		if portable {
+			return "materialgram", "materialgram Portable", true, false
+		}
+		return "materialgram", "materialgram", false, false
+	case "exteragram.exe":
+		if portable {
+			return "exteragram", "exteraGram Portable", true, false
+		}
+		return "exteragram", "exteraGram", false, false
+	case "cherrygram.exe":
+		if portable {
+			return "cherrygram", "Cherrygram Portable", true, false
+		}
+		return "cherrygram", "Cherrygram", false, false
+	case "ime.exe":
+		if portable {
+			return "ime", "iMe Portable", true, false
+		}
+		return "ime", "iMe Desktop", false, false
+	case "nicegram.exe":
+		if portable {
+			return "nicegram", "Nicegram Portable", true, false
+		}
+		return "nicegram", "Nicegram Desktop", false, false
 	case "unigram.exe":
 		return "unigram", "Unigram (MSIX)", false, true
 	case "telegram.exe":

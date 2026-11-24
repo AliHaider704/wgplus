@@ -34,3 +34,101 @@ jobs:
           go-version-file: desktop-win/go.mod
       - run: go vet ./...
       - run: go test -v ./...
+
+  android-build-and-audit:
+    name: Android Build, Unit Tests & Static ELF Audit
+    runs-on: ubuntu-latest
+    needs: [go-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: wgbridge-go/go.mod
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - name: Install Android SDK & NDK components
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;36.0.0" "ndk;27.2.12479018"
+      - name: Build wgbridge.aar (arm64-v8a + armeabi-v7a)
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        run: |
+          chmod +x gradlew scripts/build-wgbridge-ci-x86_64.sh
+          bash scripts/build-wgbridge-ci-x86_64.sh android/arm64,android/arm
+      - name: Build, unit test, and compile instrumentation tests
+        run: ./gradlew testDebugUnitTest assembleRelease compileDebugAndroidTestJavaWithJavac --no-daemon
+      - name: Static APK, ELF ABI & 16 KB alignment audit
+        run: python3 scripts/audit-android-apk.py dist/WireGuardPlus-*.apk
+      - name: Upload release APKs & build metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-release-apks
+          path: |
+            dist/WireGuardPlus-*.apk
+            dist/android-build-meta.json
+          retention-days: 14
+
+  android-emulator-matrix:
+    name: Android Emulator Matrix (API ${{ matrix.api-level }})
+    runs-on: ubuntu-latest
+    needs: [go-tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [28, 31, 34, 35]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: wgbridge-go/go.mod
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - name: Install NDK and SDK build tools for x86_64 CI bridge
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;36.0.0" "ndk;27.2.12479018"
+      - name: Build CI-only x86_64 wgbridge.aar
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        run: |
+          chmod +x gradlew scripts/build-wgbridge-ci-x86_64.sh
+          bash scripts/build-wgbridge-ci-x86_64.sh
+      - name: Enable KVM group permissions
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Run instrumentation smoke tests on API ${{ matrix.api-level }}
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: ${{ matrix.api-level }}
+          target: default
+          arch: x86_64
+          profile: pixel_6
+          emulator-options: -no-snapshot-save -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none -camera-front none
+          disable-animations: true
+          script: |
+            adb logcat -c || true
+            if ! ./gradlew connectedDebugAndroidTest -PemulatorTestBuild=true --no-daemon; then
+              adb logcat -d -t 2000 > "logcat-api-${{ matrix.api-level }}.txt" || true
+              exit 1
+            fi
+      - name: Upload emulator failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-diagnostics-api-${{ matrix.api-level }}
+          if-no-files-found: ignore
+          path: |
+            logcat-api-${{ matrix.api-level }}.txt
+            app/build/reports/androidTests/
+          retention-days: 7

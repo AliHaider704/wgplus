@@ -99,7 +99,7 @@ public class WgPlusFeatureSuiteTest {
         WireGuardManager.TunnelConfig vanilla = new WireGuardManager.TunnelConfig();
         assertFalse(vanilla.hasAwgConfigured());
         assertEquals("", vanilla.toAwgParamsString());
-        assertEquals("Jc=3\nJmin=48\nJmax=108\n", vanilla.toEffectiveAwgParamsString());
+        assertEquals("", vanilla.toEffectiveAwgParamsString());
     }
 
     @Test
@@ -450,7 +450,7 @@ public class WgPlusFeatureSuiteTest {
 
     @Test
     public void testHybridContinuityTierResolutionAndVersionLabel() {
-        assertEquals("1.9.0", WgStrings.VERSION_LABEL);
+        assertEquals("2.0.0", WgStrings.VERSION_LABEL);
 
         assertEquals(
                 ContinuityBridgeManager.ContinuityTier.HYBRID_FULL,

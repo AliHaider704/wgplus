@@ -147,6 +147,12 @@ var defaultTelegramExeNames = []string{
 	"64gram.exe",
 	"unigram.exe",
 	"forkgram.exe",
+	"kotatogram.exe",
+	"materialgram.exe",
+	"exteragram.exe",
+	"cherrygram.exe",
+	"ime.exe",
+	"nicegram.exe",
 }
 
 // NewProcessGuard creates an armored loopback process firewall defaulting to strict allowlist mode.
@@ -584,6 +590,10 @@ func isTrustedTelegramPublisher(signerName, normPath string) bool {
 		strings.Contains(low, "kotatogram") ||
 		strings.Contains(low, "64gram") ||
 		strings.Contains(low, "forkgram") ||
+		strings.Contains(low, "materialgram") ||
+		strings.Contains(low, "exteragram") ||
+		strings.Contains(low, "cherrygram") ||
+		strings.Contains(low, "nicegram") ||
 		strings.Contains(low, "unigram") {
 		return true
 	}

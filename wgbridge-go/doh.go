@@ -490,10 +490,50 @@ func ResolveEndpointDoH(rawEndpoint string, useDoH bool) (string, error) {
 	}
 
 	if useDoH {
-		if addr, dohErr := resolveHostViaParallelDoH(host, 1200*time.Millisecond); dohErr == nil && addr.IsValid() {
-			ipStr := addr.String()
-			putCachedDoH(host, ipStr)
-			return net.JoinHostPort(ipStr, strconv.Itoa(portNum)), nil
+		// Launch DoH with a 350ms head start; if it hasn't resolved by then (e.g., ISP blocking
+		// DoH), race direct UDP DNS & system resolver in parallel instead of stalling 1.2s+1.0s sequentially.
+		fastCh := make(chan string, 1)
+		dohDone := make(chan struct{})
+		go func() {
+			defer close(dohDone)
+			if addr, dohErr := resolveHostViaParallelDoH(host, 1200*time.Millisecond); dohErr == nil && addr.IsValid() {
+				ipStr := addr.String()
+				putCachedDoH(host, ipStr)
+				select {
+				case fastCh <- net.JoinHostPort(ipStr, strconv.Itoa(portNum)):
+				default:
+				}
+			}
+		}()
+
+		timer := time.NewTimer(350 * time.Millisecond)
+		select {
+		case res := <-fastCh:
+			timer.Stop()
+			return res, nil
+		case <-dohDone:
+			timer.Stop()
+			select {
+			case res := <-fastCh:
+				return res, nil
+			default:
+			}
+		case <-timer.C:
+			go func() {
+				if sysAddr, sysErr := resolveEndpointFastFallback(host, portNum); sysErr == nil {
+					select {
+					case fastCh <- sysAddr:
+					default:
+					}
+				}
+			}()
+			waitTimer := time.NewTimer(1100 * time.Millisecond)
+			select {
+			case res := <-fastCh:
+				waitTimer.Stop()
+				return res, nil
+			case <-waitTimer.C:
+			}
 		}
 	}
 

@@ -90,6 +90,7 @@ public final class TelegramXBridge {
                                 WireGuardManager.reportHookActiveToProvider(appCtx, PACKAGE_NAME);
                                 WireGuardManager.syncPullSharedStateFromProvider(appCtx, true);
                                 NativeBridgeLoader.ensureLoaded(appCtx, modulePath);
+                                ModuleHygieneManager.runStartupVersionHygieneIfNeeded(appCtx, modulePath, lpparam.classLoader);
                                 if (WireGuardManager.isKillSwitchEnabled(appCtx)) {
                                     int ksPort = WireGuardManager.enforceKillSwitchIfDisconnected(appCtx, modulePath, lpparam.classLoader);
                                     applyTdlibProxyReflective(lpparam.classLoader, ksPort > 0 ? ksPort : 9);
@@ -309,6 +310,7 @@ public final class TelegramXBridge {
             }
             for (Method m : client.getClass().getMethods()) {
                 if ("send".equals(m.getName()) && m.getParameterTypes().length >= 2) {
+                    cleanupStaleTdlibLoopbackProxies(cl, client, m, localPort);
                     m.invoke(client, req, null);
                     return true;
                 }
@@ -316,6 +318,41 @@ public final class TelegramXBridge {
         } catch (Throwable ignored) {
         }
         return false;
+    }
+
+    private static void cleanupStaleTdlibLoopbackProxies(ClassLoader cl, Object client, Method sendMethod, int currentPort) {
+        try {
+            Class<?> getProxiesCls = XposedHelpers.findClassIfExists("org.drinkless.tdlib.TdApi$GetProxies", cl);
+            Class<?> removeProxyCls = XposedHelpers.findClassIfExists("org.drinkless.tdlib.TdApi$RemoveProxy", cl);
+            Class<?> resHandlerCls = sendMethod.getParameterTypes()[1];
+            if (getProxiesCls == null || removeProxyCls == null || resHandlerCls == null || !resHandlerCls.isInterface()) {
+                return;
+            }
+            Object getReq = getProxiesCls.getDeclaredConstructor().newInstance();
+            Object handler = java.lang.reflect.Proxy.newProxyInstance(cl, new Class<?>[]{resHandlerCls}, (proxy, method, args) -> {
+                if ("onResult".equals(method.getName()) && args != null && args.length > 0 && args[0] != null) {
+                    try {
+                        Object[] proxies = (Object[]) XposedHelpers.getObjectField(args[0], "proxies");
+                        if (proxies != null) {
+                            for (Object p : proxies) {
+                                if (p == null) continue;
+                                String srv = (String) XposedHelpers.getObjectField(p, "server");
+                                int pPort = XposedHelpers.getIntField(p, "port");
+                                int id = XposedHelpers.getIntField(p, "id");
+                                if ("127.0.0.1".equals(srv) && pPort != currentPort && id > 0) {
+                                    Object rmReq = removeProxyCls.getDeclaredConstructor(int.class).newInstance(id);
+                                    sendMethod.invoke(client, rmReq, null);
+                                }
+                            }
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+                return null;
+            });
+            sendMethod.invoke(client, getReq, handler);
+        } catch (Throwable ignored) {
+        }
     }
 
     /**

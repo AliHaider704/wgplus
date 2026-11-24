@@ -22,6 +22,7 @@ type voipRelayUdpSession struct {
 	key        string
 	clientAddr *net.UDPAddr
 	pConn      net.PacketConn
+	dialer     udpDialer
 	lastActive atomic.Int64
 	closeOnce  sync.Once
 }
@@ -35,20 +36,22 @@ func (s *voipRelayUdpSession) close() {
 }
 
 type voipRelay struct {
-	targetKey  string
-	targetHost string
-	targetPort int
-	localPort  int
-	parentCtx  context.Context
-	ctx        context.Context
-	cancel     context.CancelFunc
-	dialer     udpDialer
-	udpLn      *net.UDPConn
-	tcpLn      net.Listener
-	statEnt    *clientStatEntry
-	lastActive atomic.Int64
-	closed     atomic.Bool
-	closeOnce  sync.Once
+	targetKey       string
+	targetHost      string
+	targetPort      int
+	localPort       int
+	followActive    bool
+	parentCtx       context.Context
+	ctx             context.Context
+	cancel          context.CancelFunc
+	dialer          udpDialer
+	udpLn           *net.UDPConn
+	tcpLn           net.Listener
+	statEnt         *clientStatEntry
+	lastActive      atomic.Int64
+	lastRetErrNano  atomic.Int64
+	closed          atomic.Bool
+	closeOnce       sync.Once
 
 	sessMu   sync.RWMutex
 	sessions map[string]*voipRelayUdpSession
@@ -114,12 +117,13 @@ func startVoipEndpointRelayWithDialer(ctx context.Context, dialer udpDialer, tar
 		return 0
 	}
 
+	_, followActive := dialer.(*fastNet)
 	targetKey := net.JoinHostPort(strings.ToLower(trimmedHost), strconv.Itoa(targetPort))
 	nowNano := time.Now().UnixNano()
 
 	voipRelaysMu.Lock()
 	if existing, ok := voipRelays[targetKey]; ok {
-		if !existing.closed.Load() && existing.ctx.Err() == nil && existing.parentCtx == ctx {
+		if !existing.closed.Load() && existing.ctx.Err() == nil && (followActive || existing.parentCtx == ctx) {
 			existing.lastActive.Store(nowNano)
 			port := existing.localPort
 			voipRelaysMu.Unlock()
@@ -164,27 +168,35 @@ func startVoipEndpointRelayWithDialer(ctx context.Context, dialer udpDialer, tar
 	_ = udpLn.SetReadBuffer(sockBufSz)
 	_ = udpLn.SetWriteBuffer(sockBufSz)
 
-	relayCtx, relayCancel := context.WithCancel(ctx)
+	var relayCtx context.Context
+	var relayCancel context.CancelFunc
+	if followActive {
+		// Decouple VoIP relay lifetime from ephemeral activeCtx so calls survive roaming/rebinds.
+		relayCtx, relayCancel = context.WithCancel(context.Background())
+	} else {
+		relayCtx, relayCancel = context.WithCancel(ctx)
+	}
 	r := &voipRelay{
-		targetKey:  targetKey,
-		targetHost: trimmedHost,
-		targetPort: targetPort,
-		localPort:  localPort,
-		parentCtx:  ctx,
-		ctx:        relayCtx,
-		cancel:     relayCancel,
-		dialer:     dialer,
-		udpLn:      udpLn,
-		tcpLn:      tcpLn,
-		statEnt:    trackClientConnStart(voipRelayClientID),
-		sessions:   make(map[string]*voipRelayUdpSession),
-		dnsCache:   make(map[string]udpDnsCacheEntry),
+		targetKey:    targetKey,
+		targetHost:   trimmedHost,
+		targetPort:   targetPort,
+		localPort:    localPort,
+		followActive: followActive,
+		parentCtx:    ctx,
+		ctx:          relayCtx,
+		cancel:       relayCancel,
+		dialer:       dialer,
+		udpLn:        udpLn,
+		tcpLn:        tcpLn,
+		statEnt:      trackClientConnStart(voipRelayClientID),
+		sessions:     make(map[string]*voipRelayUdpSession),
+		dnsCache:     make(map[string]udpDnsCacheEntry),
 	}
 	r.lastActive.Store(nowNano)
 
 	voipRelaysMu.Lock()
 	// Check race: another goroutine may have created the same target while we were binding.
-	if existing, ok := voipRelays[targetKey]; ok && !existing.closed.Load() && existing.ctx.Err() == nil && existing.parentCtx == ctx {
+	if existing, ok := voipRelays[targetKey]; ok && !existing.closed.Load() && existing.ctx.Err() == nil && (followActive || existing.parentCtx == ctx) {
 		existing.lastActive.Store(nowNano)
 		port := existing.localPort
 		voipRelaysMu.Unlock()
@@ -301,6 +313,25 @@ func (r *voipRelay) runIdleReaper() {
 	}
 }
 
+func (r *voipRelay) getLiveDialer() (context.Context, udpDialer, int64) {
+	if !r.followActive {
+		return r.ctx, r.dialer, 0
+	}
+	mu.Lock()
+	isUp := running
+	tnet := activeTnet
+	tCtx := activeCtx
+	mu.Unlock()
+	if isUp && tnet != nil && tCtx != nil && tCtx.Err() == nil {
+		return tCtx, tnet, recoveryEpoch.Load()
+	}
+	tCtx, dialer, ok := awaitMuxRouteReady(3500 * time.Millisecond)
+	if ok && dialer != nil && tCtx != nil {
+		return tCtx, dialer, recoveryEpoch.Load()
+	}
+	return r.ctx, r.dialer, recoveryEpoch.Load()
+}
+
 func (r *voipRelay) startReturnPump(s *voipRelayUdpSession) {
 	go func() {
 		rBufPtr := udpFrameBufPool.Get().(*[]byte)
@@ -321,6 +352,13 @@ func (r *voipRelay) startReturnPump(s *voipRelayUdpSession) {
 				r.lastActive.Store(nowNano)
 				udpPacketsRx.Add(1)
 				recordClientRx(r.statEnt, rn)
+			} else {
+				udpSendErrors.Add(1)
+				nowNano := time.Now().UnixNano()
+				prev := r.lastRetErrNano.Load()
+				if nowNano-prev > int64(5*time.Second) && r.lastRetErrNano.CompareAndSwap(prev, nowNano) {
+					RecordDiag("VOIP_RELAY", "RET_ERR", fmt.Sprintf("client=%s err=%v", s.clientAddr.String(), wErr))
+				}
 			}
 		}
 	}()
@@ -331,6 +369,7 @@ func (r *voipRelay) runUdpLoop() {
 	defer udpFrameBufPool.Put(bufPtr)
 	buf := *bufPtr
 	sessionsCap := activeMaxUdpSessionsCap()
+	handshakeChecked := false
 
 	for {
 		n, srcAddr, rErr := r.udpLn.ReadFromUDP(buf)
@@ -347,13 +386,19 @@ func (r *voipRelay) runUdpLoop() {
 		nowNano := time.Now().UnixNano()
 		r.lastActive.Store(nowNano)
 
-		targetIP, resErr := resolveUdpTargetIP(r.ctx, r.dialer, r.targetHost, r.dnsCache, &r.dnsMu)
+		liveCtx, liveDialer, _ := r.getLiveDialer()
+		if !handshakeChecked {
+			handshakeChecked = true
+			_ = awaitHandshakeReadyOrFail(liveCtx, liveDialer, 2500*time.Millisecond)
+		}
+
+		targetIP, resErr := resolveUdpTargetIP(liveCtx, liveDialer, r.targetHost, r.dnsCache, &r.dnsMu)
 		if resErr != nil {
 			udpSendErrors.Add(1)
 			continue
 		}
 
-		sess, sErr := r.getOrCreateUdpSession(srcAddr, targetIP, nowNano, sessionsCap)
+		sess, sErr := r.getOrCreateUdpSession(srcAddr, targetIP, liveDialer, nowNano, sessionsCap)
 		if sErr != nil {
 			udpSendErrors.Add(1)
 			continue
@@ -363,11 +408,26 @@ func (r *voipRelay) runUdpLoop() {
 			IP:   net.IP(targetIP.AsSlice()),
 			Port: r.targetPort,
 		}
-		if nw, wErr := sess.pConn.WriteTo(buf[:n], dstAddr); wErr == nil {
+		if nw, wErr := sess.pConn.WriteTo(buf[:n], dstAddr); wErr != nil {
+			// Re-open seamlessly on broken socket / post-rebind race.
+			r.sessMu.Lock()
+			if cur, ok := r.sessions[sess.key]; ok && cur == sess {
+				cur.close()
+				delete(r.sessions, sess.key)
+			}
+			r.sessMu.Unlock()
+			liveCtx, liveDialer, _ = r.getLiveDialer()
+			if freshSess, fErr := r.getOrCreateUdpSession(srcAddr, targetIP, liveDialer, nowNano, sessionsCap); fErr == nil {
+				if nw2, wErr2 := freshSess.pConn.WriteTo(buf[:n], dstAddr); wErr2 == nil {
+					udpPacketsTx.Add(1)
+					recordClientTx(r.statEnt, nw2)
+					continue
+				}
+			}
+			udpSendErrors.Add(1)
+		} else {
 			udpPacketsTx.Add(1)
 			recordClientTx(r.statEnt, nw)
-		} else {
-			udpSendErrors.Add(1)
 		}
 	}
 }
@@ -375,6 +435,7 @@ func (r *voipRelay) runUdpLoop() {
 func (r *voipRelay) getOrCreateUdpSession(
 	srcAddr *net.UDPAddr,
 	targetIP netip.Addr,
+	dialer udpDialer,
 	nowNano int64,
 	sessionsCap int,
 ) (*voipRelayUdpSession, error) {
@@ -384,16 +445,21 @@ func (r *voipRelay) getOrCreateUdpSession(
 	r.sessMu.RLock()
 	sess, exists := r.sessions[clientKey]
 	r.sessMu.RUnlock()
-	if exists {
+	if exists && (!r.followActive || sess.dialer == dialer) {
 		sess.lastActive.Store(nowNano)
 		return sess, nil
 	}
 
+	var staleSess *voipRelayUdpSession
 	r.sessMu.Lock()
 	if sess, exists = r.sessions[clientKey]; exists {
-		r.sessMu.Unlock()
-		sess.lastActive.Store(nowNano)
-		return sess, nil
+		if !r.followActive || sess.dialer == dialer {
+			r.sessMu.Unlock()
+			sess.lastActive.Store(nowNano)
+			return sess, nil
+		}
+		staleSess = sess
+		delete(r.sessions, clientKey)
 	}
 
 	if len(r.sessions) >= sessionsCap {
@@ -412,8 +478,11 @@ func (r *voipRelay) getOrCreateUdpSession(
 		}
 	}
 	r.sessMu.Unlock()
+	if staleSess != nil {
+		staleSess.close()
+	}
 
-	newConn, err := openFullConePacketConn(r.dialer, isV6)
+	newConn, err := openFullConePacketConn(dialer, isV6)
 	if err != nil {
 		return nil, err
 	}
@@ -427,6 +496,7 @@ func (r *voipRelay) getOrCreateUdpSession(
 		key:        clientKey,
 		clientAddr: clientCopy,
 		pConn:      newConn,
+		dialer:     dialer,
 	}
 	newSess.lastActive.Store(nowNano)
 
@@ -465,9 +535,12 @@ func (r *voipRelay) handleTcpClient(client net.Conn) {
 	defer client.Close()
 	r.lastActive.Store(time.Now().UnixNano())
 
-	awaitInitialHandshakeBeforeDial(r.ctx)
+	liveCtx, liveDialer, _ := r.getLiveDialer()
+	if !awaitHandshakeReadyOrFail(liveCtx, liveDialer, 2500*time.Millisecond) {
+		return
+	}
 
-	targetIP, resErr := resolveUdpTargetIP(r.ctx, r.dialer, r.targetHost, r.dnsCache, &r.dnsMu)
+	targetIP, resErr := resolveUdpTargetIP(liveCtx, liveDialer, r.targetHost, r.dnsCache, &r.dnsMu)
 	if resErr != nil {
 		return
 	}
@@ -477,8 +550,8 @@ func (r *voipRelay) handleTcpClient(client net.Conn) {
 	}
 	targetAddr := net.JoinHostPort(targetIP.String(), strconv.Itoa(r.targetPort))
 
-	dialCtx, cancel := context.WithTimeout(r.ctx, 12*time.Second)
-	remote, err := r.dialer.DialContext(dialCtx, network, targetAddr)
+	dialCtx, cancel := context.WithTimeout(liveCtx, 12*time.Second)
+	remote, err := liveDialer.DialContext(dialCtx, network, targetAddr)
 	cancel()
 	if err != nil {
 		return
