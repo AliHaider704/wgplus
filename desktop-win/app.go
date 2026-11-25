@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
+	"golang.org/x/sys/windows"
 	"wgbridge"
 	"wgplus-win/internal/clients"
 	"wgplus-win/internal/config"
@@ -57,6 +58,7 @@ type BridgeStats struct {
 	ActiveUdpAssocs      int64               `json:"activeUdpAssocs"`
 	BlockedLocalAttempts uint64              `json:"blockedLocalAttempts"`
 	VoipTunActive        bool                `json:"voipTunActive"`
+	IsAdmin              bool                `json:"isAdmin"`
 	HandshakeHealthy     bool                `json:"handshakeHealthy"`
 	SocksAuthRejectCount int64               `json:"socksAuthRejectCount"`
 	ResolvedEndpoint     string              `json:"resolvedEndpoint"`
@@ -323,6 +325,8 @@ func (a *App) startup(ctx context.Context) {
 		return cp
 	}, a.onClientsWatcherEvent)
 
+	cleanupOldExecutableSidecars()
+	a.recordRunningInstance()
 	a.syncAutostartRegistry()
 	a.checkPreviousCrashOnStartup()
 	go a.autoConnectOnLaunch()
@@ -336,14 +340,22 @@ func (a *App) startup(ctx context.Context) {
 	}
 }
 
-// syncAutostartRegistry keeps the HKCU Run entry aligned with the setting and the current exe path.
+// syncAutostartRegistry keeps Windows startup aligned with StartWithWindows and AlwaysRunAsAdmin.
 func (a *App) syncAutostartRegistry() {
 	a.mu.Lock()
 	on := a.state.Settings.StartWithWindows
+	alwaysAdmin := a.state.Settings.AlwaysRunAsAdmin
 	a.mu.Unlock()
 	if exePath, err := os.Executable(); err == nil {
-		_ = syswin.SetStartWithWindows(on, exePath)
+		_ = syswin.SyncStartWithWindows(on, exePath, alwaysAdmin, isProcessElevated())
 	}
+}
+
+// ShouldAlwaysRunAsAdmin reports whether the user opted into persistent Administrator elevation.
+func (a *App) ShouldAlwaysRunAsAdmin() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.state.Settings.AlwaysRunAsAdmin
 }
 
 func (a *App) activeConnectTarget() string {
@@ -466,6 +478,7 @@ func (a *App) readBridgeStats() BridgeStats {
 	var st BridgeStats
 	_ = json.Unmarshal([]byte(wgbridge.GetDetailedStatsJSON()), &st)
 	st.VoipTunActive = wgbridge.IsWindowsVoipTunActive()
+	st.IsAdmin = isProcessElevated()
 	return st
 }
 
@@ -502,6 +515,7 @@ func (a *App) telemetryLoop(ctx context.Context) {
 	defer ticker.Stop()
 
 	lastHsHealthy := false
+	var lastVoipTunRetry time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -514,6 +528,19 @@ func (a *App) telemetryLoop(ctx context.Context) {
 				msg := fmt.Sprintf("rejects=%d", stats.SocksAuthRejectCount)
 				wgbridge.RecordDiag("HYGIENE", "SOCKS_AUTH_RESYNC", msg)
 				a.reportAnomalyAsync("SOCKS_AUTH_RESYNC", msg)
+			}
+			a.mu.Lock()
+			isConnNow := a.connected
+			a.mu.Unlock()
+			if isConnNow && stats.IsAdmin && !stats.VoipTunActive && stats.HandshakeHealthy && time.Since(lastVoipTunRetry) >= 8*time.Second {
+				lastVoipTunRetry = time.Now()
+				go func(dataDir string) {
+					if dllPath, dllErr := voiptun.EnsureWintunDLLForApp(dataDir); dllErr == nil {
+						if wgbridge.StartWindowsVoipTun(filepath.Dir(dllPath)) == nil {
+							a.emitStateChanged()
+						}
+					}
+				}(a.store.DataDir())
 			}
 			a.mu.Lock()
 			if len(a.rxHistory) >= historyCap {
@@ -816,15 +843,50 @@ func (a *App) QuitApp() {
 	}
 }
 
-// EnableVoipTunAdmin relaunches WireGuard Plus with Administrator rights so the local Wintun
-// call router can intercept Telegram desktop voice/video UDP media directly.
+// EnableVoipTunAdmin saves persistent Administrator preference and relaunches elevated
+// (or activates Wintun directly if already running with Administrator rights).
 func (a *App) EnableVoipTunAdmin() error {
-	if err := syswin.RelaunchElevated(); err != nil {
+	if isProcessElevated() {
+		a.mu.Lock()
+		a.state.Settings.AlwaysRunAsAdmin = true
+		_ = a.store.Save(a.state)
+		isConn := a.connected
+		a.mu.Unlock()
+		a.syncAutostartRegistry()
+		if isConn && !wgbridge.IsWindowsVoipTunActive() {
+			if dllPath, dllErr := voiptun.EnsureWintunDLLForApp(a.store.DataDir()); dllErr != nil {
+				return dllErr
+			} else if vtErr := wgbridge.StartWindowsVoipTun(filepath.Dir(dllPath)); vtErr != nil {
+				return vtErr
+			}
+		}
+		a.refreshTray()
+		a.emitStateChanged()
+		return nil
+	}
+
+	a.mu.Lock()
+	prev := a.state.Settings.AlwaysRunAsAdmin
+	a.state.Settings.AlwaysRunAsAdmin = true
+	_ = a.store.Save(a.state)
+	a.mu.Unlock()
+
+	if err := syswin.RelaunchElevatedWithArgs(os.Getpid(), "--elevated-relaunch"); err != nil {
+		a.mu.Lock()
+		a.state.Settings.AlwaysRunAsAdmin = prev
+		_ = a.store.Save(a.state)
+		a.mu.Unlock()
+		if errors.Is(err, windows.ERROR_CANCELLED) ||
+			strings.Contains(strings.ToLower(err.Error()), "cancel") {
+			return nil
+		}
 		return err
 	}
+
 	go func() {
-		time.Sleep(250 * time.Millisecond)
 		a.QuitApp()
+		time.Sleep(1500 * time.Millisecond)
+		os.Exit(0)
 	}()
 	return nil
 }
@@ -1923,9 +1985,9 @@ func (a *App) UpdateSettings(s config.AppSettings) (config.AppSettings, error) {
 	s.ChannelInvitedV3 = prev.ChannelInvitedV3
 	s.ChannelInvitedV4 = prev.ChannelInvitedV4
 
-	if s.StartWithWindows != prev.StartWithWindows {
+	if s.StartWithWindows != prev.StartWithWindows || s.AlwaysRunAsAdmin != prev.AlwaysRunAsAdmin {
 		exePath, _ := os.Executable()
-		if err := syswin.SetStartWithWindows(s.StartWithWindows, exePath); err != nil {
+		if err := syswin.SyncStartWithWindows(s.StartWithWindows, exePath, s.AlwaysRunAsAdmin, isProcessElevated()); err != nil {
 			a.mu.Unlock()
 			return prev, err
 		}

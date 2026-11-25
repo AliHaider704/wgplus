@@ -4,10 +4,13 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -155,12 +158,52 @@ func (h *Host) stopNetworkWatcher() {
 	}
 }
 
-// RelaunchElevated prompts Windows UAC to start a fresh Administrator instance of this app.
-func RelaunchElevated() error {
-	exePath, err := os.Executable()
-	if err != nil {
-		return err
+// WaitForProcessExit waits for pid to terminate (plus a short settle delay) so single-instance
+// locks and child WebView2 handles are fully released before launching the replacement window.
+func WaitForProcessExit(pid uint32, maxWait time.Duration) {
+	if pid == 0 || pid == uint32(os.Getpid()) {
+		return
 	}
+	h, err := windows.OpenProcess(windows.SYNCHRONIZE, false, pid)
+	if err == nil {
+		waitMs := uint32(maxWait.Milliseconds())
+		if waitMs == 0 {
+			waitMs = 5000
+		}
+		_, _ = windows.WaitForSingleObject(h, waitMs)
+		_ = windows.CloseHandle(h)
+	}
+	time.Sleep(180 * time.Millisecond)
+}
+
+func quoteWinArgs(args []string) string {
+	if len(args) == 0 {
+		return ""
+	}
+	quoted := make([]string, 0, len(args))
+	for _, a := range args {
+		quoted = append(quoted, syscall.EscapeArg(a))
+	}
+	return strings.Join(quoted, " ")
+}
+
+// RelaunchElevatedTargetWithArgs prompts Windows UAC to start targetExe elevated, passing --wait-pid
+// when waitPid > 0 followed by extraArgs.
+func RelaunchElevatedTargetWithArgs(targetExe string, waitPid int, extraArgs ...string) error {
+	exePath := strings.TrimSpace(targetExe)
+	if exePath == "" {
+		var err error
+		exePath, err = os.Executable()
+		if err != nil {
+			return err
+		}
+	}
+	args := make([]string, 0, len(extraArgs)+2)
+	if waitPid > 0 {
+		args = append(args, "--wait-pid", strconv.Itoa(waitPid))
+	}
+	args = append(args, extraArgs...)
+
 	verbPtr, err := windows.UTF16PtrFromString("runas")
 	if err != nil {
 		return err
@@ -169,9 +212,51 @@ func RelaunchElevated() error {
 	if err != nil {
 		return err
 	}
+	var argsPtr *uint16
+	if argStr := quoteWinArgs(args); argStr != "" {
+		argsPtr, err = windows.UTF16PtrFromString(argStr)
+		if err != nil {
+			return err
+		}
+	}
 	dirPtr, err := windows.UTF16PtrFromString(filepath.Dir(exePath))
 	if err != nil {
 		return err
 	}
-	return windows.ShellExecute(0, verbPtr, exePtr, nil, dirPtr, windows.SW_SHOWNORMAL)
+	return windows.ShellExecute(0, verbPtr, exePtr, argsPtr, dirPtr, windows.SW_SHOWNORMAL)
+}
+
+// RelaunchElevatedWithArgs prompts Windows UAC to start a fresh elevated instance of the current executable.
+func RelaunchElevatedWithArgs(waitPid int, extraArgs ...string) error {
+	return RelaunchElevatedTargetWithArgs("", waitPid, extraArgs...)
+}
+
+// RelaunchElevated prompts Windows UAC to start a fresh Administrator instance of this app.
+func RelaunchElevated() error {
+	return RelaunchElevatedWithArgs(os.Getpid())
+}
+
+// SpawnProcessDetached starts exePath cleanly (elevated if wantElevated and not already elevated),
+// forwarding --wait-pid so the new process waits for waitPid to release its single-instance lock.
+func SpawnProcessDetached(exePath string, wantElevated bool, waitPid int, extraArgs ...string) error {
+	cleanExe := strings.TrimSpace(exePath)
+	if cleanExe == "" {
+		var err error
+		cleanExe, err = os.Executable()
+		if err != nil {
+			return err
+		}
+	}
+	if wantElevated && !windows.GetCurrentProcessToken().IsElevated() {
+		return RelaunchElevatedTargetWithArgs(cleanExe, waitPid, extraArgs...)
+	}
+	args := make([]string, 0, len(extraArgs)+2)
+	if waitPid > 0 {
+		args = append(args, "--wait-pid", strconv.Itoa(waitPid))
+	}
+	args = append(args, extraArgs...)
+	cmd := exec.Command(cleanExe, args...)
+	cmd.Dir = filepath.Dir(cleanExe)
+	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: windows.DETACHED_PROCESS}
+	return cmd.Start()
 }

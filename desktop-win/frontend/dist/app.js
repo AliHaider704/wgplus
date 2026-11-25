@@ -313,7 +313,7 @@ function renderStatusAndTelemetry() {
   el("btn-recovery-awg").disabled = recoveringAwg || generatingWarp || state.connecting;
   el("btn-recovery-warp").disabled = recoveringAwg || generatingWarp || state.connecting;
 
-  const showVoipAdmin = !!(state.connected && s.voipTunActive === false);
+  const showVoipAdmin = !s.voipTunActive && !s.isAdmin;
   el("voip-admin-banner").classList.toggle("hidden", !showVoipAdmin);
   el("btn-voip-admin").disabled = state.connecting;
 
@@ -1483,7 +1483,22 @@ async function runUpdateFlow() {
         sub: tr.updSubForce,
         notes: notesFor(upd),
         primaryLabel: tr.updNow,
-        onPrimary: () => wailsRuntime()?.BrowserOpenURL(upd.download),
+        onPrimary: async () => {
+          const btn = el("upd-primary");
+          if (btn) {
+            btn.disabled = true;
+            btn.textContent = tr.updInstalling;
+          }
+          try {
+            await api().ApplySelfUpdate(upd.download);
+          } catch (_) {
+            wailsRuntime()?.BrowserOpenURL(upd.download);
+            if (btn) {
+              btn.disabled = false;
+              btn.textContent = tr.updNow;
+            }
+          }
+        },
         secondaryLabel: tr.updQuit,
         onSecondary: () => api().QuitApp(),
       });

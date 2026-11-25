@@ -3,12 +3,15 @@ package main
 import (
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"unicode/utf8"
 
+	"golang.org/x/sys/windows"
 	"wgplus-win/internal/config"
 	"wgplus-win/internal/guard"
+	"wgplus-win/internal/vault"
 )
 
 func TestSanitizeWindowsDiagTextAndPathUserRedaction(t *testing.T) {
@@ -191,4 +194,87 @@ func TestLiveWindowsFirestoreTelemetryUpload(t *testing.T) {
 		t.Fatalf("unexpected Firestore doc name: %q", docName)
 	}
 	t.Logf("Live Windows telemetry document created: %s", docName)
+}
+
+func TestReplaceBinaryFileInPlaceOverLockedOpenFile(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "WireGuardPlus-Windows-x64.exe")
+	staged := target + ".download"
+
+	if err := os.WriteFile(target, []byte("MZ_OLD_BINARY_V1"), 0o755); err != nil {
+		t.Fatalf("write old target: %v", err)
+	}
+	if err := os.WriteFile(staged, []byte("MZ_NEW_BINARY_V2"), 0o755); err != nil {
+		t.Fatalf("write staged target: %v", err)
+	}
+
+	// Simulate Windows PE loader handle on a running .exe: allows shared read & delete (rename)
+	// while strictly blocking direct in-place write/overwrite until the process exits.
+	targetPtr, err := windows.UTF16PtrFromString(target)
+	if err != nil {
+		t.Fatalf("UTF16PtrFromString: %v", err)
+	}
+	lockedHandle, err := windows.CreateFile(
+		targetPtr,
+		windows.GENERIC_READ,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_DELETE,
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("CreateFile PE-style handle: %v", err)
+	}
+	cleanupClosed := false
+	defer func() {
+		if !cleanupClosed {
+			_ = windows.CloseHandle(lockedHandle)
+		}
+	}()
+
+	// Direct overwrite must fail while running handle is open, proving NTFS rename is necessary.
+	if wErr := os.WriteFile(target, []byte("DIRECT_OVERWRITE_SHOULD_FAIL"), 0o755); wErr == nil {
+		t.Fatal("expected direct write over running executable handle to fail")
+	}
+
+	if err := replaceBinaryFileInPlace(target, staged); err != nil {
+		t.Fatalf("replaceBinaryFileInPlace failed over running executable handle: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("read replaced target: %v", err)
+	}
+	if string(got) != "MZ_NEW_BINARY_V2" {
+		t.Fatalf("expected new binary content at target path, got %q", string(got))
+	}
+	_ = windows.CloseHandle(lockedHandle)
+	cleanupClosed = true
+}
+
+func TestWebviewDirElevationSeparationAndAlwaysAdminPersistence(t *testing.T) {
+	dir := t.TempDir()
+	store, err := vault.NewStoreAt(dir, false)
+	if err != nil {
+		t.Fatalf("NewStoreAt: %v", err)
+	}
+	if store.WebviewDirForElevation(false) == store.WebviewDirForElevation(true) {
+		t.Fatal("elevated and standard WebView2 directories must be isolated to avoid ACL lockouts")
+	}
+
+	st := config.PersistedState{
+		SchemaVersion: 1,
+		Settings:      config.DefaultSettings(),
+	}
+	st.Settings.AlwaysRunAsAdmin = true
+	if err := store.Save(st); err != nil {
+		t.Fatalf("store.Save: %v", err)
+	}
+	reloaded, err := store.Load()
+	if err != nil {
+		t.Fatalf("store.Load: %v", err)
+	}
+	if !reloaded.Settings.AlwaysRunAsAdmin {
+		t.Fatal("AlwaysRunAsAdmin must persist across restarts")
+	}
 }

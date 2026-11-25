@@ -2,8 +2,12 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"os"
@@ -12,8 +16,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"golang.org/x/net/proxy"
+	"golang.org/x/sys/windows"
 	"wgbridge"
+	"wgplus-win/internal/syswin"
+	"wgplus-win/internal/vault"
 )
 
 // AppVersion must match the release tag (without "v") of this build.
@@ -25,9 +33,10 @@ func (a *App) GetAppVersion() string {
 }
 
 const (
-	releasesAPI    = "https://api.github.com/repos/AliHaider704/wgplus/releases/"
-	windowsAssetNm = "WireGuardPlus-Windows-x64.exe"
-	lastSeenFile   = "last_seen_version"
+	releasesAPI         = "https://api.github.com/repos/AliHaider704/wgplus/releases/"
+	windowsAssetNm      = "WireGuardPlus-Windows-x64.exe"
+	lastSeenFile        = "last_seen_version"
+	runningInstanceFile = "running_instance.json"
 )
 
 // ReleaseNotes holds bilingual bullet lists parsed from a release body.
@@ -239,4 +248,311 @@ func (a *App) GetWhatsNew() *ReleaseNotes {
 // AckWhatsNew records that the current version's notes were shown.
 func (a *App) AckWhatsNew() {
 	_ = os.WriteFile(filepath.Join(a.store.DataDir(), lastSeenFile), []byte(AppVersion), 0o600)
+}
+
+type runningInstanceMeta struct {
+	PID     uint32 `json:"pid"`
+	ExePath string `json:"exePath"`
+	Version string `json:"version"`
+}
+
+func (a *App) recordRunningInstance() {
+	if a.store == nil {
+		return
+	}
+	exePath, err := os.Executable()
+	if err != nil || strings.TrimSpace(exePath) == "" {
+		return
+	}
+	meta := runningInstanceMeta{
+		PID:     uint32(os.Getpid()),
+		ExePath: filepath.Clean(exePath),
+		Version: AppVersion,
+	}
+	if raw, mErr := json.Marshal(meta); mErr == nil {
+		_ = os.WriteFile(filepath.Join(a.store.DataDir(), runningInstanceFile), raw, 0o600)
+	}
+}
+
+func cleanupOldExecutableSidecars() {
+	exePath, err := os.Executable()
+	if err != nil || strings.TrimSpace(exePath) == "" {
+		return
+	}
+	clean := filepath.Clean(exePath)
+	dir := filepath.Dir(clean)
+	_ = os.Remove(clean + ".old")
+	_ = os.Remove(clean + ".download")
+	if entries, rErr := os.ReadDir(dir); rErr == nil {
+		base := filepath.Base(clean)
+		for _, ent := range entries {
+			if ent.IsDir() {
+				continue
+			}
+			nm := ent.Name()
+			if strings.HasPrefix(nm, base+".old.") ||
+				(strings.EqualFold(nm, "WireGuardPlus-Windows-x64-new.exe") && !strings.EqualFold(nm, base)) {
+				_ = os.Remove(filepath.Join(dir, nm))
+			}
+		}
+	}
+}
+
+func copyFileBytes(src, dst string, perm os.FileMode) error {
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		_ = out.Close()
+		_ = os.Remove(dst)
+		return err
+	}
+	return out.Close()
+}
+
+// replaceBinaryFileInPlace replaces targetExe atomically while targetExe may still be executing
+// using NTFS rename-while-running, cleaning old sidecars cleanly when possible.
+func replaceBinaryFileInPlace(targetExe, newFilePath string) error {
+	cleanTarget := filepath.Clean(targetExe)
+	cleanNew := filepath.Clean(newFilePath)
+	oldPath := cleanTarget + ".old"
+	_ = os.Remove(oldPath)
+	if _, err := os.Stat(oldPath); err == nil {
+		oldPath = fmt.Sprintf("%s.old.%d", cleanTarget, time.Now().UnixNano())
+	}
+
+	movedOld := false
+	if _, err := os.Stat(cleanTarget); err == nil {
+		if rErr := os.Rename(cleanTarget, oldPath); rErr != nil {
+			return fmt.Errorf("failed moving existing executable out of the way: %w", rErr)
+		}
+		movedOld = true
+	}
+
+	if rErr := os.Rename(cleanNew, cleanTarget); rErr != nil {
+		if cErr := copyFileBytes(cleanNew, cleanTarget, 0o755); cErr != nil {
+			if movedOld {
+				_ = os.Rename(oldPath, cleanTarget)
+			}
+			return fmt.Errorf("failed placing new executable at target path: %w", cErr)
+		}
+		_ = os.Remove(cleanNew)
+	}
+	_ = os.Remove(oldPath)
+	return nil
+}
+
+func fileSHA256Hex(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func isProcessAliveWin(pid uint32) bool {
+	if pid == 0 || pid == uint32(os.Getpid()) {
+		return false
+	}
+	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
+	if err != nil {
+		return false
+	}
+	defer windows.CloseHandle(h)
+	var code uint32
+	if err := windows.GetExitCodeProcess(h, &code); err != nil {
+		return false
+	}
+	const stillActive = 259
+	return code == stillActive
+}
+
+// maybeUpgradeInstalledCopyInPlace detects when a newly downloaded WireGuardPlus .exe was launched
+// outside an existing installed copy (e.g. from Downloads), replaces the existing copy in-place,
+// and starts the updated installed copy cleanly. Returns true when handoff occurred.
+func maybeUpgradeInstalledCopyInPlace() bool {
+	myExe, err := os.Executable()
+	if err != nil || strings.TrimSpace(myExe) == "" {
+		return false
+	}
+	cleanMy := filepath.Clean(myExe)
+	dataDir, portable := vault.ResolveDataDir(cleanMy)
+	if portable {
+		return false
+	}
+	lowMy := strings.ToLower(cleanMy)
+	if strings.Contains(lowMy, `\temp\`) || strings.Contains(lowMy, `\build\bin\`) {
+		return false
+	}
+
+	var targetExe string
+	var targetPid uint32
+	if raw, rErr := os.ReadFile(filepath.Join(dataDir, runningInstanceFile)); rErr == nil {
+		var meta runningInstanceMeta
+		if json.Unmarshal(raw, &meta) == nil && strings.TrimSpace(meta.ExePath) != "" {
+			targetExe = filepath.Clean(meta.ExePath)
+			targetPid = meta.PID
+		}
+	}
+	if targetExe == "" {
+		if regExe := syswin.RegisteredAutostartExe(); regExe != "" {
+			targetExe = filepath.Clean(regExe)
+		}
+	}
+	if targetExe == "" || strings.EqualFold(cleanMy, targetExe) {
+		return false
+	}
+	if !strings.Contains(strings.ToLower(filepath.Base(targetExe)), "wireguardplus") {
+		return false
+	}
+	if st, sErr := os.Stat(targetExe); sErr != nil || st.IsDir() {
+		return false
+	}
+
+	pidAlive := isProcessAliveWin(targetPid)
+	fromDownloads := strings.Contains(lowMy, `\downloads\`)
+	if !pidAlive && !fromDownloads {
+		return false
+	}
+
+	myHash, err1 := fileSHA256Hex(cleanMy)
+	targetHash, err2 := fileSHA256Hex(targetExe)
+	if err1 != nil || err2 != nil || myHash == targetHash {
+		return false
+	}
+
+	if pidAlive {
+		if h, pErr := windows.OpenProcess(windows.PROCESS_TERMINATE|windows.SYNCHRONIZE, false, targetPid); pErr == nil {
+			_ = windows.TerminateProcess(h, 0)
+			_, _ = windows.WaitForSingleObject(h, 5000)
+			_ = windows.CloseHandle(h)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	staged := targetExe + ".staged"
+	if err := copyFileBytes(cleanMy, staged, 0o755); err != nil {
+		return false
+	}
+	if err := replaceBinaryFileInPlace(targetExe, staged); err != nil {
+		_ = os.Remove(staged)
+		return false
+	}
+
+	wantAdmin := isProcessElevated()
+	if store, sErr := vault.NewStoreAt(dataDir, false); sErr == nil {
+		if pst, lErr := store.Load(); lErr == nil && pst.Settings.AlwaysRunAsAdmin {
+			wantAdmin = true
+		}
+	}
+	if err := syswin.SpawnProcessDetached(targetExe, wantAdmin, os.Getpid(), "--in-place-upgraded"); err != nil {
+		return false
+	}
+	return true
+}
+
+func downloadBinaryWithClient(c *http.Client, fullURL, dstPath string) error {
+	dlClient := &http.Client{
+		Timeout:   90 * time.Second,
+		Transport: c.Transport,
+	}
+	req, err := http.NewRequest("GET", fullURL, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("User-Agent", "WireGuardPlus/"+AppVersion)
+	resp, err := dlClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return fmt.Errorf("download HTTP %d", resp.StatusCode)
+	}
+	f, err := os.OpenFile(dstPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o755)
+	if err != nil {
+		return err
+	}
+	n, err := io.Copy(f, resp.Body)
+	closeErr := f.Close()
+	if err != nil {
+		_ = os.Remove(dstPath)
+		return err
+	}
+	if closeErr != nil {
+		_ = os.Remove(dstPath)
+		return closeErr
+	}
+	if n < 2*1024*1024 {
+		_ = os.Remove(dstPath)
+		return errors.New("downloaded binary too small")
+	}
+	hdr := make([]byte, 2)
+	vf, err := os.Open(dstPath)
+	if err != nil {
+		_ = os.Remove(dstPath)
+		return err
+	}
+	_, rErr := io.ReadFull(vf, hdr)
+	_ = vf.Close()
+	if rErr != nil || hdr[0] != 'M' || hdr[1] != 'Z' {
+		_ = os.Remove(dstPath)
+		return errors.New("downloaded file is not a valid Windows executable")
+	}
+	return nil
+}
+
+// ApplySelfUpdate downloads downloadURL and overwrites the running executable in-place,
+// then restarts into the updated version cleanly without manual file moving.
+func (a *App) ApplySelfUpdate(downloadURL string) error {
+	cleanURL := strings.TrimSpace(downloadURL)
+	if !strings.HasPrefix(cleanURL, "https://") || !strings.HasSuffix(strings.ToLower(cleanURL), ".exe") {
+		if a.ctx != nil && cleanURL != "" {
+			runtime.BrowserOpenURL(a.ctx, cleanURL)
+		}
+		return nil
+	}
+	exePath, err := os.Executable()
+	if err != nil || strings.TrimSpace(exePath) == "" {
+		return errors.New("cannot resolve current executable path")
+	}
+	cleanExe := filepath.Clean(exePath)
+	tmpPath := cleanExe + ".download"
+
+	var lastErr error
+	for _, client := range a.buildUpdaterHTTPClients() {
+		if dErr := downloadBinaryWithClient(client, cleanURL, tmpPath); dErr == nil {
+			lastErr = nil
+			break
+		} else {
+			lastErr = dErr
+		}
+	}
+	if lastErr != nil {
+		return lastErr
+	}
+
+	if err := replaceBinaryFileInPlace(cleanExe, tmpPath); err != nil {
+		return err
+	}
+	if err := syswin.SpawnProcessDetached(cleanExe, a.ShouldAlwaysRunAsAdmin() || isProcessElevated(), os.Getpid()); err != nil {
+		return err
+	}
+	go func() {
+		a.QuitApp()
+		time.Sleep(1500 * time.Millisecond)
+		os.Exit(0)
+	}()
+	return nil
 }

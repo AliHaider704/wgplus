@@ -97,6 +97,7 @@ $outExeName = "WireGuardPlus-Windows-x64.exe"
 $distExe = Join-Path $DistDir $outExeName
 
 $verifyExe = $distExe
+$wasDistRunning = $false
 Push-Location $DesktopDir
 try {
     & wails build -clean -platform windows/amd64 -trimpath -ldflags "-s -w -buildid=" -o $outExeName
@@ -105,15 +106,25 @@ try {
     if (-not (Test-Path $builtExe)) {
         throw "Expected Wails output missing at $builtExe"
     }
+    Remove-Item -Force -ErrorAction SilentlyContinue (Join-Path $DistDir "WireGuardPlus-Windows-x64-new.exe"), ($distExe + ".old")
+    $runningDist = @(Get-Process -Name "WireGuardPlus-Windows-x64" -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ([string]::Equals([System.IO.Path]::GetFullPath($_.Path), [System.IO.Path]::GetFullPath($distExe), [System.StringComparison]::OrdinalIgnoreCase)) })
+    if ($runningDist.Count -gt 0) {
+        $wasDistRunning = $true
+        $runningDist | ForEach-Object { Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue }
+        Start-Sleep -Milliseconds 350
+    }
     try {
         Copy-Item -Force $builtExe $distExe
-        $verifyExe = $distExe
     } catch [System.IO.IOException] {
-        $stagedExe = Join-Path $DistDir "WireGuardPlus-Windows-x64-new.exe"
-        Copy-Item -Force $builtExe $stagedExe
-        Write-Warning "dist\$outExeName is currently running; staged new build at dist\WireGuardPlus-Windows-x64-new.exe"
-        $verifyExe = $stagedExe
+        $oldSidecar = $distExe + ".old"
+        Remove-Item -Force -ErrorAction SilentlyContinue $oldSidecar
+        if (Test-Path $distExe) {
+            Move-Item -Force $distExe $oldSidecar
+        }
+        Copy-Item -Force $builtExe $distExe
+        Remove-Item -Force -ErrorAction SilentlyContinue $oldSidecar
     }
+    $verifyExe = $distExe
 } finally {
     Pop-Location
 }
@@ -166,4 +177,8 @@ Write-Host "Build artifacts ready:"
 Get-Item $verifyExe, $distZip | ForEach-Object {
     $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     Write-Host ("  {0} ({1} bytes) SHA-256: {2}" -f $_.Name, $_.Length, $hash)
+}
+if ($wasDistRunning) {
+    Start-Process -FilePath $distExe -ArgumentList "--minimized"
+    Write-Host "Restarted $outExeName in background tray after in-place replacement."
 }

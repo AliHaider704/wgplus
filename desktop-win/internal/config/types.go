@@ -61,6 +61,7 @@ type AppSettings struct {
 	StartMinimized           bool   `json:"startMinimized"`
 	MinimizeToTray           bool   `json:"minimizeToTray"`
 	CallChecklistAck         bool   `json:"callChecklistAck"`
+	AlwaysRunAsAdmin         bool   `json:"alwaysRunAsAdmin"`
 	TelemetryConsentDecided  bool   `json:"telemetryConsentDecided"`
 	TelemetryOptIn           bool   `json:"telemetryOptIn"`
 	ChannelInvitedV2         bool   `json:"channelInvitedV2,omitempty"`

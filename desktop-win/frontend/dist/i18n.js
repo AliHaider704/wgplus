@@ -6,7 +6,8 @@ export const STRINGS = {
   en: {
     updTitleForce: "Update required",
     updSubForce: "A new version is available. Update to keep using WireGuard Plus.",
-    updNow: "Download update",
+    updNow: "Download & install update",
+    updInstalling: "Installing update...",
     updQuit: "Quit",
     updTitleNew: "What's new",
     updSubNew: "WireGuard Plus was updated. Here is what changed.",
@@ -241,7 +242,8 @@ export const STRINGS = {
   ar: {
     updTitleForce: "تحديث مطلوب",
     updSubForce: "يتوفر إصدار جديد. حدّث للاستمرار باستخدام نفق وايرجارد بلس.",
-    updNow: "تنزيل التحديث",
+    updNow: "تنزيل وتثبيت التحديث",
+    updInstalling: "جارٍ تثبيت التحديث...",
     updQuit: "إغلاق",
     updTitleNew: "ما الجديد",
     updSubNew: "تم تحديث نفق وايرجارد بلس. هذه أبرز التحسينات.",

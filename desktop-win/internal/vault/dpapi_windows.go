@@ -80,8 +80,14 @@ func NewStoreAt(dir string, portable bool) (*Store, error) {
 
 func (s *Store) DataDir() string  { return s.dataDir }
 func (s *Store) IsPortable() bool { return s.isPortable }
-func (s *Store) WebviewDir() string {
+func (s *Store) WebviewDirForElevation(elevated bool) string {
+	if elevated {
+		return filepath.Join(s.dataDir, "webview2-admin")
+	}
 	return filepath.Join(s.dataDir, "webview2")
+}
+func (s *Store) WebviewDir() string {
+	return s.WebviewDirForElevation(windows.GetCurrentProcessToken().IsElevated())
 }
 
 func makeDataBlob(b []byte) *windows.DataBlob {
