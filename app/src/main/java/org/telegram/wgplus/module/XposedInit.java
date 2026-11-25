@@ -988,6 +988,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                     }
                     WgDiagnosticsLog.record("VOIP", "RELAY",
                             rawPort + "->" + relayAddr + (isRtc ? " (rtc)" : (clearedReflector ? " (turn_only)" : " (refl)")));
+                    WgCallWatchdog.arm(ctx, MODULE_PATH);
                     return 2;
                 }
                 WgDiagnosticsLog.record("VOIP", "RELAY_MISS", "port=" + rawPort + " rtc=" + isRtc);

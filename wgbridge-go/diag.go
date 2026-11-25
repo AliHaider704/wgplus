@@ -238,6 +238,7 @@ func BuildEngineDiagnosticsBundleJSON() string {
 			"udpIpv6FastFails":     udpIpv6DialFastFails.Load(),
 			"watchdogRecoveries":   watchdogRecoveries.Load(),
 			"recoveryEpoch":        GetRecoveryEpoch(),
+			"voipLowTrafficCloses": GetVoipLowTrafficCloseCount(),
 		},
 		"voipRelays": getVoipRelaysDiagSnapshot(),
 		"ringBuffer": ringCopy,

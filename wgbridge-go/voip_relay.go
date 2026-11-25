@@ -70,7 +70,15 @@ type voipRelay struct {
 var (
 	voipRelaysMu sync.Mutex
 	voipRelays   = make(map[string]*voipRelay)
+
+	// voipLowTrafficCloses counts relays that closed after >=30s with <100 packets (failed call signature).
+	voipLowTrafficCloses atomic.Uint64
 )
+
+// GetVoipLowTrafficCloseCount reports how many VoIP relays closed looking like a failed call.
+func GetVoipLowTrafficCloseCount() int64 {
+	return int64(voipLowTrafficCloses.Load())
+}
 
 // StartVoipEndpointRelay binds a local 127.0.0.1 UDP (and best-effort TCP) relay
 // socket that forwards packets for targetHost:targetPort directly through the active
@@ -373,7 +381,18 @@ func (r *voipRelay) close() {
 		}
 		r.sessMu.Unlock()
 		trackClientConnEnd(r.statEnt)
-		RecordDiag("VOIP_RELAY", "CLOSE", fmt.Sprintf("target=%s:%d localAddr=%s", r.targetHost, r.targetPort, r.localAddrString()))
+		ageSec := time.Now().Unix() - r.createdAtUnix
+		if ageSec < 0 {
+			ageSec = 0
+		}
+		tx, rx, errs := r.udpPktsTx.Load(), r.udpPktsRx.Load(), r.udpErrs.Load()
+		RecordDiag("VOIP_RELAY", "CLOSE", fmt.Sprintf("target=%s:%d localAddr=%s ageSec=%d udpTx=%d udpRx=%d errs=%d tcpConns=%d",
+			r.targetHost, r.targetPort, r.localAddrString(), ageSec, tx, rx, errs, r.tcpConns.Load()))
+		// A call relay that lived >= 30s but carried almost no media is the signature of a failed call.
+		if ageSec >= 30 && tx+rx < 100 {
+			voipLowTrafficCloses.Add(1)
+			RecordDiag("VOIP_RELAY", "LOW_TRAFFIC", fmt.Sprintf("target=%s:%d ageSec=%d udpTx=%d udpRx=%d errs=%d", r.targetHost, r.targetPort, ageSec, tx, rx, errs))
+		}
 	})
 }
 
