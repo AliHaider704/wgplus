@@ -159,7 +159,7 @@ jobs:
                               break
               return chosen
 
-          picked = pick(["Google", "Samsung", "Xiaomi", "Motorola"], min_api=28, max_count=3)
+          picked = pick(["Xiaomi", "Samsung", "Google", "Motorola"], min_api=28, max_count=2)
           if not picked:
               raise SystemExit(f"No matching FTL devices found for form={form}")
           print(" ".join(f"--device model={mid},version={api},locale=en,orientation=portrait" for mid, api in picked))
