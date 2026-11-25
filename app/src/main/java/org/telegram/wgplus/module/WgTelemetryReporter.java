@@ -4,6 +4,7 @@ import android.content.Context;
 import android.content.SharedPreferences;
 import android.content.pm.PackageInfo;
 import android.os.Build;
+import android.os.Bundle;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -20,6 +21,7 @@ import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.text.SimpleDateFormat;
+import java.util.Collections;
 import java.util.Date;
 import java.util.Locale;
 import java.util.TimeZone;
@@ -28,7 +30,9 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 import javax.net.ssl.HttpsURLConnection;
+import javax.net.ssl.SNIHostName;
 import javax.net.ssl.SSLHandshakeException;
+import javax.net.ssl.SSLParameters;
 import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 
@@ -56,7 +60,7 @@ public final class WgTelemetryReporter {
     private static final long DAILY_WINDOW_MS = 24L * 60L * 60L * 1000L;
     private static final int MAX_AUTO_REPORTS_PER_DAY = 4;
     private static final long MANUAL_COOLDOWN_MS = 30_000L;
-    private static final int MAX_REPORT_CHARS = 14000;
+    private static final int MAX_REPORT_UTF8_BYTES = 15800;
 
     public static final int STATUS_SENT = 0;
     public static final int STATUS_RATE_LIMITED = 1;
@@ -197,10 +201,14 @@ public final class WgTelemetryReporter {
                 String jsonBody = buildFirestoreDocumentJson(appCtx, "MANUAL_USER_REPORT", effective);
                 if (postJson(appCtx, moduleApkPath, jsonBody)) {
                     sLastManualSendElapsedMs = SystemClock.elapsedRealtime();
+                    WgDiagnosticsLog.record("TELEMETRY", "SENT_OK", "manual report uploaded");
                     result = STATUS_SENT;
+                } else {
+                    storePendingPayload(appCtx, jsonBody);
                 }
             } catch (Throwable t) {
                 Log.w(TAG, "Manual telemetry failed: " + t.getMessage());
+                WgDiagnosticsLog.recordException("TELEMETRY", "MANUAL_FAIL", t);
             }
             if (callback != null) {
                 callback.onComplete(result);
@@ -272,7 +280,7 @@ public final class WgTelemetryReporter {
             String safeRelease = normalizeToken(androidRelease, "unknown", 32);
             String safeTrigger = normalizeToken(triggerCode, "ANOMALY", 64);
             String safeTier = normalizeToken(continuityTier, "STANDARD_FGS", 48);
-            String sanitizedMd = WgDiagnosticsLog.sanitizeReportText(rawReportMarkdown, MAX_REPORT_CHARS);
+            String sanitizedMd = WgDiagnosticsLog.sanitizeReportText(rawReportMarkdown, MAX_REPORT_UTF8_BYTES);
             if (sanitizedMd.length() < 20) {
                 sanitizedMd = "### WireGuard Plus Diagnostics\n- Trigger: " + safeTrigger;
             }
@@ -413,12 +421,21 @@ public final class WgTelemetryReporter {
             if (postHttpsThroughSocks5(activePort, user, pass, payload)) {
                 return true;
             }
+            if (ctx != null) {
+                Bundle shared = WireGuardManager.fetchSharedHubInfoBundle(ctx);
+                if (shared != null) {
+                    String sUser = shared.getString("socksUser", "");
+                    String sPass = shared.getString("socksPass", "");
+                    if (sPass != null && !sPass.isEmpty() && !sPass.equals(pass)) {
+                        if (postHttpsThroughSocks5(activePort, sUser != null ? sUser : user, sPass, payload)) {
+                            return true;
+                        }
+                    }
+                }
+            }
         }
 
-        // Strict Kill Switch compliance: never bypass directly to ISP when Kill Switch is armed while disconnected
-        if (WireGuardManager.isKillSwitchEnabled(ctx)) {
-            return false;
-        }
+        // Fall back to direct HTTPS so telemetry still reaches the developer when the tunnel itself is failing
         return postHttpsDirect(payload);
     }
 
@@ -427,6 +444,15 @@ public final class WgTelemetryReporter {
             SSLSocketFactory factory = (SSLSocketFactory) SSLSocketFactory.getDefault();
             try (SSLSocket ssl = (SSLSocket) factory.createSocket(sock, FIRESTORE_HOST, 443, true)) {
                 ssl.setSoTimeout(7000);
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    try {
+                        SSLParameters params = ssl.getSSLParameters();
+                        params.setServerNames(Collections.singletonList(new SNIHostName(FIRESTORE_HOST)));
+                        params.setEndpointIdentificationAlgorithm("HTTPS");
+                        ssl.setSSLParameters(params);
+                    } catch (Throwable ignored) {
+                    }
+                }
                 ssl.startHandshake();
                 if (!HttpsURLConnection.getDefaultHostnameVerifier().verify(FIRESTORE_HOST, ssl.getSession())) {
                     throw new SSLHandshakeException("TLS hostname mismatch for Firestore");
@@ -448,12 +474,26 @@ public final class WgTelemetryReporter {
                     String[] parts = statusLine.split("\\s+", 3);
                     if (parts.length >= 2) {
                         int code = Integer.parseInt(parts[1].trim());
-                        return code >= 200 && code < 300;
+                        if (code >= 200 && code < 300) {
+                            return true;
+                        }
+                        StringBuilder errSnippet = new StringBuilder();
+                        String ln;
+                        while ((ln = br.readLine()) != null && errSnippet.length() < 180) {
+                            if (ln.trim().isEmpty()) {
+                                continue;
+                            }
+                            if (ln.startsWith("{") || ln.contains("message")) {
+                                errSnippet.append(ln.trim()).append(' ');
+                            }
+                        }
+                        WgDiagnosticsLog.record("TELEMETRY", "SOCKS_HTTP_ERR", "code=" + code + " " + errSnippet);
                     }
                 }
             }
         } catch (Throwable t) {
             Log.d(TAG, "SOCKS5 Firestore post failed: " + t.getMessage());
+            WgDiagnosticsLog.record("TELEMETRY", "SOCKS_ERR", t.getClass().getSimpleName() + ": " + t.getMessage());
         }
         return false;
     }
@@ -474,17 +514,25 @@ public final class WgTelemetryReporter {
                 os.flush();
             }
             int code = conn.getResponseCode();
-            try (InputStream ignored = (code >= 400 ? conn.getErrorStream() : conn.getInputStream())) {
-                if (ignored != null) {
+            String errBody = "";
+            try (InputStream bodyStream = (code >= 400 ? conn.getErrorStream() : conn.getInputStream())) {
+                if (bodyStream != null) {
                     byte[] tmp = new byte[256];
-                    // Drain briefly for clean keepalive close
-                    ignored.read(tmp);
+                    int r = bodyStream.read(tmp);
+                    if (r > 0 && code >= 400) {
+                        errBody = new String(tmp, 0, r, StandardCharsets.UTF_8);
+                    }
                 }
             } catch (Throwable ignored) {
             }
-            return code >= 200 && code < 300;
+            if (code >= 200 && code < 300) {
+                return true;
+            }
+            WgDiagnosticsLog.record("TELEMETRY", "DIRECT_HTTP_ERR", "code=" + code + " " + errBody);
+            return false;
         } catch (Throwable t) {
             Log.d(TAG, "Direct Firestore post failed: " + t.getMessage());
+            WgDiagnosticsLog.record("TELEMETRY", "DIRECT_ERR", t.getClass().getSimpleName() + ": " + t.getMessage());
             return false;
         } finally {
             if (conn != null) {

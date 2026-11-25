@@ -713,6 +713,13 @@ public final class WireGuardManager {
     private static Runnable sPendingIdleSaverTask = null;
     private static volatile int sConsecutiveHealthFailures = 0;
     private static volatile boolean sFailoverCheckRunning = false;
+    private static volatile ClassLoader sDiagnosticHostClassLoader = null;
+
+    static void setDiagnosticHostClassLoader(ClassLoader cl) {
+        if (cl != null) {
+            sDiagnosticHostClassLoader = cl;
+        }
+    }
 
     private static synchronized ScheduledExecutorService getGuardianExecutor() {
         if (sGuardianExecutor == null || sGuardianExecutor.isShutdown()) {
@@ -3001,7 +3008,7 @@ public final class WireGuardManager {
     private static volatile int sCachedExternalSharedPort = -1;
     private static volatile boolean sSharedHubProbeInFlight = false;
 
-    private static boolean isUsingSharedHub() {
+    static boolean isUsingSharedHub() {
         if (sIsSharedHubOwner || sSharedHubPort <= 0) {
             return false;
         }
@@ -6476,5 +6483,218 @@ public final class WireGuardManager {
 
     private static String safeTrim(String s) {
         return s == null ? "" : s.trim();
+    }
+
+    static Bundle fetchSharedHubInfoBundle(Context context) {
+        if (context == null) {
+            return null;
+        }
+        try {
+            String myPkg = context.getPackageName();
+            if ("org.telegram.wgplus.module".equals(myPkg)) {
+                SharedPreferences sp = context.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
+                Bundle b = new Bundle();
+                b.putInt("port", sp.getInt("port", -1));
+                b.putString("owner", sp.getString("owner", ""));
+                b.putString("socksUser", sp.getString("socksUser", ""));
+                b.putString("socksPass", sp.getString("socksPass", ""));
+                b.putLong("lastHsSec", sp.getLong("lastHsSec", 0L));
+                b.putBoolean("hsHealthy", sp.getBoolean("hsHealthy", false));
+                b.putLong("updatedAt", sp.getLong("updatedAt", 0L));
+                b.putBoolean("daemonOrRootActive",
+                        PrivilegeBridge.isStandaloneDaemonAlive(context)
+                                || PrivilegeBridge.isRootAvailablePassive(context));
+                return b;
+            }
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                return null;
+            }
+            return context.getContentResolver().call(
+                    STATUS_PROVIDER_URI,
+                    KeepaliveStatusProvider.METHOD_QUERY_SHARED_TUNNEL,
+                    null,
+                    null
+            );
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    static String fetchRemoteEngineDiagnosticsBundle(Context context, String moduleApkPath, int port) {
+        if (context == null || port <= 0 || Looper.myLooper() == Looper.getMainLooper()) {
+            return "";
+        }
+        try {
+            NativeBridgeLoader.ensureLoaded(context, moduleApkPath);
+            if (!NativeBridgeLoader.isLoaded()) {
+                return "";
+            }
+            java.util.LinkedHashSet<String> passes = new java.util.LinkedHashSet<>();
+            if (sSharedSocksPass != null && !sSharedSocksPass.isEmpty()) {
+                passes.add(sSharedSocksPass);
+            }
+            Bundle info = fetchSharedHubInfoBundle(context);
+            if (info != null) {
+                String sp = info.getString("socksPass", "");
+                if (sp != null && !sp.isEmpty()) {
+                    passes.add(sp);
+                }
+            }
+            String activePass = getActiveSocksPass(context);
+            if (activePass != null && !activePass.isEmpty()) {
+                passes.add(activePass);
+            }
+            for (String p : passes) {
+                String res = Wgbridge.requestRemoteDiagnosticsBundleJSON(port, p);
+                if (res != null && !res.trim().isEmpty()) {
+                    return res;
+                }
+            }
+        } catch (Throwable ignored) {
+        }
+        return "";
+    }
+
+    static String getDiagnosticsInternalStateSummary(Context context) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("inFg=").append(sAppInForeground)
+                .append(", sharedOwner=").append(sIsSharedHubOwner)
+                .append(", sharedPort=").append(sSharedHubPort)
+                .append(", activeMtu=").append(sActiveTunnelMtu)
+                .append(", mtuDowngraded=").append(sAutoMtuDowngraded)
+                .append(", healthFailures=").append(sConsecutiveHealthFailures)
+                .append(", roamRetries=").append(sRoamRetryCount)
+                .append(", lastBoundPort=").append(sLastBoundPort)
+                .append(", lastBoundHsHealthy=").append(sLastBoundHsHealthy)
+                .append(", lastBoundCalls=").append(sLastBoundRouteCalls);
+        if (context != null) {
+            try {
+                sb.append(", failOver=").append(isAutoFailoverEnabled(context))
+                        .append(", smartKA=").append(isSmartKeepaliveEnabled(context))
+                        .append(", profiles=").append(loadProfiles(context).size());
+            } catch (Throwable ignored) {
+            }
+        }
+        return sb.toString();
+    }
+
+    static String detectInjectionMode(Context context) {
+        if (context == null) {
+            return "Unknown";
+        }
+        String pkg = context.getPackageName();
+        if ("org.telegram.wgplus.module".equals(pkg)) {
+            return "Standalone_Companion";
+        }
+        boolean hasLspatchAsset = false;
+        try {
+            String[] list = context.getAssets().list("lspatch");
+            hasLspatchAsset = list != null && list.length > 0;
+        } catch (Throwable ignored) {
+        }
+        if (hasLspatchAsset) {
+            try (java.io.InputStream is = context.getAssets().open("lspatch/origin.apk")) {
+                if (is != null) {
+                    return "LSPatch_Portable";
+                }
+            } catch (Throwable ignored) {
+            }
+            return "LSPatch_Local";
+        }
+        try {
+            Class.forName("de.robv.android.xposed.XposedBridge", false, WireGuardManager.class.getClassLoader());
+            return "LSPosed";
+        } catch (Throwable ignored) {
+        }
+        return "Hooked_Other";
+    }
+
+    static String inspectTelegramProxyHealthSummary(Context context) {
+        ClassLoader cl = sDiagnosticHostClassLoader != null
+                ? sDiagnosticHostClassLoader
+                : (context != null ? context.getClassLoader() : null);
+        if (cl == null) {
+            return "n/a";
+        }
+        Class<?> connectionsManagerClass = XposedHelpers.findClassIfExists("org.telegram.tgnet.ConnectionsManager", cl);
+        if (connectionsManagerClass == null) {
+            return "n/a (standalone)";
+        }
+        StringBuilder sb = new StringBuilder();
+        try {
+            Class<?> userConfigClass = XposedHelpers.findClassIfExists("org.telegram.messenger.UserConfig", cl);
+            int maxAcc = XposedProxyReflector.resolveMaxAccountCount(cl);
+            int activeCount = 0;
+            for (int acc = 0; acc < maxAcc; acc++) {
+                if (!XposedProxyReflector.isAccountActivated(userConfigClass, acc)) {
+                    continue;
+                }
+                activeCount++;
+                String stLabel = "?";
+                try {
+                    Object inst = XposedHelpers.callStaticMethod(
+                            connectionsManagerClass,
+                            "getInstance",
+                            new Class<?>[]{int.class},
+                            acc
+                    );
+                    if (inst != null) {
+                        int st = (Integer) XposedHelpers.callMethod(inst, "getConnectionState");
+                        if (st == 1) {
+                            stLabel = "Connecting(1)";
+                        } else if (st == 2) {
+                            stLabel = "Updating(2)";
+                        } else if (st == 3) {
+                            stLabel = "Connected(3)";
+                        } else if (st == 4) {
+                            stLabel = "WaitNet(4)";
+                        } else if (st == 5) {
+                            stLabel = "ConnProxy(5)";
+                        } else {
+                            stLabel = String.valueOf(st);
+                        }
+                    }
+                } catch (Throwable ignored) {
+                }
+                if (sb.length() > 0) {
+                    sb.append(", ");
+                }
+                sb.append("acc").append(acc).append("=").append(stLabel);
+            }
+            if (activeCount == 0) {
+                sb.append("no_activated_slots");
+            }
+        } catch (Throwable t) {
+            sb.append("slots_err");
+        }
+        try {
+            Class<?> sharedConfigClass = XposedHelpers.findClassIfExists("org.telegram.messenger.SharedConfig", cl);
+            if (sharedConfigClass != null) {
+                boolean pEnabled = XposedHelpers.getStaticBooleanField(sharedConfigClass, "proxyEnabled");
+                boolean pCalls = XposedHelpers.getStaticBooleanField(sharedConfigClass, "proxyEnabledCalls");
+                Object curProxy = XposedHelpers.getStaticObjectField(sharedConfigClass, "currentProxy");
+                String addr = curProxy != null ? XposedProxyReflector.extractProxyInfoAddress(curProxy) : "none";
+                int port = curProxy != null ? XposedProxyReflector.extractProxyInfoPort(curProxy) : 0;
+                boolean avail = false;
+                boolean checking = false;
+                if (curProxy != null) {
+                    try {
+                        avail = XposedHelpers.getBooleanField(curProxy, "available");
+                        checking = XposedHelpers.getBooleanField(curProxy, "checking");
+                    } catch (Throwable ignored) {
+                    }
+                }
+                String safeAddr = "127.0.0.1".equals(addr) || "none".equals(addr) ? addr : "[NON_LOOPBACK]";
+                sb.append(" | SharedConfig(enabled=").append(pEnabled)
+                        .append(", calls=").append(pCalls)
+                        .append(", addr=").append(safeAddr)
+                        .append(":").append(port)
+                        .append(", avail=").append(avail)
+                        .append(", chk=").append(checking)
+                        .append(")");
+            }
+        } catch (Throwable ignored) {
+        }
+        return sb.toString();
     }
 }

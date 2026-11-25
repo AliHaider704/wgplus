@@ -50,6 +50,7 @@ var (
 	activeRawEp              string
 	activeUseDoH             bool
 	activeKeepAlive          int
+	activeMtu                int
 	activeStartTime          time.Time
 	handshakeInitMu          sync.Mutex
 	lastHandshakeInitAt      time.Time
@@ -478,6 +479,13 @@ func ResetActiveProxyConnections(reason string) int {
 	return len(closers)
 }
 
+func getActiveProxyStreamCount() int {
+	proxyStreamsMu.Lock()
+	n := len(activeProxyStreams)
+	proxyStreamsMu.Unlock()
+	return n
+}
+
 func readActiveTotals(dev *device.Device) (rx uint64, tx uint64, hsSec int64) {
 	rawRx, rawTx, hs := readDeviceCounters(dev)
 	mu.Lock()
@@ -678,6 +686,7 @@ func StartTunnelAdvanced(
 	activeRawEp = endpoint
 	activeUseDoH = useDoH
 	activeKeepAlive = keepAlive
+	activeMtu = effectiveMTU
 	activeStartTime = time.Now()
 	baseRxBytes = 0
 	baseTxBytes = 0
@@ -1047,6 +1056,7 @@ func stopTunnelOnlyLocked() {
 	activeRawEp = ""
 	activeUseDoH = false
 	activeKeepAlive = 0
+	activeMtu = 0
 	baseRxBytes = 0
 	baseTxBytes = 0
 	running = false
@@ -1426,9 +1436,16 @@ func readWgpStatusSnapshot() (isUp bool, hsHealthy bool, hsSec int64, profileSig
 // SendLocalWgp1Command executes a single-line WGP1 loopback control command from Go so Android
 // Main UI Thread callers (such as VoIPService endpoint setup) never trigger StrictMode NetworkOnMainThreadException.
 func SendLocalWgp1Command(muxPort int, socksPass string, command string, timeoutMs int) string {
+	return sendLocalWgp1CommandLimit(muxPort, socksPass, command, timeoutMs, 512)
+}
+
+func sendLocalWgp1CommandLimit(muxPort int, socksPass string, command string, timeoutMs int, maxBytes int) string {
 	cmd := strings.TrimSpace(command)
 	if muxPort < 1 || muxPort > 65535 || cmd == "" {
 		return ""
+	}
+	if maxBytes < 512 {
+		maxBytes = 512
 	}
 	if timeoutMs < 80 {
 		timeoutMs = 80
@@ -1451,21 +1468,40 @@ func SendLocalWgp1Command(muxPort int, socksPass string, command string, timeout
 	if _, err := c.Write([]byte(line)); err != nil {
 		return ""
 	}
-	var out [512]byte
-	n := 0
-	for n < len(out) {
-		rn, rErr := c.Read(out[n : n+1])
+	out := make([]byte, 0, minInt(maxBytes, 2048))
+	chunk := make([]byte, 1024)
+	for len(out) < maxBytes {
+		rn, rErr := c.Read(chunk)
 		if rn > 0 {
-			if out[n] == '\n' {
-				break
+			for i := 0; i < rn && len(out) < maxBytes; i++ {
+				if chunk[i] == '\n' {
+					return strings.TrimSpace(string(out))
+				}
+				out = append(out, chunk[i])
 			}
-			n++
 		}
 		if rErr != nil {
 			break
 		}
 	}
-	return strings.TrimSpace(string(out[:n]))
+	return strings.TrimSpace(string(out))
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// RequestRemoteDiagnosticsBundleJSON queries a live local mux owner over authenticated WGP1
+// for its complete sanitized diagnostic bundle JSON (counters, VoIP relays, and ring buffer).
+func RequestRemoteDiagnosticsBundleJSON(muxPort int, socksPass string) string {
+	resp := sendLocalWgp1CommandLimit(muxPort, socksPass, "DIAG_BUNDLE", 1200, 65536)
+	if !strings.HasPrefix(resp, "OK ") {
+		return ""
+	}
+	return strings.TrimSpace(resp[3:])
 }
 
 // RequestRemoteVoipRelayAddr asks a live local mux owner over WGP1 to bind or reuse a
@@ -1601,6 +1637,8 @@ func handleWgpControlConn(client net.Conn, firstByte byte) {
 		} else {
 			_, _ = fmt.Fprintf(client, "OK %t %t %d\n", isUp, hsHealthy, hsSec)
 		}
+	case "DIAG_BUNDLE":
+		_, _ = client.Write([]byte("OK " + BuildEngineDiagnosticsBundleJSON() + "\n"))
 	case "YIELD":
 		SetKillSwitchArmed(false)
 		StopKillSwitchGuard()

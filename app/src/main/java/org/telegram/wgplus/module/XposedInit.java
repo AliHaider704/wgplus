@@ -168,6 +168,8 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                     }
                     sHostAppContext = appContext;
                     final Context hostAppCtx = appContext;
+                    WireGuardManager.setDiagnosticHostClassLoader(lpparam.classLoader);
+                    WgDiagnosticsLog.installCrashRecorder(hostAppCtx, MODULE_PATH);
 
                                 // Fast lifecycle registration on main thread; zero heavy I/O or ZIP scanning here
                                 registerSmartKeepaliveLifecycle(hostAppCtx, lpparam.classLoader);

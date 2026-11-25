@@ -52,6 +52,10 @@ public class ModuleLauncherActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        WgDiagnosticsLog.installCrashRecorder(
+                this,
+                getApplicationInfo() != null ? getApplicationInfo().sourceDir : null
+        );
         ensureLauncherComponentVisible();
         mLiveRefreshTicker = new Runnable() {
             @Override

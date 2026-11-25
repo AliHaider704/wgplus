@@ -7,7 +7,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"net"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,8 +42,10 @@ var (
 	udpIpv6DialFastFails atomic.Uint64
 	watchdogRecoveries   atomic.Uint64
 
-	diagSecretKVRe = regexp.MustCompile(`(?i)\b(private_?key|preshared_?key|pass(?:word|phrase)?|secret|auth)\s*[:=]\s*([^\s,;]+)`)
-	diagB64KeyRe   = regexp.MustCompile(`\b[A-Za-z0-9+/]{42,44}=\b`)
+	diagSecretKVRe     = regexp.MustCompile(`(?i)\b((?:socks_?|proxy_?|shared_?)?(?:private_?key|preshared_?key|pass(?:word|phrase)?|secret|auth|token))\s*[:=]\s*([^\s,;]+)`)
+	diagB64KeyRe       = regexp.MustCompile(`[A-Za-z0-9+/]{42,44}=`)
+	diagHexKeyRe       = regexp.MustCompile(`\b[0-9a-fA-F]{64}\b`)
+	diagPublicIpPortRe = regexp.MustCompile(`\b\d{1,3}(?:\.\d{1,3}){3}:\d{1,5}\b`)
 )
 
 func sanitizeDiagMessage(msg string) string {
@@ -50,7 +54,14 @@ func sanitizeDiagMessage(msg string) string {
 		return ""
 	}
 	s = diagSecretKVRe.ReplaceAllString(s, "$1=[REDACTED]")
+	s = diagPublicIpPortRe.ReplaceAllStringFunc(s, func(m string) string {
+		if strings.HasPrefix(m, "127.") {
+			return m
+		}
+		return "[IP_PORT_REDACTED]"
+	})
 	s = diagB64KeyRe.ReplaceAllString(s, "[KEY_REDACTED]")
+	s = diagHexKeyRe.ReplaceAllString(s, "[HEX_KEY_REDACTED]")
 	if len(s) > 360 {
 		s = s[:360] + "..."
 	}
@@ -105,6 +116,7 @@ func GetUdpTelemetryJSON() string {
 	payload := map[string]any{
 		"activeTcpConns":       activeTcpConns.Load(),
 		"activeUdpAssocs":      activeUdpAssocs.Load(),
+		"activeProxyStreams":   getActiveProxyStreamCount(),
 		"blockedLocalAttempts": blockedLocalAttempts.Load(),
 		"udpSocketsOpened":     udpSocketsOpened.Load(),
 		"udpPacketsTx":         udpPacketsTx.Load(),
@@ -116,6 +128,121 @@ func GetUdpTelemetryJSON() string {
 		"recoveryEpoch":        GetRecoveryEpoch(),
 	}
 	raw, err := json.Marshal(payload)
+	if err != nil {
+		return "{}"
+	}
+	return string(raw)
+}
+
+// BuildEngineDiagnosticsBundleJSON returns a single privacy-safe JSON snapshot containing live
+// detailed tunnel state (endpoint port only, zero raw peer IP/host), UDP & watchdog counters,
+// VoIP relay packet counters, and the latest Go ring-buffer entries.
+func BuildEngineDiagnosticsBundleJSON() string {
+	mu.Lock()
+	dev := activeDev
+	isUp := running && muxListener != nil && dev != nil
+	ks := muxKillSwitch
+	sPort := muxPort
+	hPort := httpProxyPort
+	baseRx := baseRxBytes
+	baseTx := baseTxBytes
+	epPort := 0
+	if _, portStr, err := net.SplitHostPort(strings.TrimSpace(activeResolvedEp)); err == nil {
+		if p, pErr := strconv.Atoi(portStr); pErr == nil && p > 0 {
+			epPort = p
+		}
+	}
+	mtu := activeMtu
+	keepAlive := activeKeepAlive
+	var uptimeSec int64
+	if isUp && !activeStartTime.IsZero() {
+		uptimeSec = int64(time.Since(activeStartTime).Seconds())
+		if uptimeSec < 0 {
+			uptimeSec = 0
+		}
+	}
+	mu.Unlock()
+
+	var rxBytes, txBytes uint64
+	var hsAge int64 = -1
+	if isUp && dev != nil {
+		rawRx, rawTx, hs := readDeviceCounters(dev)
+		rxBytes = baseRx + rawRx
+		txBytes = baseTx + rawTx
+		if hs > 0 {
+			hsAge = time.Now().Unix() - hs
+			if hsAge < 0 {
+				hsAge = 0
+			}
+		}
+	}
+
+	clientStatsMu.RLock()
+	clients := make([]clientTrafficStat, 0, len(clientStatsMap))
+	for _, ent := range clientStatsMap {
+		clients = append(clients, clientTrafficStat{
+			Label:        ent.label,
+			ActiveConns:  ent.activeConns.Load(),
+			RxBytes:      ent.rxBytes.Load(),
+			TxBytes:      ent.txBytes.Load(),
+			LastSeenUnix: ent.lastSeenUnix.Load(),
+		})
+	}
+	clientStatsMu.RUnlock()
+
+	diagMu.Lock()
+	startIdx := 0
+	if len(diagEntries) > 80 {
+		startIdx = len(diagEntries) - 80
+	}
+	ringCopy := make([]diagEntry, 0, len(diagEntries)-startIdx)
+	for _, entry := range diagEntries[startIdx:] {
+		ringCopy = append(ringCopy, diagEntry{
+			Timestamp: entry.Timestamp,
+			Category:  entry.Category,
+			Code:      entry.Code,
+			Message:   sanitizeDiagMessage(entry.Message),
+		})
+	}
+	diagMu.Unlock()
+
+	bundle := map[string]any{
+		"detailed": map[string]any{
+			"running":              isUp,
+			"killSwitch":           ks,
+			"socksPort":            sPort,
+			"httpPort":             hPort,
+			"rxBytes":              rxBytes,
+			"txBytes":              txBytes,
+			"rxBps":                currentRxBps.Load(),
+			"txBps":                currentTxBps.Load(),
+			"hsAgeSec":             hsAge,
+			"handshakeHealthy":     IsHandshakeHealthy(),
+			"socksAuthRejectCount": GetSocksAuthRejectCount(),
+			"activeMtu":            mtu,
+			"activeKeepAlive":      keepAlive,
+			"uptimeSec":            uptimeSec,
+			"endpointPort":         epPort,
+			"clients":              clients,
+		},
+		"udpTelemetry": map[string]any{
+			"activeTcpConns":       activeTcpConns.Load(),
+			"activeUdpAssocs":      activeUdpAssocs.Load(),
+			"activeProxyStreams":   getActiveProxyStreamCount(),
+			"blockedLocalAttempts": blockedLocalAttempts.Load(),
+			"udpSocketsOpened":     udpSocketsOpened.Load(),
+			"udpPacketsTx":         udpPacketsTx.Load(),
+			"udpPacketsRx":         udpPacketsRx.Load(),
+			"udpGuardDrops":        udpGuardDrops.Load(),
+			"udpSendErrors":        udpSendErrors.Load(),
+			"udpIpv6FastFails":     udpIpv6DialFastFails.Load(),
+			"watchdogRecoveries":   watchdogRecoveries.Load(),
+			"recoveryEpoch":        GetRecoveryEpoch(),
+		},
+		"voipRelays": getVoipRelaysDiagSnapshot(),
+		"ringBuffer": ringCopy,
+	}
+	raw, err := json.Marshal(bundle)
 	if err != nil {
 		return "{}"
 	}

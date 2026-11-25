@@ -381,6 +381,19 @@ func TestWgp1ControlRpcVoipRelayAndStatus(t *testing.T) {
 		t.Fatalf("bidirectional preserved-port UDP relay failed: rn=%d err=%v got=%q", rn, rErr, string(rBuf[:rn]))
 	}
 
+	// Verify local & remote authenticated WGP1 DIAG_BUNDLE returns counters, VoIP relay packets, and ring buffer
+	localBundle := BuildEngineDiagnosticsBundleJSON()
+	if !strings.Contains(localBundle, `"voipRelays"`) || !strings.Contains(localBundle, `"targetPort":3478`) || strings.Contains(localBundle, "10.99.0.1") {
+		t.Fatalf("BuildEngineDiagnosticsBundleJSON missing expected sanitized relay snapshot: %s", localBundle)
+	}
+	if rejected := RequestRemoteDiagnosticsBundleJSON(muxPort, "wrong-pass"); rejected != "" {
+		t.Fatalf("expected wrong password DIAG_BUNDLE to fail, got %q", rejected)
+	}
+	remoteBundle := RequestRemoteDiagnosticsBundleJSON(muxPort, "secret-wgp1-pass")
+	if !strings.Contains(remoteBundle, `"udpTxPkts":1`) || !strings.Contains(remoteBundle, `"udpRxPkts":1`) || !strings.Contains(remoteBundle, `"ringBuffer"`) {
+		t.Fatalf("RequestRemoteDiagnosticsBundleJSON missing relay counters or ring buffer: %s", remoteBundle)
+	}
+
 	// Normal SOCKS5 (0x05) handshake on same muxPort still succeeds after first-byte peek
 	socksConn, sErr := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", muxPort), 2*time.Second)
 	if sErr != nil {

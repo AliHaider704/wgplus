@@ -928,6 +928,29 @@ public class WgPlusFeatureSuiteTest {
         }
     }
 
+    @Test
+    public void testDiagnosticsUtf8HeadTailTruncationAndRedaction() {
+        StringBuilder huge = new StringBuilder();
+        huge.append("### WireGuard Plus Diagnostics (Android)\n");
+        huge.append("- **Device / OS**: `samsung SM-S918B` (Android 17)\n");
+        huge.append("- **Power Policy**: battOptIgnored=`true`\n");
+        huge.append("- **Shared Pass Leak**: socksPass=super-secret-xyz Endpoint=198.51.100.77:2408\n\n");
+        for (int i = 0; i < 650; i++) {
+            huge.append("[2026-11-25T10:00:00Z] [OLD/EVENT] تقرير قديم رقم ").append(i).append(" padded padding event line.\n");
+        }
+        huge.append("[2026-11-25T12:40:00Z] [LATEST/CRASH_TAIL] newest_tail_marker_9911 target=91.108.9.58:1400\n");
+
+        String out = WgDiagnosticsLog.sanitizeReportText(huge.toString(), 15800);
+        int utf8Len = out.getBytes(StandardCharsets.UTF_8).length;
+        assertTrue("Truncated report UTF-8 size must stay <= 15800 bytes, got " + utf8Len, utf8Len <= 15800);
+        assertTrue("Header must be preserved", out.contains("### WireGuard Plus Diagnostics (Android)"));
+        assertTrue("Newest tail event must be preserved", out.contains("newest_tail_marker_9911"));
+        assertTrue("Omitted marker must be inserted", out.contains("[older events omitted]"));
+        assertFalse("Secret must be redacted", out.contains("super-secret-xyz"));
+        assertFalse("Public endpoint must be redacted", out.contains("198.51.100.77"));
+        assertFalse("Relay target IP:port must be redacted", out.contains("91.108.9.58"));
+    }
+
     private static double contrastRatio(int rgb1, int rgb2) {
         double l1 = relativeLuminance(rgb1);
         double l2 = relativeLuminance(rgb2);

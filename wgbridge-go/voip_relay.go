@@ -6,6 +6,7 @@ import (
 	"hash/fnv"
 	"net"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -52,6 +53,11 @@ type voipRelay struct {
 	statEnt         *clientStatEntry
 	lastActive      atomic.Int64
 	lastRetErrNano  atomic.Int64
+	udpPktsTx       atomic.Uint64
+	udpPktsRx       atomic.Uint64
+	udpErrs         atomic.Uint64
+	tcpConns        atomic.Uint64
+	createdAtUnix   int64
 	closed          atomic.Bool
 	closeOnce       sync.Once
 
@@ -255,8 +261,9 @@ func startVoipEndpointRelayInternal(
 		dialer:       dialer,
 		udpLn:        udpLn,
 		tcpLn:        tcpLn,
-		statEnt:      trackClientConnStart(voipRelayClientID),
-		sessions:     make(map[string]*voipRelayUdpSession),
+		statEnt:       trackClientConnStart(voipRelayClientID),
+		createdAtUnix: nowNano / int64(time.Second),
+		sessions:      make(map[string]*voipRelayUdpSession),
 		dnsCache:     make(map[string]udpDnsCacheEntry),
 	}
 	r.lastActive.Store(nowNano)
@@ -453,9 +460,11 @@ func (r *voipRelay) startReturnPump(s *voipRelayUdpSession) {
 				nowNano := time.Now().UnixNano()
 				s.lastActive.Store(nowNano)
 				r.lastActive.Store(nowNano)
+				r.udpPktsRx.Add(1)
 				udpPacketsRx.Add(1)
 				recordClientRx(r.statEnt, rn)
 			} else {
+				r.udpErrs.Add(1)
 				udpSendErrors.Add(1)
 				nowNano := time.Now().UnixNano()
 				prev := r.lastRetErrNano.Load()
@@ -497,12 +506,14 @@ func (r *voipRelay) runUdpLoop() {
 
 		targetIP, resErr := resolveUdpTargetIP(liveCtx, liveDialer, r.targetHost, r.dnsCache, &r.dnsMu)
 		if resErr != nil {
+			r.udpErrs.Add(1)
 			udpSendErrors.Add(1)
 			continue
 		}
 
 		sess, sErr := r.getOrCreateUdpSession(srcAddr, targetIP, liveDialer, nowNano, sessionsCap)
 		if sErr != nil {
+			r.udpErrs.Add(1)
 			udpSendErrors.Add(1)
 			continue
 		}
@@ -522,13 +533,16 @@ func (r *voipRelay) runUdpLoop() {
 			liveCtx, liveDialer, _ = r.getLiveDialer()
 			if freshSess, fErr := r.getOrCreateUdpSession(srcAddr, targetIP, liveDialer, nowNano, sessionsCap); fErr == nil {
 				if nw2, wErr2 := freshSess.pConn.WriteTo(buf[:n], dstAddr); wErr2 == nil {
+					r.udpPktsTx.Add(1)
 					udpPacketsTx.Add(1)
 					recordClientTx(r.statEnt, nw2)
 					continue
 				}
 			}
+			r.udpErrs.Add(1)
 			udpSendErrors.Add(1)
 		} else {
+			r.udpPktsTx.Add(1)
 			udpPacketsTx.Add(1)
 			recordClientTx(r.statEnt, nw)
 		}
@@ -629,9 +643,72 @@ func (r *voipRelay) runTcpAcceptLoop() {
 		if err != nil {
 			return
 		}
+		r.tcpConns.Add(1)
 		tuneLocalTcpSocket(c)
 		go r.handleTcpClient(c)
 	}
+}
+
+type voipRelayDiagStat struct {
+	LocalAddr   string `json:"localAddr"`
+	TargetPort  int    `json:"targetPort"`
+	UdpSessions int    `json:"udpSessions"`
+	UdpTxPkts   uint64 `json:"udpTxPkts"`
+	UdpRxPkts   uint64 `json:"udpRxPkts"`
+	UdpErrs     uint64 `json:"udpErrs"`
+	TcpConns    uint64 `json:"tcpConns"`
+	AgeSec      int64  `json:"ageSec"`
+	IdleSec     int64  `json:"idleSec"`
+	TcpReady    bool   `json:"tcpReady"`
+}
+
+func getVoipRelaysDiagSnapshot() []voipRelayDiagStat {
+	voipRelaysMu.Lock()
+	relays := make([]*voipRelay, 0, len(voipRelays))
+	for _, r := range voipRelays {
+		if r != nil && !r.closed.Load() {
+			relays = append(relays, r)
+		}
+	}
+	voipRelaysMu.Unlock()
+
+	now := time.Now()
+	nowUnix := now.Unix()
+	nowNano := now.UnixNano()
+	out := make([]voipRelayDiagStat, 0, len(relays))
+	for _, r := range relays {
+		r.sessMu.RLock()
+		sessCnt := len(r.sessions)
+		r.sessMu.RUnlock()
+
+		age := nowUnix - r.createdAtUnix
+		if r.createdAtUnix <= 0 || age < 0 {
+			age = 0
+		}
+		idle := (nowNano - r.lastActive.Load()) / int64(time.Second)
+		if idle < 0 {
+			idle = 0
+		}
+		out = append(out, voipRelayDiagStat{
+			LocalAddr:   r.localAddrString(),
+			TargetPort:  r.targetPort,
+			UdpSessions: sessCnt,
+			UdpTxPkts:   r.udpPktsTx.Load(),
+			UdpRxPkts:   r.udpPktsRx.Load(),
+			UdpErrs:     r.udpErrs.Load(),
+			TcpConns:    r.tcpConns.Load(),
+			AgeSec:      age,
+			IdleSec:     idle,
+			TcpReady:    r.tcpLn != nil,
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].TargetPort != out[j].TargetPort {
+			return out[i].TargetPort < out[j].TargetPort
+		}
+		return out[i].LocalAddr < out[j].LocalAddr
+	})
+	return out
 }
 
 func (r *voipRelay) handleTcpClient(client net.Conn) {
