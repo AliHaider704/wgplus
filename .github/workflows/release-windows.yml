@@ -109,13 +109,14 @@ jobs:
               "dist\WireGuardPlus-Windows-x64.exe" `
               "dist\WireGuardPlus-Windows-x64-Portable.zip" `
               "dist\SHA256SUMS-windows.txt" `
-              --generate-notes
+              --notes-file "docs\release-notes\$tag.md"
             if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
             exit 0
           }
 
           $parsed = $releaseJson | ConvertFrom-Json
           $hasExe = @($parsed.assets | Where-Object { $_.name -eq "WireGuardPlus-Windows-x64.exe" }).Count -gt 0
+          if (Test-Path "docs\release-notes\$tag.md") { & gh release edit $tag --notes-file "docs\release-notes\$tag.md" }
           if ($hasExe) {
             Write-Host "Release $tag already contains WireGuardPlus-Windows-x64.exe; skipping asset overwrite to preserve unified SHA256SUMS.txt."
             exit 0
