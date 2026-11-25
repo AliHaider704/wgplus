@@ -32,9 +32,9 @@
 |----------|----------|--------------|-------|
 | **Windows Desktop (Single `.exe`, `17.83 MB`)** | [`WireGuardPlus-Windows-x64.exe`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64.exe) | Windows 10/11 x64 | Single executable, DPAPI vault, System Tray, isolated Telegram call routing |
 | **Windows Portable (`.zip`, `6.87 MB`)** | [`WireGuardPlus-Windows-x64-Portable.zip`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64-Portable.zip) | Windows 10/11 x64, USB/folder | Includes `portable.flag`, zero AppData writes |
-| **Android ARM64 (`5.05 MB`, Recommended)** | [`WireGuardPlus-2.0.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-arm64-v8a.apk) | Android 5.0+ (arm64-v8a) | Rootless via LSPatch or Rooted via LSPosed / Vector |
-| **Android ARMv7 (`5.02 MB`)** | [`WireGuardPlus-2.0.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-armeabi-v7a.apk) | Android 5.0+ (armeabi-v7a) | 32-bit Android devices |
-| **Android Universal (`11.29 MB`)** | [`WireGuardPlus-2.0.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0.apk) | Android 5.0+ (arm64 + armv7a) | Universal fallback + auto-updater compatible |
+| **Android ARM64 (`5.25 MB`, Recommended)** | [`WireGuardPlus-2.0.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-arm64-v8a.apk) | Android 5.0+ (arm64-v8a) | Rootless via LSPatch or Rooted via LSPosed / Vector |
+| **Android ARMv7 (`5.23 MB`)** | [`WireGuardPlus-2.0.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-armeabi-v7a.apk) | Android 5.0+ (armeabi-v7a) | 32-bit Android devices |
+| **Android Universal (`11.53 MB`)** | [`WireGuardPlus-2.0.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0.apk) | Android 5.0+ (arm64 + armv7a) | Universal fallback + auto-updater compatible |
 
 Verify any download against [`SHA256SUMS.txt`](https://github.com/AliHaider704/wgplus/releases/latest/download/SHA256SUMS.txt), watch the [Walkthrough Video (`MP4`)](https://github.com/AliHaider704/wgplus/releases/download/v1.7.3/WireGuardPlus-Windows-Walkthrough.mp4), or join our [Official Telegram Channel](https://t.me/wgplus_official).
 
@@ -146,7 +146,7 @@ Requires **Windows 10/11 (x64)** (WebView2 runtime is pre-installed on Windows 1
 
 Requires **Android 5.0+** (**Android 11+** for one-time silent Wireless Debugging activation).
 
-1. Download [`WireGuardPlus-2.0.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-arm64-v8a.apk) (`5.05 MB`), [`WireGuardPlus-2.0.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-armeabi-v7a.apk) (`5.02 MB`), or [`WireGuardPlus-2.0.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0.apk) (universal).
+1. Download [`WireGuardPlus-2.0.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-arm64-v8a.apk) (`5.25 MB`), [`WireGuardPlus-2.0.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-armeabi-v7a.apk) (`5.23 MB`), or [`WireGuardPlus-2.0.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0.apk) (universal).
 2. **Rootless (LSPatch):** Patch any supported client (**Telegram**, **Telegram Plus**, **Nagram**, **AyuGram**, **Telegraph**, **Telegram Gold**, **Telegram X**) using [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch) in **Portable** (embed WireGuard Plus + any other modules such as TeleVip) or **Local** mode, then install and open **WireGuard Plus** for one-time 6-digit Wireless Debugging pairing.
    - **Rooted (LSPosed / Vector):** Enable **WireGuard Plus** in **LSPosed / Vector -> Modules**, scope your Telegram client(s), reopen Telegram, and grant Root in WireGuard Plus for silent continuity.
 3. Open **Telegram -> Settings -> Data and Storage -> Proxy Settings -> WireGuard**, import your `.conf` / QR screenshot / clipboard, tap **Connect**, and run **Verify route & calls**.
