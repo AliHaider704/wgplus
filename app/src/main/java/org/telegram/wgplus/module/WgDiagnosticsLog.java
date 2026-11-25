@@ -618,10 +618,53 @@ public final class WgDiagnosticsLog {
         return String.valueOf(b);
     }
 
+    static String formatInstancesMatrixMarkdown(String instancesJson) {
+        if (instancesJson == null || instancesJson.trim().isEmpty() || "[]".equals(instancesJson.trim())) {
+            return "";
+        }
+        try {
+            JSONArray arr = new JSONArray(instancesJson);
+            if (arr.length() == 0) {
+                return "";
+            }
+            StringBuilder out = new StringBuilder("\n#### Per-App Telegram Instance Matrix\n");
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject o = arr.optJSONObject(i);
+                if (o == null) continue;
+                String pkg = sanitize(o.optString("pkg", "?"));
+                String ver = sanitize(o.optString("ver", "?"));
+                String mode = sanitize(o.optString("mode", "?"));
+                String role = sanitize(o.optString("role", "?"));
+                boolean running = o.optBoolean("running", false);
+                int port = o.optInt("port", -1);
+                long ageSec = o.optLong("ageSec", -1L);
+                String tgState = sanitize(o.optString("tgState", ""));
+                String lastEv = sanitize(o.optString("lastEvent", ""));
+                out.append("- `").append(pkg).append("` | ver=`").append(ver)
+                        .append("` | mode=`").append(mode)
+                        .append("` | role=`").append(role)
+                        .append("` | up=`").append(running)
+                        .append("` | port=`").append(port)
+                        .append("` | age=`").append(ageSec).append("s`");
+                if (!tgState.isEmpty()) {
+                    out.append(" | tg=`").append(tgState).append("`");
+                }
+                if (!lastEv.isEmpty()) {
+                    out.append(" | ev=`").append(lastEv).append("`");
+                }
+                out.append("\n");
+            }
+            return out.toString();
+        } catch (Throwable ignored) {
+            return "";
+        }
+    }
+
     private static void appendClientsAndHooksSummary(StringBuilder sb, Context ctx, boolean inModule) {
         try {
             List<String> installed = ContinuityBridgeManager.getInstalledTargetPackages(ctx);
             sb.append("- **Installed Clients**: `").append(installed.isEmpty() ? "none" : String.join(", ", installed)).append("`\n");
+            String instancesJson = "";
             if (!inModule) {
                 Bundle hook = ctx.getContentResolver().call(
                         Uri.parse("content://" + KeepaliveStatusProvider.AUTHORITY),
@@ -635,8 +678,13 @@ public final class WgDiagnosticsLog {
                     long ageSec = lastMs > 0L ? Math.max(0L, (System.currentTimeMillis() - lastMs) / 1000L) : -1L;
                     sb.append("- **Hook Telemetry**: lastPkg=`").append(lastPkg.isEmpty() ? "none" : lastPkg)
                             .append("`, lastSeenAgeSec=`").append(ageSec).append("`\n");
+                    instancesJson = hook.getString(KeepaliveStatusProvider.RESULT_INSTANCES_JSON, "");
                 }
             } else {
+                Bundle hook = KeepaliveStatusProvider.readHookTelemetryBundle(ctx);
+                if (hook != null) {
+                    instancesJson = hook.getString(KeepaliveStatusProvider.RESULT_INSTANCES_JSON, "");
+                }
                 Bundle auto = ctx.getContentResolver().call(
                         Uri.parse("content://" + KeepaliveStatusProvider.AUTHORITY),
                         KeepaliveStatusProvider.METHOD_AUTOMATION_STATUS,
@@ -649,8 +697,18 @@ public final class WgDiagnosticsLog {
                         JSONObject j = new JSONObject(raw);
                         JSONArray hp = j.optJSONArray("hookPackages");
                         sb.append("- **Hooked Packages**: `").append(hp != null ? hp.toString() : "[]").append("`\n");
+                        if (instancesJson.isEmpty()) {
+                            JSONArray inst = j.optJSONArray("hookInstances");
+                            if (inst != null) {
+                                instancesJson = inst.toString();
+                            }
+                        }
                     }
                 }
+            }
+            String matrixMd = formatInstancesMatrixMarkdown(instancesJson);
+            if (!matrixMd.isEmpty()) {
+                sb.append(matrixMd);
             }
         } catch (Throwable ignored) {
         }

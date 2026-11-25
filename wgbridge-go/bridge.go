@@ -1260,21 +1260,37 @@ func recordSocksAuthReject(reason string) {
 	}
 }
 
-func readSocks5HandshakeAndReq(client net.Conn) (cmd byte, host string, dstPort uint16, reqParsed bool) {
+func sanitizeAuthSubLabel(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	var b strings.Builder
+	b.Grow(len(raw))
+	for i := 0; i < len(raw) && b.Len() < 64; i++ {
+		c := raw[i]
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' || c == '#' {
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
+func readSocks5HandshakeAndReqWithLabel(client net.Conn) (cmd byte, host string, dstPort uint16, authSubLabel string, reqParsed bool) {
 	// 1. Greeting: VER, NMETHODS, METHODS...
 	hdr := make([]byte, 2)
 	if _, err := io.ReadFull(client, hdr); err != nil {
-		return 0, "", 0, false
+		return 0, "", 0, "", false
 	}
 	if hdr[0] != 0x05 {
-		return 0, "", 0, false
+		return 0, "", 0, "", false
 	}
 	nMethods := int(hdr[1])
 	var methods []byte
 	if nMethods > 0 {
 		methods = make([]byte, nMethods)
 		if _, err := io.ReadFull(client, methods); err != nil {
-			return 0, "", 0, false
+			return 0, "", 0, "", false
 		}
 	}
 
@@ -1282,7 +1298,7 @@ func readSocks5HandshakeAndReq(client net.Conn) (cmd byte, host string, dstPort 
 	if expectedUser == "" && expectedPass == "" {
 		// Reply: SOCKS5, NO AUTHENTICATION REQUIRED (0x00)
 		if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
-			return 0, "", 0, false
+			return 0, "", 0, "", false
 		}
 	} else {
 		hasUserPass := false
@@ -1295,68 +1311,82 @@ func readSocks5HandshakeAndReq(client net.Conn) (cmd byte, host string, dstPort 
 		if !hasUserPass {
 			_, _ = client.Write([]byte{0x05, 0xFF})
 			recordSocksAuthReject("client omitted user/pass method 0x02")
-			return 0, "", 0, false
+			return 0, "", 0, "", false
 		}
 		if _, err := client.Write([]byte{0x05, 0x02}); err != nil {
-			return 0, "", 0, false
+			return 0, "", 0, "", false
 		}
 		// RFC 1929 subnegotiation: VER(1) | ULEN(1) | UNAME | PLEN(1) | PASSWD
 		var subHdr [2]byte
 		if _, err := io.ReadFull(client, subHdr[:]); err != nil || subHdr[0] != 0x01 {
 			_, _ = client.Write([]byte{0x01, 0x01})
 			recordSocksAuthReject("invalid rfc1929 subnegotiation header")
-			return 0, "", 0, false
+			return 0, "", 0, "", false
 		}
 		uBuf := make([]byte, int(subHdr[1]))
 		if len(uBuf) > 0 {
 			if _, err := io.ReadFull(client, uBuf); err != nil {
 				_, _ = client.Write([]byte{0x01, 0x01})
 				recordSocksAuthReject("truncated rfc1929 username")
-				return 0, "", 0, false
+				return 0, "", 0, "", false
 			}
 		}
 		var pLen [1]byte
 		if _, err := io.ReadFull(client, pLen[:]); err != nil {
 			_, _ = client.Write([]byte{0x01, 0x01})
 			recordSocksAuthReject("missing rfc1929 password length")
-			return 0, "", 0, false
+			return 0, "", 0, "", false
 		}
 		pBuf := make([]byte, int(pLen[0]))
 		if len(pBuf) > 0 {
 			if _, err := io.ReadFull(client, pBuf); err != nil {
 				_, _ = client.Write([]byte{0x01, 0x01})
 				recordSocksAuthReject("truncated rfc1929 password")
-				return 0, "", 0, false
+				return 0, "", 0, "", false
 			}
 		}
-		uOk := subtle.ConstantTimeCompare(uBuf, []byte(expectedUser))
+		uOk := 0
+		expLen := len(expectedUser)
+		if len(uBuf) == expLen {
+			uOk = subtle.ConstantTimeCompare(uBuf, []byte(expectedUser))
+		} else if expectedUser != "" && len(uBuf) > expLen+1 && uBuf[expLen] == ':' {
+			if subtle.ConstantTimeCompare(uBuf[:expLen], []byte(expectedUser)) == 1 {
+				uOk = 1
+				authSubLabel = sanitizeAuthSubLabel(string(uBuf[expLen+1:]))
+			}
+		}
 		pOk := subtle.ConstantTimeCompare(pBuf, []byte(expectedPass))
 		if (uOk & pOk) != 1 {
 			_, _ = client.Write([]byte{0x01, 0x01})
 			recordSocksAuthReject("username/password mismatch")
-			return 0, "", 0, false
+			return 0, "", 0, "", false
 		}
 		if _, err := client.Write([]byte{0x01, 0x00}); err != nil {
-			return 0, "", 0, false
+			return 0, "", 0, "", false
 		}
 	}
 
 	// 2. Request: VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT
 	reqHdr := make([]byte, 4)
 	if _, err := io.ReadFull(client, reqHdr); err != nil {
-		return 0, "", 0, false
+		return 0, "", 0, "", false
 	}
 	if reqHdr[0] != 0x05 {
-		return 0, "", 0, false
+		return 0, "", 0, "", false
 	}
 
 	cmd = reqHdr[1]
 	host, dstPort, err := readSocks5Target(client, reqHdr[3])
 	if err != nil {
 		_, _ = client.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return 0, "", 0, false
+		return 0, "", 0, "", false
 	}
-	return cmd, host, dstPort, true
+	return cmd, host, dstPort, authSubLabel, true
+}
+
+func readSocks5HandshakeAndReq(client net.Conn) (cmd byte, host string, dstPort uint16, reqParsed bool) {
+	cmd, host, dstPort, _, reqParsed = readSocks5HandshakeAndReqWithLabel(client)
+	return
 }
 
 func dispatchSocks5Cmd(ctx context.Context, client net.Conn, dialer udpDialer, cmd byte, host string, dstPort uint16) {
@@ -1378,11 +1408,15 @@ func handleSocks5Client(ctx context.Context, client net.Conn, dialer udpDialer) 
 	defer client.Close()
 	_ = client.SetDeadline(time.Now().Add(20 * time.Second))
 
-	cmd, host, dstPort, ok := readSocks5HandshakeAndReq(client)
+	cmd, host, dstPort, authSubLabel, ok := readSocks5HandshakeAndReqWithLabel(client)
 	if !ok {
 		return
 	}
-	dispatchSocks5Cmd(ctx, client, dialer, cmd, host, dstPort)
+	label := "local-client"
+	if authSubLabel != "" {
+		label = authSubLabel
+	}
+	dispatchSocks5CmdWithLabel(ctx, client, dialer, cmd, host, dstPort, label)
 }
 
 type prependByteConn struct {
@@ -1672,9 +1706,12 @@ func handleMuxConn(client net.Conn) {
 	wrapped := &prependByteConn{Conn: client, firstByte: first[0]}
 	_ = wrapped.SetDeadline(time.Now().Add(20 * time.Second))
 
-	cmd, host, dstPort, ok := readSocks5HandshakeAndReq(wrapped)
+	cmd, host, dstPort, authSubLabel, ok := readSocks5HandshakeAndReqWithLabel(wrapped)
 	if !ok {
 		return
+	}
+	if authSubLabel != "" && (clientLabel == "android" || clientLabel == "local-client" || clientLabel == "") {
+		clientLabel = authSubLabel
 	}
 
 	devCtx, dialer, allowed := awaitMuxRouteReady(2800 * time.Millisecond)

@@ -2,6 +2,7 @@ package guard
 
 import (
 	"fmt"
+	"hash/fnv"
 	"net"
 	"os"
 	"path/filepath"
@@ -691,6 +692,25 @@ func (pg *ProcessGuard) isAllowedProcess(pid uint32, exePath, baseName string) b
 	return false
 }
 
+// ClientLabelForExe returns a stable per-instance label distinguishing multiple
+// portable Telegram binaries by hashing their cleaned executable path.
+func ClientLabelForExe(exePath, baseName string) string {
+	trimmed := strings.TrimSpace(exePath)
+	if trimmed != "" {
+		clean := strings.ToLower(filepath.Clean(trimmed))
+		base := strings.ToLower(strings.TrimSpace(filepath.Base(clean)))
+		if base == "" || base == "." {
+			base = strings.ToLower(strings.TrimSpace(baseName))
+		}
+		if base != "" {
+			h := fnv.New32a()
+			_, _ = h.Write([]byte(clean))
+			return fmt.Sprintf("%s#%08x", base, h.Sum32())
+		}
+	}
+	return strings.ToLower(strings.TrimSpace(baseName))
+}
+
 // CheckTcpClient inspects an incoming loopback TCP peer (for SOCKS5 / HTTP CONNECT)
 // and returns a client label and whether it is allowed to use the tunnel.
 func (pg *ProcessGuard) CheckTcpClient(remoteAddr net.Addr) (string, bool) {
@@ -721,7 +741,7 @@ func (pg *ProcessGuard) CheckTcpClient(remoteAddr net.Addr) (string, bool) {
 	}
 
 	exePath, baseName := pg.lookupProcessInfo(pid)
-	label := baseName
+	label := ClientLabelForExe(exePath, baseName)
 	if pid == pg.selfPid {
 		label = "WireGuardPlus-Probe"
 	}
@@ -780,12 +800,13 @@ func (pg *ProcessGuard) CheckUdpPeer(remoteAddr *net.UDPAddr, expectedLabel stri
 		return false
 	}
 	if pid != pg.selfPid && expectedLabel != "" && expectedLabel != "local-client" && expectedLabel != "unknown" {
-		if !strings.EqualFold(baseName, expectedLabel) {
+		instLabel := ClientLabelForExe(exePath, baseName)
+		if !strings.EqualFold(instLabel, expectedLabel) && !strings.EqualFold(baseName, expectedLabel) {
 			pg.recordEvent(GuardEvent{
 				TimestampUnix: time.Now().Unix(),
 				Action:        "block",
 				Protocol:      "UDP",
-				ClientLabel:   baseName,
+				ClientLabel:   instLabel,
 				ExePath:       exePath,
 				PID:           pid,
 				PeerPort:      remoteAddr.Port,

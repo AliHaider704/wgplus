@@ -951,6 +951,41 @@ public class WgPlusFeatureSuiteTest {
         assertFalse("Relay target IP:port must be redacted", out.contains("91.108.9.58"));
     }
 
+    @Test
+    public void testPerAppTelegramInstanceMatrixFormattingAndRedaction() throws Exception {
+        org.json.JSONArray arr = new org.json.JSONArray();
+        org.json.JSONObject plus = new org.json.JSONObject();
+        plus.put("pkg", "org.telegram.plus");
+        plus.put("ver", "12.8.1.0");
+        plus.put("mode", "LSPatch_Local");
+        plus.put("role", "shared_owner");
+        plus.put("running", true);
+        plus.put("port", 48729);
+        plus.put("ageSec", 4L);
+        plus.put("tgState", "acc0=Connected(3) | socksPass=leak123");
+        org.json.JSONObject web = new org.json.JSONObject();
+        web.put("pkg", "org.telegram.messenger.web");
+        web.put("ver", "13.3.1");
+        web.put("mode", "LSPatch_Portable");
+        web.put("role", "shared_client");
+        web.put("running", true);
+        web.put("port", 48729);
+        web.put("ageSec", 12L);
+        web.put("lastEvent", "[VOIP_RELAY] 162.159.193.10:2408 -> 127.0.0.1:48729");
+        arr.put(plus);
+        arr.put(web);
+
+        String md = WgDiagnosticsLog.formatInstancesMatrixMarkdown(arr.toString());
+        assertTrue(md.contains("Per-App Telegram Instance Matrix"));
+        assertTrue(md.contains("`org.telegram.plus`"));
+        assertTrue(md.contains("`org.telegram.messenger.web`"));
+        assertTrue(md.contains("role=`shared_owner`"));
+        assertTrue(md.contains("role=`shared_client`"));
+        assertTrue(md.contains("127.0.0.1:48729"));
+        assertFalse("Secret must be redacted from instance matrix", md.contains("leak123"));
+        assertFalse("Public endpoint must be redacted from instance matrix", md.contains("162.159.193.10"));
+    }
+
     private static double contrastRatio(int rgb1, int rgb2) {
         double l1 = relativeLuminance(rgb1);
         double l2 = relativeLuminance(rgb2);

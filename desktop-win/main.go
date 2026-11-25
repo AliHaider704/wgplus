@@ -42,6 +42,12 @@ func main() {
 	if confArg != "" {
 		app.SetPendingImportPath(confArg)
 	}
+	defer func() {
+		if r := recover(); r != nil {
+			app.recordRecoveredPanic("wails_main", r)
+			panic(r)
+		}
+	}()
 
 	if selfCheck {
 		out, scErr := app.RunSelfCheck()

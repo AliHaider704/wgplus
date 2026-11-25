@@ -79,12 +79,14 @@ public class KeepaliveStatusProvider extends ContentProvider {
     public static final String RESULT_HOOK_PKG = "hook_pkg";
     public static final String RESULT_HOOK_LAST_MS = "hook_last_ms";
     public static final String RESULT_HYGIENE_REQ_MS = "hygiene_req_ms";
+    public static final String RESULT_INSTANCES_JSON = "instances_json";
     public static final String RESULT_JSON = "json";
 
     private static final String HOOK_PREFS = "wg_plus_hook_telemetry";
     private static final String KEY_HOOK_PKG = "hook_last_pkg";
     private static final String KEY_HOOK_LAST_MS = "hook_last_epoch_ms";
     private static final String KEY_HOOK_PACKAGES_JSON = "hook_packages_json";
+    private static final String KEY_INSTANCE_PREFIX = "inst_";
     private static final String KEY_HYGIENE_REQ_MS = "hygiene_req_ms";
     private static final long VISIBILITY_GRANT_INTERVAL_MS = 15_000L;
     private static volatile long sLastVisibilityGrantMs = 0L;
@@ -139,6 +141,10 @@ public class KeepaliveStatusProvider extends ContentProvider {
     }
 
     public static void recordHookHeartbeatLocal(Context ctx, String pkg) {
+        recordHookHeartbeatLocal(ctx, pkg, null);
+    }
+
+    public static void recordHookHeartbeatLocal(Context ctx, String pkg, Bundle extras) {
         if (ctx == null || pkg == null || pkg.isEmpty()) {
             return;
         }
@@ -157,10 +163,39 @@ public class KeepaliveStatusProvider extends ContentProvider {
             map.put(safe, now);
         } catch (Throwable ignored) {
         }
+        JSONObject inst = new JSONObject();
+        try {
+            String prevRaw = prefs.getString(KEY_INSTANCE_PREFIX + safe, "");
+            if (!prevRaw.isEmpty()) {
+                inst = new JSONObject(prevRaw);
+            }
+        } catch (Throwable ignored) {
+        }
+        try {
+            inst.put("pkg", safe);
+            inst.put("ts", now);
+            if (extras != null) {
+                String ver = extras.getString("host_ver", "");
+                if (!ver.isEmpty()) inst.put("ver", ver);
+                String mode = extras.getString("mode", "");
+                if (!mode.isEmpty()) inst.put("mode", mode);
+                String role = extras.getString("role", "");
+                if (!role.isEmpty()) inst.put("role", role);
+                if (extras.containsKey("port")) inst.put("port", extras.getInt("port", -1));
+                if (extras.containsKey("running")) inst.put("running", extras.getBoolean("running", false));
+                if (extras.containsKey("shared")) inst.put("shared", extras.getBoolean("shared", false));
+                String tgState = extras.getString("tg_state", "");
+                if (!tgState.isEmpty()) inst.put("tgState", tgState);
+                String lastEv = extras.getString("last_event", "");
+                if (!lastEv.isEmpty()) inst.put("lastEvent", lastEv);
+            }
+        } catch (Throwable ignored) {
+        }
         prefs.edit()
                 .putString(KEY_HOOK_PKG, safe)
                 .putLong(KEY_HOOK_LAST_MS, now)
                 .putString(KEY_HOOK_PACKAGES_JSON, map.toString())
+                .putString(KEY_INSTANCE_PREFIX + safe, inst.toString())
                 .apply();
     }
 
@@ -180,6 +215,32 @@ public class KeepaliveStatusProvider extends ContentProvider {
         b.putString(RESULT_HOOK_PKG, p.getString(KEY_HOOK_PKG, ""));
         b.putLong(RESULT_HOOK_LAST_MS, p.getLong(KEY_HOOK_LAST_MS, 0L));
         b.putLong(RESULT_HYGIENE_REQ_MS, p.getLong(KEY_HYGIENE_REQ_MS, 0L));
+        try {
+            long now = System.currentTimeMillis();
+            java.util.TreeMap<String, JSONObject> sorted = new java.util.TreeMap<>();
+            java.util.Map<String, ?> all = p.getAll();
+            if (all != null) {
+                for (java.util.Map.Entry<String, ?> e : all.entrySet()) {
+                    if (e.getKey() != null && e.getKey().startsWith(KEY_INSTANCE_PREFIX) && e.getValue() instanceof String) {
+                        try {
+                            JSONObject o = new JSONObject((String) e.getValue());
+                            String pkg = o.optString("pkg", e.getKey().substring(KEY_INSTANCE_PREFIX.length()));
+                            long ts = o.optLong("ts", 0L);
+                            o.put("ageSec", ts > 0L ? Math.max(0L, (now - ts) / 1000L) : -1L);
+                            sorted.put(pkg, o);
+                        } catch (Throwable ignored) {
+                        }
+                    }
+                }
+            }
+            JSONArray arr = new JSONArray();
+            for (JSONObject o : sorted.values()) {
+                arr.put(o);
+            }
+            b.putString(RESULT_INSTANCES_JSON, arr.toString());
+        } catch (Throwable ignored) {
+            b.putString(RESULT_INSTANCES_JSON, "[]");
+        }
         return b;
     }
 
@@ -250,7 +311,7 @@ public class KeepaliveStatusProvider extends ContentProvider {
         }
         if (METHOD_REPORT_HOOK_ACTIVE.equals(method)) {
             if (!safePkg.isEmpty()) {
-                recordHookHeartbeatLocal(ctx, safePkg);
+                recordHookHeartbeatLocal(ctx, safePkg, extras);
             }
             return readHookTelemetryBundle(ctx);
         }
@@ -433,6 +494,11 @@ public class KeepaliveStatusProvider extends ContentProvider {
             } catch (Throwable ignored) {
             }
             obj.put("hookPackages", hookPackagesArr);
+            try {
+                String instRaw = hook.getString(RESULT_INSTANCES_JSON, "[]");
+                obj.put("hookInstances", new JSONArray(instRaw));
+            } catch (Throwable ignored) {
+            }
             obj.put("hasConfiguredProfile", WireGuardManager.hasAnyConfiguredProfile(ctx));
             obj.put("tunnelRunning", running);
             obj.put("activePort", port);

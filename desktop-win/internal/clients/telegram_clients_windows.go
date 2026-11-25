@@ -247,6 +247,24 @@ func detectUnigramMsixInstalled() bool {
 	return false
 }
 
+// SnapshotRunningPIDs returns active PIDs keyed by lowercase cleaned ExePath
+// and "name:<lowercase baseName>" so diagnostics can display every running instance's PIDs.
+func SnapshotRunningPIDs() map[string][]uint32 {
+	procs := snapshotRunningProcesses()
+	out := make(map[string][]uint32, len(procs)*2)
+	for _, rp := range procs {
+		if rp.exePath != "" {
+			key := strings.ToLower(filepath.Clean(rp.exePath))
+			out[key] = append(out[key], rp.pid)
+		}
+		if rp.baseName != "" {
+			nkey := "name:" + strings.ToLower(rp.baseName)
+			out[nkey] = append(out[nkey], rp.pid)
+		}
+	}
+	return out
+}
+
 // DiscoverClients detects installed, MSIX, and portable Telegram desktop clients on Windows
 // and merges them with user-pinned custom entries while preserving live running state.
 func DiscoverClients(customClients []config.TelegramClientEntry) []config.TelegramClientEntry {

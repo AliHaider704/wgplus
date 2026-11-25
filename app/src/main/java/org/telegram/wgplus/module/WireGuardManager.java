@@ -414,6 +414,28 @@ public final class WireGuardManager {
         return sSocksUser;
     }
 
+    /**
+     * Returns a per-package SOCKS5 username ({@code wg:<packageName>}) when configuring Telegram clients
+     * so Go engine telemetry attributes traffic and active connections to each Telegram fork separately,
+     * while the engine itself validates the base {@code wg} prefix + session password.
+     */
+    public static String getClientSocksUser(Context context) {
+        String base = getActiveSocksUser(context);
+        if (base == null || base.isEmpty()) {
+            return "";
+        }
+        int colonIdx = base.indexOf(':');
+        if (colonIdx > 0) {
+            base = base.substring(0, colonIdx);
+        }
+        Context pkgCtx = context != null ? context : sSocksPrefsCtx;
+        String pkg = pkgCtx != null ? pkgCtx.getPackageName() : "";
+        if ("wg".equals(base) && pkg != null && !pkg.isEmpty() && !"org.telegram.wgplus.module".equals(pkg)) {
+            return base + ":" + pkg;
+        }
+        return base;
+    }
+
     public static String getActiveSocksPass() {
         return getActiveSocksPass(sSocksPrefsCtx);
     }
@@ -1319,20 +1341,84 @@ public final class WireGuardManager {
         return sTunnelStartedAtMs;
     }
 
+    private static volatile long sLastHookHeartbeatMs = 0L;
+
     public static void reportHookActiveToProvider(Context context, String hostPkg) {
         if (context == null || hostPkg == null || hostPkg.isEmpty()) {
             return;
         }
         try {
             Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+            Bundle extras = new Bundle();
+            try {
+                android.content.pm.PackageInfo pi = appCtx.getPackageManager().getPackageInfo(hostPkg, 0);
+                if (pi != null && pi.versionName != null) {
+                    extras.putString("host_ver", pi.versionName);
+                }
+            } catch (Throwable ignored) {
+            }
+            extras.putString("mode", detectInjectionMode(appCtx));
+            boolean localUp = false;
+            int localPort = 0;
+            try {
+                if (NativeBridgeLoader.isLoaded() && Wgbridge.isRunning()) {
+                    localUp = true;
+                    localPort = (int) Wgbridge.getActivePort();
+                }
+            } catch (Throwable ignored) {
+            }
+            int effPort = localPort > 0 ? localPort : (sSharedHubPort > 0 ? sSharedHubPort : sLastBoundPort);
+            boolean running = localUp || sSharedHubPort > 0;
+            String role = localUp
+                    ? (sIsSharedHubOwner ? "shared_owner" : "local_owner")
+                    : (sSharedHubPort > 0 ? "shared_client" : "standby");
+            extras.putInt("port", effPort);
+            extras.putBoolean("running", running);
+            extras.putBoolean("shared", sSharedHubPort > 0 && !localUp);
+            extras.putString("role", role);
+            if (!"org.telegram.wgplus.module".equals(hostPkg)) {
+                String tgState = inspectTelegramProxyHealthSummary(appCtx);
+                if (tgState != null && !tgState.isEmpty() && !tgState.startsWith("n/a")) {
+                    if (tgState.length() > 160) {
+                        tgState = tgState.substring(0, 160);
+                    }
+                    extras.putString("tg_state", tgState);
+                }
+            }
+            List<String> evs = WgDiagnosticsLog.snapshotEvents();
+            if (!evs.isEmpty()) {
+                String lastEv = evs.get(evs.size() - 1);
+                if (lastEv.length() > 140) {
+                    lastEv = lastEv.substring(0, 140);
+                }
+                extras.putString("last_event", lastEv);
+            }
             appCtx.getContentResolver().call(
                     STATUS_PROVIDER_URI,
                     KeepaliveStatusProvider.METHOD_REPORT_HOOK_ACTIVE,
                     hostPkg,
-                    null
+                    extras
             );
+            sLastHookHeartbeatMs = SystemClock.elapsedRealtime();
         } catch (Throwable ignored) {
         }
+    }
+
+    static void scheduleHookHeartbeatThrottled(Context context) {
+        if (context == null) {
+            return;
+        }
+        String pkg = context.getPackageName();
+        if (pkg == null || pkg.isEmpty() || "org.telegram.wgplus.module".equals(pkg)) {
+            return;
+        }
+        long now = SystemClock.elapsedRealtime();
+        if (now - sLastHookHeartbeatMs < 15_000L) {
+            return;
+        }
+        sLastHookHeartbeatMs = now;
+        final Context appCtx = context.getApplicationContext() != null ? context.getApplicationContext() : context;
+        SYNC_EXEC.execute(() -> reportHookActiveToProvider(appCtx, pkg));
     }
 
     public static Bundle queryHookStatusFromProvider(Context context) {
@@ -4966,6 +5052,7 @@ public final class WireGuardManager {
         }
         if (alive) {
             sConsecutiveHealthFailures = 0;
+            scheduleHookHeartbeatThrottled(appCtx);
             TunnelConfig activeCfg = getConnectedProfile(appCtx, moduleApkPath);
             boolean hsNow = isHandshakeHealthyNow(appCtx, moduleApkPath);
             if (hsNow && (!sLastReportedHsHealthy || Math.abs(System.currentTimeMillis() - sLastSharedTunnelHeartbeatMs) >= 60_000L)) {
@@ -5545,7 +5632,7 @@ public final class WireGuardManager {
             boolean force
     ) {
         try {
-            String socksUser = enabled ? getActiveSocksUser(context) : "";
+            String socksUser = enabled ? getClientSocksUser(context) : "";
             String socksPass = enabled ? getActiveSocksPass(context) : "";
             boolean hsHealthy = enabled && isHandshakeHealthyNow(context, null);
 
@@ -5587,6 +5674,7 @@ public final class WireGuardManager {
             sLastBoundUser = socksUser;
             sLastBoundPass = socksPass;
             sLastBoundHsHealthy = hsHealthy;
+            scheduleHookHeartbeatThrottled(context);
             Log.i(TAG, "Applied Telegram proxy & call settings (enabled=" + enabled
                     + ", port=" + localPort + ", routeCalls=" + routeCalls + ", hsHealthy=" + hsHealthy + ")");
         } catch (Throwable t) {
@@ -5624,7 +5712,7 @@ public final class WireGuardManager {
                                 .apply();
                     }
                 }
-                String activeU = getActiveSocksUser(appCtx);
+                String activeU = getClientSocksUser(appCtx);
                 String activeP = getActiveSocksPass(appCtx);
                 mc.edit()
                         .putBoolean("proxy_enabled", true)
@@ -6041,7 +6129,7 @@ public final class WireGuardManager {
         }
 
         static void apply(ClassLoader classLoader, boolean enabled, int localPort, boolean forceNudge) {
-            String socksUser = enabled ? WireGuardManager.getActiveSocksUser() : "";
+            String socksUser = enabled ? WireGuardManager.getClientSocksUser(sSocksPrefsCtx) : "";
             String socksPass = enabled ? WireGuardManager.getActiveSocksPass() : "";
             boolean hsHealthy = enabled && WireGuardManager.isHandshakeHealthyNow(sSocksPrefsCtx, null);
             apply(classLoader, enabled, localPort, socksUser, socksPass, hsHealthy, forceNudge);

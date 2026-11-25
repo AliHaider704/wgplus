@@ -445,7 +445,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                         ? WireGuardManager.getEffectiveProxyPort(ctx, MODULE_PATH)
                                         : WireGuardManager.getCachedSharedOrFallbackPort(ctx);
                                 int wantPort = effPort > 0 ? effPort : 9;
-                                String wantUser = WireGuardManager.getActiveSocksUser(ctx);
+                                String wantUser = WireGuardManager.getClientSocksUser(ctx);
                                 String wantPass = WireGuardManager.getActiveSocksPass(ctx);
                                 if (!enabled || !isLoopback || portArg != wantPort
                                         || !wantUser.equals(userArg) || !wantPass.equals(passArg)) {
@@ -479,7 +479,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                         ? WireGuardManager.getEffectiveProxyPort(ctx, MODULE_PATH)
                                         : WireGuardManager.getCachedSharedOrFallbackPort(ctx);
                                 int wantPort = effPort > 0 ? effPort : 9;
-                                String wantUser = WireGuardManager.getActiveSocksUser(ctx);
+                                String wantUser = WireGuardManager.getClientSocksUser(ctx);
                                 String wantPass = WireGuardManager.getActiveSocksPass(ctx);
                                 if (!enabled || !isLoopback || portArg != wantPort
                                         || !wantUser.equals(userArg) || !wantPass.equals(passArg)) {
@@ -519,7 +519,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                     ? WireGuardManager.getEffectiveProxyPort(ctx, MODULE_PATH)
                                     : WireGuardManager.getCachedSharedOrFallbackPort(ctx);
                             int wantPort = effPort > 0 ? effPort : 9;
-                            String wantUser = WireGuardManager.getActiveSocksUser(ctx);
+                            String wantUser = WireGuardManager.getClientSocksUser(ctx);
                             String wantPass = WireGuardManager.getActiveSocksPass(ctx);
                             if (!isLoopback || portArg != wantPort
                                     || !wantUser.equals(userArg) || !wantPass.equals(passArg)) {
@@ -554,7 +554,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                         if (effPort > 0 && (isLoopback || ks || tunnelUp)) {
                             param.args[1] = "127.0.0.1";
                             param.args[2] = effPort;
-                            param.args[3] = WireGuardManager.getActiveSocksUser(ctx);
+                            param.args[3] = WireGuardManager.getClientSocksUser(ctx);
                             param.args[4] = WireGuardManager.getActiveSocksPass(ctx);
                             param.args[5] = "";
                         } else if (ks && isLoopback && portArg <= 0) {
@@ -1182,7 +1182,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                         ((Method) param.method).getName() + " new=" + newlyRelayed + " pre=" + alreadyRelayed + " proxyNull=true");
                             }
                         } else if (proxyArgIdx >= 0 && proxyClass != null && effectivePort > 0) {
-                            String socksUser = WireGuardManager.getActiveSocksUser(ctx);
+                            String socksUser = WireGuardManager.getClientSocksUser(ctx);
                             String socksPass = WireGuardManager.getActiveSocksPass(ctx);
                             boolean hasAuth = socksUser != null && !socksUser.isEmpty();
                             Constructor<?> ctor = proxyClass.getDeclaredConstructor(
@@ -1310,8 +1310,8 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                                 "setProxy",
                                                 "127.0.0.1",
                                                 effectivePort,
-                                                WireGuardManager.getActiveSocksUser(),
-                                                WireGuardManager.getActiveSocksPass()
+                                                WireGuardManager.getClientSocksUser(ctx),
+                                                WireGuardManager.getActiveSocksPass(ctx)
                                         );
                                     }
                                 } catch (Throwable ignored) {

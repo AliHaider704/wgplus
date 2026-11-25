@@ -1501,5 +1501,102 @@ func TestHopCooldownIsHandshakeHealthyAndFailFast(t *testing.T) {
 	}
 }
 
+func TestSocks5SubLabelPerInstanceAttribution(t *testing.T) {
+	SetSocksAuth("wg", "test_secret_pass")
+	defer SetSocksAuth("", "")
+
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen echo: %v", err)
+	}
+	defer echoLn.Close()
+	echoPort := uint16(echoLn.Addr().(*net.TCPAddr).Port)
+	go func() {
+		for {
+			c, aErr := echoLn.Accept()
+			if aErr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				_, _ = io.Copy(conn, conn)
+			}(c)
+		}
+	}()
+
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("Listen socks: %v", err)
+	}
+	defer socksLn.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() {
+		for {
+			c, aErr := socksLn.Accept()
+			if aErr != nil {
+				return
+			}
+			go handleSocks5Client(ctx, c, localNetDialer{})
+		}
+	}()
+
+	dialWithUser := func(user, pass string, expectPass bool) {
+		t.Helper()
+		c, dErr := net.DialTimeout("tcp", socksLn.Addr().String(), 2*time.Second)
+		if dErr != nil {
+			t.Fatalf("dial %s: %v", user, dErr)
+		}
+		defer c.Close()
+		_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+		_, _ = c.Write([]byte{0x05, 0x01, 0x02})
+		greet := make([]byte, 2)
+		if _, err := io.ReadFull(c, greet); err != nil || greet[1] != 0x02 {
+			t.Fatalf("greet %s: err=%v greet=%v", user, err, greet)
+		}
+		authPkt := make([]byte, 0, 3+len(user)+len(pass))
+		authPkt = append(authPkt, 0x01, byte(len(user)))
+		authPkt = append(authPkt, user...)
+		authPkt = append(authPkt, byte(len(pass)))
+		authPkt = append(authPkt, pass...)
+		_, _ = c.Write(authPkt)
+		authResp := make([]byte, 2)
+		if _, err := io.ReadFull(c, authResp); err != nil {
+			t.Fatalf("authResp %s: %v", user, err)
+		}
+		if expectPass && authResp[1] != 0x00 {
+			t.Fatalf("expected auth OK for %q, got 0x%02x", user, authResp[1])
+		}
+		if !expectPass {
+			if authResp[1] == 0x00 {
+				t.Fatalf("expected auth reject for %q, got OK", user)
+			}
+			return
+		}
+		req := []byte{0x05, 0x01, 0x00, 0x01, 127, 0, 0, 1, byte(echoPort >> 8), byte(echoPort)}
+		_, _ = c.Write(req)
+		rep := make([]byte, 10)
+		if _, err := io.ReadFull(c, rep); err != nil || rep[1] != 0x00 {
+			t.Fatalf("connect %s: err=%v rep=%v", user, err, rep)
+		}
+		msg := []byte("HELLO_" + user)
+		_, _ = c.Write(msg)
+		got := make([]byte, len(msg))
+		if _, err := io.ReadFull(c, got); err != nil {
+			t.Fatalf("echo read %s: %v", user, err)
+		}
+	}
+
+	dialWithUser("wg:org.telegram.plus", "test_secret_pass", true)
+	dialWithUser("wg:org.telegram.messenger.web", "test_secret_pass", true)
+	dialWithUser("wg:org.telegram.plus", "wrong_pass", false)
+	dialWithUser("evil:org.telegram.plus", "test_secret_pass", false)
+
+	statsJSON := GetDetailedStatsJSON()
+	if !strings.Contains(statsJSON, "org.telegram.plus") || !strings.Contains(statsJSON, "org.telegram.messenger.web") {
+		t.Fatalf("expected separate ClientTrafficStat entries in stats JSON, got: %s", statsJSON)
+	}
+}
+
 
 

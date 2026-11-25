@@ -11,6 +11,8 @@ let recoveringAwg = false;
 let pingingAll = false;
 let probingMtu = false;
 let onboardingDismissed = false;
+let telemetryConsentDismissedThisVisit = false;
+let sendingDiagCloud = false;
 
 const el = (id) => document.getElementById(id);
 
@@ -73,6 +75,26 @@ function applyStaticLabels() {
   el("btn-diag-save").textContent = tr.diagSave;
   el("btn-diag-clear").textContent = tr.diagClear;
   el("btn-diag-github").textContent = tr.diagGithub;
+  if (el("lbl-diag-auto-telemetry")) {
+    const optIn = !!(state?.settings?.telemetryOptIn);
+    el("lbl-diag-auto-telemetry").textContent = tr.diagAutoTelemetryLbl;
+    el("desc-diag-auto-telemetry").textContent = optIn ? tr.diagAutoTelemetryOn : tr.diagAutoTelemetryOff;
+    el("chk-diag-telemetry").checked = optIn;
+  }
+  if (el("btn-diag-send-cloud")) {
+    el("btn-diag-send-cloud").textContent = sendingDiagCloud ? tr.diagSendingCloudBtn : tr.diagSendCloudBtn;
+    el("btn-diag-send-cloud").disabled = sendingDiagCloud;
+  }
+  if (el("modal-telemetry-title")) {
+    el("modal-telemetry-badge").textContent = tr.telemetryModalBadge;
+    el("modal-telemetry-title").textContent = tr.telemetryModalTitle;
+    el("modal-telemetry-body").textContent = tr.telemetryModalBody;
+    el("lbl-telemetry-b1").textContent = tr.telemetryBullet1;
+    el("lbl-telemetry-b2").textContent = tr.telemetryBullet2;
+    el("lbl-telemetry-b3").textContent = tr.telemetryBullet3;
+    el("btn-telemetry-accept").textContent = tr.telemetryAcceptBtn;
+    el("btn-telemetry-decline").textContent = tr.telemetryDeclineBtn;
+  }
 
   el("lbl-onboard-title").textContent = tr.onboardTitle;
   el("lbl-onboard-desc").textContent = tr.onboardDesc;
@@ -347,6 +369,23 @@ function renderStatusAndTelemetry() {
     const showChannelGate = !!(state.connected && state.settings && !state.settings.channelInvitedV4);
     chModal.classList.toggle("hidden", !showChannelGate);
   }
+  maybeShowTelemetryConsent();
+}
+
+function maybeShowTelemetryConsent() {
+  const modal = el("modal-telemetry-consent");
+  if (!modal || !state || !state.settings) return;
+  if (state.settings.telemetryOptIn || telemetryConsentDismissedThisVisit) {
+    modal.classList.add("hidden");
+    return;
+  }
+  const updOpen = el("upd-overlay") && !el("upd-overlay").classList.contains("hidden");
+  const chOpen = el("modal-channel") && !el("modal-channel").classList.contains("hidden");
+  if (updOpen || chOpen) {
+    modal.classList.add("hidden");
+    return;
+  }
+  modal.classList.remove("hidden");
 }
 
 function renderClients() {
@@ -887,6 +926,68 @@ function wireEvents() {
       showError(String(err));
     }
   });
+  if (el("chk-diag-telemetry")) {
+    el("chk-diag-telemetry").addEventListener("change", async () => {
+      try {
+        const nextOptIn = el("chk-diag-telemetry").checked;
+        state.settings = await api().SetTelemetryConsent(nextOptIn);
+        applyStaticLabels();
+        if (nextOptIn) {
+          el("modal-telemetry-consent")?.classList.add("hidden");
+          showToast(t().toastTelemetryEnabled);
+        }
+        await refreshDiagnosticsModal();
+      } catch (err) {
+        showError(String(err));
+      }
+    });
+  }
+  if (el("btn-diag-send-cloud")) {
+    el("btn-diag-send-cloud").addEventListener("click", async () => {
+      if (sendingDiagCloud) return;
+      sendingDiagCloud = true;
+      applyStaticLabels();
+      try {
+        const res = await api().SendDiagnosticReportNow();
+        const tr = t();
+        if (res === "sent") {
+          showToast(tr.toastDiagSentCloud);
+        } else if (res === "queued") {
+          showToast(tr.toastDiagQueuedCloud);
+        } else if (res === "rate_limited") {
+          showToast(tr.toastDiagRateLimited);
+        }
+        await refreshDiagnosticsModal();
+      } catch (err) {
+        showError(String(err));
+      } finally {
+        sendingDiagCloud = false;
+        applyStaticLabels();
+      }
+    });
+  }
+  if (el("btn-telemetry-accept")) {
+    el("btn-telemetry-accept").addEventListener("click", async () => {
+      try {
+        state.settings = await api().SetTelemetryConsent(true);
+        el("modal-telemetry-consent").classList.add("hidden");
+        renderAll();
+        showToast(t().toastTelemetryEnabled);
+      } catch (err) {
+        showError(String(err));
+      }
+    });
+    el("btn-telemetry-decline").addEventListener("click", async () => {
+      try {
+        telemetryConsentDismissedThisVisit = true;
+        el("modal-telemetry-consent").classList.add("hidden");
+        state.settings = await api().SetTelemetryConsent(false);
+        renderAll();
+      } catch (err) {
+        showError(String(err));
+      }
+    });
+  }
   el("btn-join-channel").addEventListener("click", async () => {
     try {
       const opened = await api().OpenOfficialChannel();
@@ -1319,6 +1420,14 @@ function subscribeRuntimeEvents() {
     }
   });
 
+  rt.EventsOn("windowShown", (nextState) => {
+    if (nextState) {
+      state = nextState;
+    }
+    telemetryConsentDismissedThisVisit = false;
+    renderAll();
+  });
+
   rt.EventsOn("failover", (info) => {
     if (info?.profileName) {
       showToast(`${info.profileName} (${info.rttMs} ${t().unitsMs})`);
@@ -1389,12 +1498,13 @@ async function runUpdateFlow() {
         sub: tr.updSubNew,
         notes: notesFor(info),
         primaryLabel: tr.updContinue,
-        onPrimary: async () => { await api().AckWhatsNew(); el("upd-overlay").classList.add("hidden"); },
+        onPrimary: async () => { await api().AckWhatsNew(); el("upd-overlay").classList.add("hidden"); maybeShowTelemetryConsent(); },
       });
     } else if (info) {
       await api().AckWhatsNew();
     }
   } catch (_) { /* offline: never block */ } finally {
     updateCheckInFlight = false;
+    maybeShowTelemetryConsent();
   }
 }

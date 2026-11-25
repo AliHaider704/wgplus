@@ -271,7 +271,7 @@ public final class TelegramXBridge {
             Constructor<?> socksCtor = socksCls.getDeclaredConstructor(String.class, String.class);
             socksCtor.setAccessible(true);
             Object proxyType = socksCtor.newInstance(
-                    WireGuardManager.getActiveSocksUser(),
+                    WireGuardManager.getClientSocksUser(null),
                     WireGuardManager.getActiveSocksPass()
             );
 
@@ -361,7 +361,7 @@ public final class TelegramXBridge {
      */
     public static Intent buildSocksDispatchIntent(int port) {
         StringBuilder uri = new StringBuilder("tg://socks?server=127.0.0.1&port=").append(port);
-        String user = WireGuardManager.getActiveSocksUser();
+        String user = WireGuardManager.getClientSocksUser(null);
         String pass = WireGuardManager.getActiveSocksPass();
         if (user != null && !user.isEmpty()) {
             uri.append("&user=").append(Uri.encode(user)).append("&pass=").append(Uri.encode(pass != null ? pass : ""));
