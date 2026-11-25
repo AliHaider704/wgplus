@@ -44,7 +44,7 @@ jobs:
 
       - name: Setup Go
         if: steps.check_auth.outputs.configured == 'true'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v7
         with:
           go-version-file: wgbridge-go/go.mod
           cache-dependency-path: wgbridge-go/go.sum

@@ -14,7 +14,7 @@ jobs:
         working-directory: wgbridge-go
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: wgbridge-go/go.mod
           cache-dependency-path: wgbridge-go/go.sum
@@ -30,7 +30,7 @@ jobs:
         working-directory: desktop-win
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: desktop-win/go.mod
           cache-dependency-path: desktop-win/go.sum
@@ -43,7 +43,7 @@ jobs:
     needs: [go-tests]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: wgbridge-go/go.mod
           cache-dependency-path: wgbridge-go/go.sum
@@ -92,7 +92,7 @@ jobs:
         api-level: [28, 31, 34, 35]
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: wgbridge-go/go.mod
           cache-dependency-path: wgbridge-go/go.sum
