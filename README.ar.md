@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 <img src="docs/assets/banner.png" alt="WireGuard Plus - نفق وايرجارد وأمنيزيا داخل تيليجرام لويندوز وأندرويد" width="100%" />
 
@@ -26,15 +26,17 @@
 
 <div dir="rtl">
 
-## التحميل (`v1.9.0`)
+[![CI](https://github.com/AliHaider704/wgplus/actions/workflows/ci.yml/badge.svg?branch=qa/v2.0.0-cloud-verify)](https://github.com/AliHaider704/wgplus/actions/workflows/ci.yml) [![Test Lab](https://github.com/AliHaider704/wgplus/actions/workflows/firebase-test-lab.yml/badge.svg?branch=qa/v2.0.0-cloud-verify)](docs/QA_PIPELINE.md) [Privacy](docs/PRIVACY.md) | [FAQ](docs/FAQ.md)
+
+## التحميل (`v2.0.0`)
 
 | المنصة | رابط التحميل | المتطلبات | الملاحظات |
 |--------|--------------|-----------|-----------|
 | **ويندوز (ملف `.exe` مفرد، `17.83 MB`)** | [`WireGuardPlus-Windows-x64.exe`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64.exe) | ويندوز 10/11 (x64) | تشغيل مباشر، تشفير DPAPI، أيقونة شريط النظام، توجيه معزول للمكالمات |
 | **ويندوز المحمول (`.zip`، `6.87 MB`)** | [`WireGuardPlus-Windows-x64-Portable.zip`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64-Portable.zip) | ويندوز 10/11 (x64)، فلاش/مجلد | يحتوي `portable.flag`، حفظ محلي كامل بدون AppData |
-| **أندرويد ARM64 (`5.05 MB` - موصى به)** | [`WireGuardPlus-1.9.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.9.0-arm64-v8a.apk) | أندرويد 5.0+ (arm64-v8a) | بدون روت عبر LSPatch أو بالروت عبر LSPosed / Vector |
-| **أندرويد ARMv7 (`5.02 MB`)** | [`WireGuardPlus-1.9.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.9.0-armeabi-v7a.apk) | أندرويد 5.0+ (armeabi-v7a) | للأجهزة ذات معمارية 32 بت |
-| **أندرويد الشاملة (`11.29 MB`)** | [`WireGuardPlus-1.9.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.9.0.apk) | أندرويد 5.0+ (arm64 + armv7a) | نسخة شاملة متوافقة مع التحديثات التلقائية |
+| **أندرويد ARM64 (`5.05 MB` - موصى به)** | [`WireGuardPlus-2.0.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-arm64-v8a.apk) | أندرويد 5.0+ (arm64-v8a) | بدون روت عبر LSPatch أو بالروت عبر LSPosed / Vector |
+| **أندرويد ARMv7 (`5.02 MB`)** | [`WireGuardPlus-2.0.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-armeabi-v7a.apk) | أندرويد 5.0+ (armeabi-v7a) | للأجهزة ذات معمارية 32 بت |
+| **أندرويد الشاملة (`11.29 MB`)** | [`WireGuardPlus-2.0.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0.apk) | أندرويد 5.0+ (arm64 + armv7a) | نسخة شاملة متوافقة مع التحديثات التلقائية |
 
 تحقق من تطابق الملفات عبر [`SHA256SUMS.txt`](https://github.com/AliHaider704/wgplus/releases/latest/download/SHA256SUMS.txt)، أو شاهد [فيديو الشرح (`MP4`)](https://github.com/AliHaider704/wgplus/releases/download/v1.7.3/WireGuardPlus-Windows-Walkthrough.mp4)، أو انضم إلى [قناة تيليجرام الرسمية](https://t.me/wgplus_official).
 
@@ -150,7 +152,7 @@ flowchart LR
 
 يتطلب **أندرويد 5.0+** (**أندرويد 11+** للتفعيل الصامت عبر التصحيح اللاسلكي).
 
-1. حمّل [`WireGuardPlus-1.9.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.9.0-arm64-v8a.apk) (`5.05 MB`) أو [`WireGuardPlus-1.9.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.9.0-armeabi-v7a.apk) (`5.02 MB`) أو [`WireGuardPlus-1.9.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.9.0.apk) (الشاملة).
+1. حمّل [`WireGuardPlus-2.0.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-arm64-v8a.apk) (`5.05 MB`) أو [`WireGuardPlus-2.0.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-armeabi-v7a.apk) (`5.02 MB`) أو [`WireGuardPlus-2.0.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0.apk) (الشاملة).
 2. **بدون روت (LSPatch):** ادمج أي نسخة مدعومة (**Telegram** أو **Telegram Plus** أو **Nagram** أو **AyuGram** أو **Telegraph** أو **Telegram Gold** أو **Telegram X**) عبر [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch) بوضع **Portable** أو **Local**، ثم ثبّت تيليجرام وافتح تطبيق **نفق وايرجارد بلس** لإكمال ربط التصحيح اللاسلكي ذي الـ 6 أرقام لمرة واحدة.
    - **مع روت (LSPosed / Vector):** فعّل **WireGuard Plus** في **LSPosed / Vector -> Modules** وحدد تطبيقات تيليجرام ثم امنح الروت داخل التطبيق لحماية صامتة.
 3. داخل تيليجرام افتح **الإعدادات -> البيانات والتخزين -> إعدادات البروكسي -> نفق وايرجارد** وأضف ملفك واتصل.
@@ -168,7 +170,7 @@ Get-FileHash .\WireGuardPlus-Windows-x64.exe -Algorithm SHA256
 ```
 
 - **بخصوص تنبيه SmartScreen أو Defender (`!ml`):** لأن المشروع مفتوح المصدر ومجاني بدون شهادة توقيع تجارية مدفوعة، قد يُظهر ويندوز تنبيه SmartScreen عند التشغيل الأول لنسخ Go + Wails الجديدة. الملف **لا يستخدم UPX أو أي أدوات ضغط مشفرة**، ويمكن بناؤه مباشرة من المصدر أو التحقق من سجل البناء الموثّق (SLSA provenance) عبر [`.github/workflows/release-windows.yml`](.github/workflows/release-windows.yml).
-- **شفافية الاتصالات الخارجية (صفر تتبع أو تحليلات):** التطبيق لا يتصل بأي خادم تحليلات أو إعلانات؛ جميع اتصالاته الممكنة محصورة بالتالي فقط:
+- **شفافية الاتصالات الخارجية (بلا تحليلات؛ إرسال الأخطاء اختياري، انظر docs/PRIVACY.md):** التطبيق لا يتصل بأي خادم تحليلات أو إعلانات؛ جميع اتصالاته الممكنة محصورة بالتالي فقط:
 
 | الغرض | الوجهة | متى يحدث؟ |
 |-------|--------|-----------|

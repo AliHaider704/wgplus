@@ -1,4 +1,4 @@
-﻿<div align="center">
+<div align="center">
 
 <img src="docs/assets/banner.png" alt="WireGuard Plus - WireGuard & AmneziaWG Inside Telegram for Windows and Android" width="100%" />
 
@@ -24,15 +24,17 @@
 
 ---
 
-## Downloads (`v1.9.0`)
+[![CI](https://github.com/AliHaider704/wgplus/actions/workflows/ci.yml/badge.svg?branch=qa/v2.0.0-cloud-verify)](https://github.com/AliHaider704/wgplus/actions/workflows/ci.yml) [![Test Lab](https://github.com/AliHaider704/wgplus/actions/workflows/firebase-test-lab.yml/badge.svg?branch=qa/v2.0.0-cloud-verify)](docs/QA_PIPELINE.md) [Privacy](docs/PRIVACY.md) | [FAQ](docs/FAQ.md)
+
+## Downloads (`v2.0.0`)
 
 | Platform | Download | Requirements | Notes |
 |----------|----------|--------------|-------|
 | **Windows Desktop (Single `.exe`, `17.83 MB`)** | [`WireGuardPlus-Windows-x64.exe`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64.exe) | Windows 10/11 x64 | Single executable, DPAPI vault, System Tray, isolated Telegram call routing |
 | **Windows Portable (`.zip`, `6.87 MB`)** | [`WireGuardPlus-Windows-x64-Portable.zip`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64-Portable.zip) | Windows 10/11 x64, USB/folder | Includes `portable.flag`, zero AppData writes |
-| **Android ARM64 (`5.05 MB`, Recommended)** | [`WireGuardPlus-1.9.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.9.0-arm64-v8a.apk) | Android 5.0+ (arm64-v8a) | Rootless via LSPatch or Rooted via LSPosed / Vector |
-| **Android ARMv7 (`5.02 MB`)** | [`WireGuardPlus-1.9.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.9.0-armeabi-v7a.apk) | Android 5.0+ (armeabi-v7a) | 32-bit Android devices |
-| **Android Universal (`11.29 MB`)** | [`WireGuardPlus-1.9.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.9.0.apk) | Android 5.0+ (arm64 + armv7a) | Universal fallback + auto-updater compatible |
+| **Android ARM64 (`5.05 MB`, Recommended)** | [`WireGuardPlus-2.0.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-arm64-v8a.apk) | Android 5.0+ (arm64-v8a) | Rootless via LSPatch or Rooted via LSPosed / Vector |
+| **Android ARMv7 (`5.02 MB`)** | [`WireGuardPlus-2.0.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-armeabi-v7a.apk) | Android 5.0+ (armeabi-v7a) | 32-bit Android devices |
+| **Android Universal (`11.29 MB`)** | [`WireGuardPlus-2.0.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0.apk) | Android 5.0+ (arm64 + armv7a) | Universal fallback + auto-updater compatible |
 
 Verify any download against [`SHA256SUMS.txt`](https://github.com/AliHaider704/wgplus/releases/latest/download/SHA256SUMS.txt), watch the [Walkthrough Video (`MP4`)](https://github.com/AliHaider704/wgplus/releases/download/v1.7.3/WireGuardPlus-Windows-Walkthrough.mp4), or join our [Official Telegram Channel](https://t.me/wgplus_official).
 
@@ -144,7 +146,7 @@ Requires **Windows 10/11 (x64)** (WebView2 runtime is pre-installed on Windows 1
 
 Requires **Android 5.0+** (**Android 11+** for one-time silent Wireless Debugging activation).
 
-1. Download [`WireGuardPlus-1.9.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.9.0-arm64-v8a.apk) (`5.05 MB`), [`WireGuardPlus-1.9.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.9.0-armeabi-v7a.apk) (`5.02 MB`), or [`WireGuardPlus-1.9.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-1.9.0.apk) (universal).
+1. Download [`WireGuardPlus-2.0.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-arm64-v8a.apk) (`5.05 MB`), [`WireGuardPlus-2.0.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-armeabi-v7a.apk) (`5.02 MB`), or [`WireGuardPlus-2.0.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0.apk) (universal).
 2. **Rootless (LSPatch):** Patch any supported client (**Telegram**, **Telegram Plus**, **Nagram**, **AyuGram**, **Telegraph**, **Telegram Gold**, **Telegram X**) using [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch) in **Portable** (embed WireGuard Plus + any other modules such as TeleVip) or **Local** mode, then install and open **WireGuard Plus** for one-time 6-digit Wireless Debugging pairing.
    - **Rooted (LSPosed / Vector):** Enable **WireGuard Plus** in **LSPosed / Vector -> Modules**, scope your Telegram client(s), reopen Telegram, and grant Root in WireGuard Plus for silent continuity.
 3. Open **Telegram -> Settings -> Data and Storage -> Proxy Settings -> WireGuard**, import your `.conf` / QR screenshot / clipboard, tap **Connect**, and run **Verify route & calls**.
@@ -162,7 +164,7 @@ Get-FileHash .\WireGuardPlus-Windows-x64.exe -Algorithm SHA256
 ```
 
 - **About SmartScreen / Defender heuristic warnings (`!ml`):** As an independent open-source project without a paid commercial Authenticode certificate, new Windows Go + Wails releases can trigger an initial *"Windows protected your PC"* prompt or generic heuristic flag. The binary uses **no UPX or runtime packers** and can be built cleanly from source or verified via GitHub Actions SLSA provenance in [`.github/workflows/release-windows.yml`](.github/workflows/release-windows.yml).
-- **Outbound Network Transparency (Zero Telemetry):** WireGuard Plus never runs analytics, ad networks, or crash uploaders. Every external connection is strictly one of:
+- **Outbound Network Transparency (opt-in error reports only, see docs/PRIVACY.md):** WireGuard Plus never runs analytics, ad networks, or crash uploaders. Every external connection is strictly one of:
 
 | Purpose | Destination | Trigger |
 |---------|-------------|---------|

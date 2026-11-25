@@ -2,6 +2,17 @@
 
 All notable changes to **WireGuard Plus** (`Windows Desktop` & `Android org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
+## [2.0.0] - Unreleased
+
+### Added
+- Multiple Telegram instances on Android and Windows (per-client labels).
+- Windows: in-place self-update, persistent run-as-administrator for calls.
+- Opt-in sanitized diagnostics (off by default) to Cloud Firestore; call no-media watchdog; phone self-check script.
+- 3-tier QA pipeline (CI, Firebase Test Lab, on-device).
+
+### Fixed
+- 9-hour sleep and Xiaomi tunnel flaps.
+
 ## [1.9.0] - 2026-11-23
 
 ### Added
