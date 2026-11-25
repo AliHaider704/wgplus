@@ -159,26 +159,90 @@ jobs:
                               break
               return chosen
 
+          def fmt_flags(items):
+              return " ".join(f"--device model={mid},version={api},locale=en,orientation=portrait" for mid, api in items)
+
           picked = pick(["Xiaomi", "Samsung", "Google", "Motorola"], min_api=28, max_count=2)
           if not picked:
               raise SystemExit(f"No matching FTL devices found for form={form}")
-          print(" ".join(f"--device model={mid},version={api},locale=en,orientation=portrait" for mid, api in picked))
+          print(f"PRIMARY={fmt_flags(picked)}")
+          if form == "PHYSICAL":
+              print(f"PHYS_1={fmt_flags(picked[:1])}")
+              virt_picked = []
+              # Build virtual fallback pool cleanly from the same models list
+              virt_candidates = []
+              for m in models:
+                  if m.get("form") != "VIRTUAL":
+                      continue
+                  tags = m.get("tags") or []
+                  if "deprecated" in tags or "directAccessOnly" in tags:
+                      continue
+                  vers = [int(v) for v in (m.get("supportedVersionIds") or []) if str(v).isdigit() and 28 <= int(v) <= 35]
+                  if vers:
+                      virt_candidates.append((m.get("id", ""), max(vers)))
+              virt_candidates.sort(key=lambda x: (-x[1], x[0]))
+              seen_apis = set()
+              for vid, vapi in virt_candidates:
+                  if vapi not in seen_apis:
+                      virt_picked.append((vid, vapi))
+                      seen_apis.add(vapi)
+                  if len(virt_picked) >= 2:
+                      break
+              if not virt_picked and virt_candidates:
+                  virt_picked = virt_candidates[:2]
+              print(f"VIRT_2={fmt_flags(virt_picked)}")
+          else:
+              print("PHYS_1=")
+              print("VIRT_2=")
           PYEOF
           )
-          echo "flags=$DEVICE_FLAGS" >> "$GITHUB_OUTPUT"
-          echo "Selected FTL devices: $DEVICE_FLAGS"
+          PRIMARY=$(echo "$DEVICE_FLAGS" | grep '^PRIMARY=' | cut -d= -f2-)
+          PHYS_1=$(echo "$DEVICE_FLAGS" | grep '^PHYS_1=' | cut -d= -f2-)
+          VIRT_2=$(echo "$DEVICE_FLAGS" | grep '^VIRT_2=' | cut -d= -f2-)
+          {
+            echo "flags=$PRIMARY"
+            echo "flags_phys_1=$PHYS_1"
+            echo "flags_virt_2=$VIRT_2"
+          } >> "$GITHUB_OUTPUT"
+          echo "Selected FTL primary devices: $PRIMARY"
 
       - name: Run instrumentation smoke suite on Firebase Test Lab
         if: steps.check_auth.outputs.configured == 'true'
         run: |
-          # shellcheck disable=SC2086
-          gcloud firebase test android run \
-            --type instrumentation \
-            --app app/build/outputs/apk/debug/app-debug.apk \
-            --test app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk \
-            ${{ steps.select_devices.outputs.flags }} \
-            --timeout 5m \
-            --no-auto-google-login
+          set +e
+          run_ftl() {
+            local dev_flags="$1"
+            # shellcheck disable=SC2086
+            gcloud firebase test android run \
+              --type instrumentation \
+              --app app/build/outputs/apk/debug/app-debug.apk \
+              --test app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk \
+              $dev_flags \
+              --timeout 5m \
+              --no-auto-google-login 2>&1 | tee /tmp/ftl_run.log
+            return ${PIPESTATUS[0]}
+          }
+
+          is_quota_err() {
+            grep -Eqi 'quota|RESOURCE_EXHAUSTED|exceeded|daily limit|No enough Quota' /tmp/ftl_run.log
+          }
+
+          run_ftl "${{ steps.select_devices.outputs.flags }}"
+          RC=$?
+          if [ "$RC" -ne 0 ] && is_quota_err && [ -n "${{ steps.select_devices.outputs.flags_phys_1 }}" ]; then
+            echo "Spark physical batch hit quota; retrying with 1 physical device..."
+            run_ftl "${{ steps.select_devices.outputs.flags_phys_1 }}"
+            RC=$?
+          fi
+          if [ "$RC" -ne 0 ] && is_quota_err && [ -n "${{ steps.select_devices.outputs.flags_virt_2 }}" ]; then
+            echo "Spark physical daily quota exhausted; stepping down to FTL virtual Spark pool..."
+            run_ftl "${{ steps.select_devices.outputs.flags_virt_2 }}"
+            RC=$?
+            if [ "$RC" -eq 0 ]; then
+              echo "### Firebase Test Lab ran on Spark Virtual Pool (physical daily quota exhausted)" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+          exit "$RC"
 
       - name: Optional Robo smoke check on LSPatch-embedded host APK
         if: steps.check_auth.outputs.configured == 'true' && inputs.extra_host_apk_url != ''
