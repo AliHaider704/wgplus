@@ -308,9 +308,30 @@ func TestSimulationSamsungNineHourOfflineZombieTcpReset(t *testing.T) {
 	if err != nil {
 		t.Fatalf("fresh SOCKS5 dial after reset failed: %v", err)
 	}
-	defer freshConn.Close()
 	reply, err := io.ReadAll(freshConn)
+	_ = freshConn.Close()
 	if err != nil || !strings.Contains(string(reply), "MTPROTO_DIFF_OK") {
 		t.Fatalf("unexpected fresh reply after sleep reset: reply=%q err=%v", string(reply), err)
+	}
+
+	// Wait briefly for relay goroutine cleanup before testing idle ResetActiveProxyConnections
+	idleDeadline := time.Now().Add(800 * time.Millisecond)
+	for time.Now().Before(idleDeadline) {
+		var m map[string]any
+		_ = json.Unmarshal([]byte(GetUdpTelemetryJSON()), &m)
+		if int(m["activeTcpConns"].(float64)) == 0 {
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+
+	// Also verify explicit ResetActiveProxyConnections increments recoveryEpoch even when 0 active streams remain
+	epochBeforeIdle := GetRecoveryEpoch()
+	idleClosed := ResetActiveProxyConnections("idle_check")
+	if idleClosed != 0 {
+		t.Fatalf("expected 0 closed streams on idle reset, got %d", idleClosed)
+	}
+	if GetRecoveryEpoch() < epochBeforeIdle+1 {
+		t.Fatalf("expected recoveryEpoch to increment on idle ResetActiveProxyConnections (%d -> %d)", epochBeforeIdle, GetRecoveryEpoch())
 	}
 }

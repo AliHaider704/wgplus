@@ -51,6 +51,7 @@ var (
 	activeUseDoH             bool
 	activeKeepAlive          int
 	activeStartTime          time.Time
+	handshakeInitMu          sync.Mutex
 	lastHandshakeInitAt      time.Time
 	baseRxBytes              uint64
 	baseTxBytes              uint64
@@ -251,9 +252,29 @@ func lookupPeerByHex(dev *device.Device, pubHex string) *device.Peer {
 	return dev.LookupPeer(pk)
 }
 
+func markHandshakeInitNow() {
+	handshakeInitMu.Lock()
+	lastHandshakeInitAt = time.Now()
+	handshakeInitMu.Unlock()
+}
+
+func waitNextTai64nTick() {
+	handshakeInitMu.Lock()
+	prev := lastHandshakeInitAt
+	handshakeInitMu.Unlock()
+	if !prev.IsZero() {
+		// WireGuard drops initiations arriving within 20ms (HandshakeInitationRate = 1s/50)
+		// or inside the same ~16.77ms TAI64N bucket; wait 55ms to cover OS timer jitter cleanly.
+		if elapsed := time.Since(prev); elapsed >= 0 && elapsed < 55*time.Millisecond {
+			time.Sleep(55*time.Millisecond - elapsed)
+		}
+	}
+}
+
 func triggerPeerHandshakeDirect(dev *device.Device, pubHex string, isRetry bool) {
 	peer := lookupPeerByHex(dev, pubHex)
 	if peer != nil {
+		markHandshakeInitNow()
 		_ = peer.SendHandshakeInitiation(isRetry)
 	}
 }
@@ -357,17 +378,6 @@ func hopActivePeerInternal(hopPort bool, forcePeerReset bool, bypassCooldown boo
 		return true
 	}
 
-	// WireGuard TAI64N whitens timestamps to ~16.77ms buckets; ensure a hard peer reset
-	// advances into the next TAI64N tick so the peer does not drop the new initiation as a replay.
-	if forcePeerReset {
-		mu.Lock()
-		sinceStart := time.Since(activeStartTime)
-		mu.Unlock()
-		if sinceStart >= 0 && sinceStart < 22*time.Millisecond {
-			time.Sleep(22*time.Millisecond - sinceStart)
-		}
-	}
-
 	if hopPort {
 		for attempt := 0; attempt < 3; attempt++ {
 			if err := dev.IpcSet("listen_port=0\n"); err == nil {
@@ -378,6 +388,9 @@ func hopActivePeerInternal(hopPort bool, forcePeerReset bool, bypassCooldown boo
 	}
 
 	if forcePeerReset && params.resolvedEp != "" {
+		// Advance past WireGuard's 20ms HandshakeInitationRate & ~16.77ms TAI64N window BEFORE
+		// applyPeerUapi(..., replace_peers=true) because persistent_keepalive immediately triggers an initiation inside IpcSet.
+		waitNextTai64nTick()
 		rawRx, rawTx, _ := readDeviceCounters(dev)
 		mu.Lock()
 		if !running || activeDev != dev {
@@ -394,6 +407,9 @@ func hopActivePeerInternal(hopPort bool, forcePeerReset bool, bypassCooldown boo
 		}
 		err := applyPeerUapi(dev, params, "", true)
 		if err == nil {
+			if params.keepAlive > 0 {
+				markHandshakeInitNow()
+			}
 			dev.DisableSomeRoamingForBrokenMobileSemantics()
 			lastAppliedResolvedEp = params.resolvedEp
 		}
@@ -401,6 +417,9 @@ func hopActivePeerInternal(hopPort bool, forcePeerReset bool, bypassCooldown boo
 		lastForceHopAt = time.Now()
 	}
 
+	if forcePeerReset && params.resolvedEp == "" {
+		waitNextTai64nTick()
+	}
 	triggerPeerHandshakeDirect(dev, params.pubHex, !forcePeerReset)
 	recoveryEpoch.Add(1)
 	if forcePeerReset {
@@ -439,14 +458,13 @@ func unregisterProxyStream(id uint64) {
 // so Telegram tgnet immediately drops zombie loopback sockets after long sleep or session expiry.
 func ResetActiveProxyConnections(reason string) int {
 	proxyStreamsMu.Lock()
-	if len(activeProxyStreams) == 0 {
-		proxyStreamsMu.Unlock()
-		return 0
-	}
-	closers := make([]func(), 0, len(activeProxyStreams))
-	for id, fn := range activeProxyStreams {
-		closers = append(closers, fn)
-		delete(activeProxyStreams, id)
+	var closers []func()
+	if len(activeProxyStreams) > 0 {
+		closers = make([]func(), 0, len(activeProxyStreams))
+		for id, fn := range activeProxyStreams {
+			closers = append(closers, fn)
+			delete(activeProxyStreams, id)
+		}
 	}
 	proxyStreamsMu.Unlock()
 
@@ -592,6 +610,10 @@ func StartTunnelAdvanced(
 		effectiveMTU = normalizeMTU(maxMTU - awgCfg.S4)
 	}
 
+	// Ensure consecutive restarts/handovers advance past WireGuard's 20ms rate limit & TAI64N bucket
+	// BEFORE dev.Up() starts the keepalive initiation timer.
+	waitNextTai64nTick()
+
 	mu.Lock()
 
 	stopTunnelOnlyLocked()
@@ -633,6 +655,7 @@ func StartTunnelAdvanced(
 		mu.Unlock()
 		return 0, fmt.Errorf("failed to bring WireGuard device up: %w", err)
 	}
+	markHandshakeInitNow()
 
 	port, err := ensureMuxListenerLocked()
 	if err != nil {
@@ -655,7 +678,6 @@ func StartTunnelAdvanced(
 	activeRawEp = endpoint
 	activeUseDoH = useDoH
 	activeKeepAlive = keepAlive
-	prevInitAt := lastHandshakeInitAt
 	activeStartTime = time.Now()
 	baseRxBytes = 0
 	baseTxBytes = 0
@@ -663,19 +685,6 @@ func StartTunnelAdvanced(
 	muxStartupPend = false
 	notifyMuxWaitersLocked()
 
-	mu.Unlock()
-
-	// Ensure consecutive restarts/handovers advance past WireGuard's ~16.77ms TAI64N quantization bucket
-	// so the remote peer does not drop the new handshake initiation as a timestamp replay.
-	if !prevInitAt.IsZero() {
-		if sinceInit := time.Since(prevInitAt); sinceInit >= 0 && sinceInit < 25*time.Millisecond {
-			time.Sleep(25*time.Millisecond - sinceInit)
-		}
-	}
-	mu.Lock()
-	if activeDev == dev {
-		lastHandshakeInitAt = time.Now()
-	}
 	mu.Unlock()
 
 	// Kick off immediate Noise_IKpsk2 Handshake Initiation at t=0ms
