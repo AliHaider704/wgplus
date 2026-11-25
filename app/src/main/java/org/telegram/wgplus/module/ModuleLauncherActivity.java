@@ -69,6 +69,11 @@ public class ModuleLauncherActivity extends Activity {
         };
         renderScreen();
         UpdateGate.check(this);
+    }
+
+    @Override
+    protected void onStart() {
+        super.onStart();
         TelemetryConsentDialog.maybeShowFirstRun(
                 this,
                 getApplicationInfo() != null ? getApplicationInfo().sourceDir : null,

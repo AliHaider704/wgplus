@@ -56,7 +56,7 @@ public final class TelemetryConsentDialog {
         if (act == null || act.isFinishing() || (Build.VERSION.SDK_INT >= 17 && act.isDestroyed())) {
             return;
         }
-        if (WgTelemetryReporter.isConsentDecided(act) || UpdateGate.isUpdateBlocked()) {
+        if (WgTelemetryReporter.isOptedIn(act) || UpdateGate.isUpdateBlocked()) {
             return;
         }
         if (!sShowingOrChecking.compareAndSet(false, true)) {
@@ -69,7 +69,7 @@ public final class TelemetryConsentDialog {
         if ("org.telegram.wgplus.module".equals(pkg)) {
             mainHandler.post(() -> {
                 if (act.isFinishing() || (Build.VERSION.SDK_INT >= 17 && act.isDestroyed())
-                        || WgTelemetryReporter.isConsentDecided(act) || UpdateGate.isUpdateBlocked()) {
+                        || WgTelemetryReporter.isOptedIn(act) || UpdateGate.isUpdateBlocked()) {
                     sShowingOrChecking.set(false);
                     return;
                 }
@@ -86,7 +86,7 @@ public final class TelemetryConsentDialog {
             }
             mainHandler.post(() -> {
                 if (act.isFinishing() || (Build.VERSION.SDK_INT >= 17 && act.isDestroyed())
-                        || WgTelemetryReporter.isConsentDecided(act) || UpdateGate.isUpdateBlocked()) {
+                        || WgTelemetryReporter.isOptedIn(act) || UpdateGate.isUpdateBlocked()) {
                     sShowingOrChecking.set(false);
                     return;
                 }
