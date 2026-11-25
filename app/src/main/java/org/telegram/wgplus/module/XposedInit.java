@@ -989,6 +989,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                     return 2;
                 }
                 WgDiagnosticsLog.record("VOIP", "RELAY_MISS", "port=" + rawPort + " rtc=" + isRtc);
+                WgTelemetryReporter.reportAnomalyAsync(ctx, MODULE_PATH, "VOIP_RELAY_MISS", "port=" + rawPort + " rtc=" + isRtc);
             }
 
             if (ks && !tunnelUp) {

@@ -1463,4 +1463,84 @@ public final class WgStrings {
                 ? "تم تشفير ونسخ " + ltr(String.valueOf(count)) + " خوادم بصيغة " + ltr("wgplus-backup-v1") + "."
                 : "Encrypted and copied " + count + " server(s) in wgplus-backup-v1 format.";
     }
+
+    public static String telemetryConsentTitle(boolean ar) {
+        return ar ? "المساهمة في تحسين استقرار التطبيق" : "Help improve connection reliability";
+    }
+
+    public static String telemetryConsentIntro(boolean ar) {
+        return ar
+                ? "هل توافق على إرسال تقارير الأخطاء التقنية تلقائي\u064B\u0627 إلى المطور عند حدوث تعثّر في الاتصال أو المكالمات؟ تساعدنا هذه التقارير على اكتشاف مشاكل الأجهزة والشبكات وإصلاحها بشكل أسرع."
+                : "Do you agree to automatically send anonymous error reports to the developer when connection or call failures happen? These reports help us find and fix device and network issues faster.";
+    }
+
+    public static String telemetryConsentPrivacyHeading(boolean ar) {
+        return ar ? "ضمانات الخصوصية والبيانات المرسلة:" : "Privacy and data guarantees:";
+    }
+
+    public static String telemetryConsentPointKeys(boolean ar) {
+        return ar
+                ? "• تُحذف المفاتيح الخاصة وعناوين الخوادم وكلمات المرور تلقائي\u064B\u0627 قبل الإرسال."
+                : "• Private keys, server endpoints, and passwords are stripped automatically before sending.";
+    }
+
+    public static String telemetryConsentPointNoPersonal(boolean ar) {
+        return ar
+                ? "• لا يتم جمع أي رسائل أو أرقام هواتف أو جهات اتصال أو معرّفات لحسابك في تيليجرام."
+                : "• No messages, phone numbers, contacts, or Telegram account identifiers are ever collected.";
+    }
+
+    public static String telemetryConsentPointControl(boolean ar) {
+        return ar
+                ? "• يُرسل فقط سجل الأعطال وطراز الجهاز ونظام التشغيل، ويمكنك إيقاف ذلك بأي وقت من نافذة التشخيص."
+                : "• Only error logs, Android version, and device model are sent, and you can toggle this anytime in Diagnostics.";
+    }
+
+    public static String telemetryConsentAcceptBtn(boolean ar) {
+        return ar ? "موافقة وتفعيل الإرسال التلقائي" : "Allow automatic error reports";
+    }
+
+    public static String telemetryConsentDeclineBtn(boolean ar) {
+        return ar ? "عدم الإرسال الآن" : "No thanks";
+    }
+
+    public static String telemetryAutoSwitchLabel(boolean ar) {
+        return ar ? "الإرسال التلقائي لسجل الأخطاء للمطور" : "Send error logs automatically to developer";
+    }
+
+    public static String telemetryAutoStatusSummary(boolean ar, boolean enabled) {
+        if (ar) {
+            return enabled
+                    ? "مفعّل: تُرسل تقارير الأعطال المنظّفة تلقائي\u064B\u0627 عند حدوث خلل دون أي بيانات سرية."
+                    : "متوقف: لن يُرسل أي تقرير تلقائي\u064B\u0627 إلا عند ضغطك على زر الإرسال يدوي\u064B\u0627.";
+        }
+        return enabled
+                ? "Enabled: sanitized failure reports are sent automatically with secrets removed."
+                : "Disabled: reports are sent only when you choose Send Report manually.";
+    }
+
+    public static String telemetrySendNowBtn(boolean ar, boolean busy) {
+        if (busy) {
+            return ar ? "جارٍ إرسال التقرير..." : "Sending report...";
+        }
+        return ar ? "إرسال تقرير التشخيص للمطور الآن" : "Send report to developer now";
+    }
+
+    public static String telemetrySentSuccessToast(boolean ar) {
+        return ar
+                ? "تم إرسال التقرير المنظّف للمطور بنجاح. شكر\u064B\u0627 لمساهمتك!"
+                : "Sanitized diagnostic report sent to developer. Thank you!";
+    }
+
+    public static String telemetrySentFailedToast(boolean ar) {
+        return ar
+                ? "تعذّر إرسال التقرير حالي\u064B\u0627. تحقق من الاتصال أو انسخ التقرير."
+                : "Could not send report right now. Check connection or copy the report.";
+    }
+
+    public static String telemetryRateLimitedToast(boolean ar) {
+        return ar
+                ? "تم إرسال تقرير قبل لحظات. انتظر بضع ثوانٍ ثم حاول مجدد\u064B\u0627."
+                : "A report was just sent. Wait a few seconds before sending again.";
+    }
 }

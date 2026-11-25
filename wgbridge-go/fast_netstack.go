@@ -29,6 +29,7 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/transport/icmp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/tcp"
 	"gvisor.dev/gvisor/pkg/tcpip/transport/udp"
+	"gvisor.dev/gvisor/pkg/waiter"
 )
 
 const (
@@ -355,8 +356,53 @@ func convertToFullAddrFast(endpoint netip.AddrPort) (tcpip.FullAddress, tcpip.Ne
 }
 
 func (fnet *fastNet) DialContextTCPAddrPort(ctx context.Context, addr netip.AddrPort) (*gonet.TCPConn, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	fa, pn := convertToFullAddrFast(addr)
-	return gonet.DialContextTCP(ctx, fnet.stack, fa, pn)
+	var wq waiter.Queue
+	ep, tcpErr := fnet.stack.NewEndpoint(tcp.ProtocolNumber, pn, &wq)
+	if tcpErr != nil {
+		return nil, errors.New(tcpErr.String())
+	}
+	ep.SocketOptions().SetKeepAlive(true)
+	keepIdle := tcpip.KeepaliveIdleOption(25 * time.Second)
+	_ = ep.SetSockOpt(&keepIdle)
+	keepIntvl := tcpip.KeepaliveIntervalOption(10 * time.Second)
+	_ = ep.SetSockOpt(&keepIntvl)
+	_ = ep.SetSockOptInt(tcpip.KeepaliveCountOption, 3)
+
+	waitEntry, notifyCh := waiter.NewChannelEntry(waiter.WritableEvents)
+	wq.EventRegister(&waitEntry)
+	defer wq.EventUnregister(&waitEntry)
+
+	select {
+	case <-ctx.Done():
+		ep.Close()
+		return nil, ctx.Err()
+	default:
+	}
+
+	tcpErr = ep.Connect(fa)
+	if _, ok := tcpErr.(*tcpip.ErrConnectStarted); ok {
+		select {
+		case <-ctx.Done():
+			ep.Close()
+			return nil, ctx.Err()
+		case <-notifyCh:
+		}
+		tcpErr = ep.LastError()
+	}
+	if tcpErr != nil {
+		ep.Close()
+		return nil, &net.OpError{
+			Op:   "connect",
+			Net:  "tcp",
+			Addr: &net.TCPAddr{IP: net.IP(addr.Addr().AsSlice()), Port: int(addr.Port())},
+			Err:  errors.New(tcpErr.String()),
+		}
+	}
+	return gonet.NewTCPConn(&wq, ep), nil
 }
 
 func (fnet *fastNet) ListenTCPAddrPort(addr netip.AddrPort) (*gonet.TCPListener, error) {

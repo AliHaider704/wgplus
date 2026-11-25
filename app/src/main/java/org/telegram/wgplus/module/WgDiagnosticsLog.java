@@ -26,26 +26,40 @@ public final class WgDiagnosticsLog {
     private static final int MAX_EVENTS = 160;
     private static final List<String> EVENTS = new ArrayList<>(MAX_EVENTS);
     private static final Pattern KV_SECRET_RE = Pattern.compile(
-            "(?i)\\b(private_?key|preshared_?key|pass(?:word|phrase)?|secret|auth|token)\\s*[:=]\\s*([^\\s,;]+)"
+            "(?i)\\b((?:socks_?|proxy_?|shared_?)?(?:private_?key|preshared_?key|pass(?:word|phrase)?|secret|auth|token))\\s*[:=]\\s*([^\\s,;]+)"
     );
-    private static final Pattern B64_KEY_RE = Pattern.compile("\\b[A-Za-z0-9+/]{42,44}=\\b");
+    private static final Pattern B64_KEY_RE = Pattern.compile("(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{42,44}=(?![A-Za-z0-9+/=])");
+    private static final Pattern HEX_KEY_RE = Pattern.compile("\\b[0-9a-fA-F]{64}\\b");
     private static final Pattern ENDPOINT_RE = Pattern.compile(
             "(?i)(endpoint\\s*[:=]\\s*)([^\\s,;]+)"
+    );
+    private static final Pattern IP_PORT_RE = Pattern.compile(
+            "\\b(?!127\\.)(?:\\d{1,3}\\.){3}\\d{1,3}:\\d{1,5}\\b"
     );
 
     private WgDiagnosticsLog() {
     }
 
     public static String sanitize(String raw) {
+        return sanitizeWithLimit(raw, 360);
+    }
+
+    public static String sanitizeReportText(String raw, int maxChars) {
+        return sanitizeWithLimit(raw, Math.max(64, maxChars));
+    }
+
+    private static String sanitizeWithLimit(String raw, int maxLen) {
         if (raw == null || raw.isEmpty()) {
             return "";
         }
         String s = raw.trim();
         s = KV_SECRET_RE.matcher(s).replaceAll("$1=[REDACTED]");
         s = ENDPOINT_RE.matcher(s).replaceAll("$1[ENDPOINT_REDACTED]");
+        s = IP_PORT_RE.matcher(s).replaceAll("[IP_PORT_REDACTED]");
         s = B64_KEY_RE.matcher(s).replaceAll("[KEY_REDACTED]");
-        if (s.length() > 360) {
-            s = s.substring(0, 360) + "...";
+        s = HEX_KEY_RE.matcher(s).replaceAll("[HEX_KEY_REDACTED]");
+        if (s.length() > maxLen) {
+            s = s.substring(0, maxLen) + "...";
         }
         return s;
     }

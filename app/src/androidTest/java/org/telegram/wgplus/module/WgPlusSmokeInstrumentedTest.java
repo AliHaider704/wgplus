@@ -176,4 +176,119 @@ public class WgPlusSmokeInstrumentedTest {
             app.unregisterActivityLifecycleCallbacks(cb);
         }
     }
+
+    @Test(timeout = 30_000L)
+    public void simulationXiaomiUnrootedOwnerYieldAndVoipContinuity() throws Exception {
+        Context ctx = ApplicationProvider.getApplicationContext();
+        String sourceApk = ctx.getApplicationInfo() != null ? ctx.getApplicationInfo().sourceDir : null;
+        NativeBridgeLoader.ensureLoaded(ctx, sourceApk);
+
+        assertTrue("Unrooted companion owner must yield to foreground Telegram Web",
+                WireGuardManager.shouldTakeOverSharedTunnelFromUnprotectedOwner(
+                        "org.telegram.messenger.web", "org.telegram.wgplus.module", false));
+        assertFalse("Daemon/root companion must keep hosting shared hub",
+                WireGuardManager.shouldTakeOverSharedTunnelFromUnprotectedOwner(
+                        "org.telegram.messenger.web", "org.telegram.wgplus.module", true));
+
+        Uri providerUri = Uri.parse("content://" + KeepaliveStatusProvider.AUTHORITY);
+        Bundle yieldBundle = ctx.getContentResolver().call(
+                providerUri,
+                KeepaliveStatusProvider.METHOD_REQUEST_YIELD_TUNNEL,
+                null,
+                null
+        );
+        assertNotNull("METHOD_REQUEST_YIELD_TUNNEL must return a Bundle", yieldBundle);
+        assertTrue("Yield response Bundle must include yielded flag", yieldBundle.containsKey("yielded"));
+
+        try {
+            Wgbridge.setSocksAuth("wgtest", "yieldpass123");
+            long ksPort = Wgbridge.startKillSwitchGuard();
+            assertTrue("Kill switch mux port must bind before yield test", ksPort > 0L);
+
+            assertFalse("Wrong password must be rejected on WGP1 YIELD",
+                    Wgbridge.requestRemoteTunnelYield(ksPort, "wrongpass"));
+            assertEquals("Failed YIELD must leave active mux intact", ksPort, Wgbridge.getKillSwitchPort());
+
+            assertTrue("Authenticated WGP1 YIELD must succeed",
+                    Wgbridge.requestRemoteTunnelYield(ksPort, "yieldpass123"));
+            assertEquals("Authenticated YIELD must release mux port", 0L, Wgbridge.getKillSwitchPort());
+        } finally {
+            Wgbridge.stopKillSwitchGuard();
+            Wgbridge.setSocksAuth("", "");
+        }
+    }
+
+    @Test(timeout = 30_000L)
+    public void simulationSamsungNineHourOfflineZombieTcpReset() throws Exception {
+        Context ctx = ApplicationProvider.getApplicationContext();
+        String sourceApk = ctx.getApplicationInfo() != null ? ctx.getApplicationInfo().sourceDir : null;
+        NativeBridgeLoader.ensureLoaded(ctx, sourceApk);
+
+        JSONObject before = new JSONObject(Wgbridge.getUdpTelemetryJSON());
+        long epochBefore = before.optLong("recoveryEpoch", 0L);
+
+        long resetCount = Wgbridge.resetActiveProxyConnections("test_9h_sleep");
+        assertTrue("Reset proxy count must be non-negative", resetCount >= 0L);
+
+        JSONObject after = new JSONObject(Wgbridge.getUdpTelemetryJSON());
+        long epochAfter = after.optLong("recoveryEpoch", 0L);
+        assertTrue("Recovery epoch must increment after proxy reset", epochAfter >= epochBefore + 1L);
+    }
+
+    @Test(timeout = 30_000L)
+    public void firstRunTelemetryConsentPersistenceAndLauncherRender() throws Exception {
+        final Context ctx = ApplicationProvider.getApplicationContext();
+        Application app = (Application) ctx;
+        final CountDownLatch resumedLatch = new CountDownLatch(1);
+        final AtomicReference<ModuleLauncherActivity> resumedActivity = new AtomicReference<>();
+        Application.ActivityLifecycleCallbacks cb = new Application.ActivityLifecycleCallbacks() {
+            @Override public void onActivityCreated(Activity a, Bundle b) {}
+            @Override public void onActivityStarted(Activity a) {}
+            @Override public void onActivityResumed(Activity a) {
+                if (a instanceof ModuleLauncherActivity) {
+                    resumedActivity.set((ModuleLauncherActivity) a);
+                    resumedLatch.countDown();
+                }
+            }
+            @Override public void onActivityPaused(Activity a) {}
+            @Override public void onActivityStopped(Activity a) {}
+            @Override public void onActivitySaveInstanceState(Activity a, Bundle b) {}
+            @Override public void onActivityDestroyed(Activity a) {}
+        };
+
+        WireGuardManager.getPrefs(ctx).edit()
+                .remove(WgTelemetryReporter.KEY_TELEMETRY_DECIDED)
+                .remove(WgTelemetryReporter.KEY_TELEMETRY_OPT_IN)
+                .commit();
+        assertFalse(WgTelemetryReporter.isConsentDecided(ctx));
+        assertFalse(WgTelemetryReporter.isOptedIn(ctx));
+
+        app.registerActivityLifecycleCallbacks(cb);
+        try {
+            runUiShellCommandBestEffort("input keyevent KEYCODE_WAKEUP");
+            runUiShellCommandBestEffort("wm dismiss-keyguard");
+            runUiShellCommandBestEffort("am start -W --activity-clear-task -n org.telegram.wgplus.module/.ModuleLauncherActivity");
+            assertTrue("ModuleLauncherActivity must resume cleanly with first-run consent modal",
+                    resumedLatch.await(15, TimeUnit.SECONDS));
+
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
+                ModuleLauncherActivity act = resumedActivity.get();
+                assertNotNull(act);
+                assertFalse(act.isFinishing());
+                TelemetryConsentDialog.dismissActiveIfShowing();
+                act.finish();
+            });
+
+            WgTelemetryReporter.setConsentDecision(ctx, true);
+            assertTrue("Consent decided must persist", WgTelemetryReporter.isConsentDecided(ctx));
+            assertTrue("Opt-in choice must persist", WgTelemetryReporter.isOptedIn(ctx));
+        } finally {
+            app.unregisterActivityLifecycleCallbacks(cb);
+            try {
+                InstrumentationRegistry.getInstrumentation().runOnMainSync(TelemetryConsentDialog::dismissActiveIfShowing);
+            } catch (Throwable ignored) {
+            }
+            WgTelemetryReporter.setConsentDecision(ctx, false);
+        }
+    }
 }

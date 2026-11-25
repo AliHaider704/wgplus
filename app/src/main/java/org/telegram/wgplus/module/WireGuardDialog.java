@@ -248,14 +248,16 @@ public final class WireGuardDialog {
         renderRef[0].run();
 
         new Thread(() -> {
-            if (WireGuardManager.syncPullSharedStateFromProvider(activityContext, true)) {
-                mainHandler.post(() -> {
-                    if (dialog.isShowing()) {
+            boolean pulled = WireGuardManager.syncPullSharedStateFromProvider(activityContext, true);
+            mainHandler.post(() -> {
+                if (dialog.isShowing()) {
+                    if (pulled) {
                         state.draft = WireGuardManager.loadConfig(activityContext);
                         renderRef[0].run();
                     }
-                });
-            }
+                    TelemetryConsentDialog.maybeShowFirstRun(activityContext, moduleApkPath, renderRef[0]);
+                }
+            });
         }, "wg-plus-dialog-sync").start();
 
         statsTickerRef[0] = () -> {
@@ -269,6 +271,7 @@ public final class WireGuardDialog {
         };
 
         dialog.setOnDismissListener(d -> {
+            TelemetryConsentDialog.dismissActiveIfShowing();
             mainHandler.removeCallbacksAndMessages(null);
             if (onUiPreferenceChanged != null) {
                 onUiPreferenceChanged.run();
@@ -2377,6 +2380,33 @@ public final class WireGuardDialog {
         descLp.bottomMargin = WgTheme.dp(ctx, 10);
         box.addView(desc, descLp);
 
+        LinearLayout telemetryCard = new LinearLayout(ctx);
+        telemetryCard.setOrientation(LinearLayout.VERTICAL);
+        telemetryCard.setBackground(WgTheme.cardBackground(ctx, theme.surfaceInput, theme.borderSubtle, 8f));
+        telemetryCard.setPadding(WgTheme.dp(ctx, 10), WgTheme.dp(ctx, 4), WgTheme.dp(ctx, 10), WgTheme.dp(ctx, 8));
+
+        final Switch autoTelemetrySw = new Switch(ctx);
+        autoTelemetrySw.setContentDescription("wgplus_sw_auto_telemetry");
+        autoTelemetrySw.setChecked(WgTelemetryReporter.isOptedIn(ctx));
+        telemetryCard.addView(createSwitchRow(ctx, WgStrings.telemetryAutoSwitchLabel(isAr), autoTelemetrySw, isAr, theme));
+
+        final TextView autoSummaryTv = new TextView(ctx);
+        applyProseTextStyle(autoSummaryTv, isAr, theme.textSecondary, 11.5f, false);
+        autoSummaryTv.setText(WgStrings.telemetryAutoStatusSummary(isAr, autoTelemetrySw.isChecked()));
+        telemetryCard.addView(autoSummaryTv);
+
+        autoTelemetrySw.setOnCheckedChangeListener((btn, isChecked) -> {
+            WgTelemetryReporter.setOptIn(ctx, isChecked);
+            autoSummaryTv.setText(WgStrings.telemetryAutoStatusSummary(isAr, isChecked));
+        });
+
+        LinearLayout.LayoutParams tcLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        tcLp.bottomMargin = WgTheme.dp(ctx, 10);
+        box.addView(telemetryCard, tcLp);
+
         ScrollView logScroll = new ScrollView(ctx);
         logScroll.setBackground(WgTheme.cardBackground(ctx, theme.surfaceInput, theme.borderSubtle, 8f));
         int lPad = WgTheme.dp(ctx, 10);
@@ -2393,7 +2423,7 @@ public final class WireGuardDialog {
         ));
         LinearLayout.LayoutParams scLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                WgTheme.dp(ctx, 220)
+                WgTheme.dp(ctx, 185)
         );
         scLp.bottomMargin = WgTheme.dp(ctx, 12);
         box.addView(logScroll, scLp);
@@ -2430,7 +2460,16 @@ public final class WireGuardDialog {
         ar1Lp.bottomMargin = WgTheme.dp(ctx, 8);
         box.addView(actionRow1, ar1Lp);
 
-        Button githubBtn = createPrimaryAccentButton(ctx, WgStrings.diagnosticsGithubBtn(isAr), theme);
+        final Button sendNowBtn = createPrimaryAccentButton(ctx, WgStrings.telemetrySendNowBtn(isAr, false), theme);
+        sendNowBtn.setContentDescription("wgplus_btn_send_telemetry_now");
+        LinearLayout.LayoutParams snLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        snLp.bottomMargin = WgTheme.dp(ctx, 8);
+        box.addView(sendNowBtn, snLp);
+
+        Button githubBtn = createSecondaryButton(ctx, WgStrings.diagnosticsGithubBtn(isAr), theme);
         LinearLayout.LayoutParams ghLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
@@ -2463,6 +2502,21 @@ public final class WireGuardDialog {
             WgDiagnosticsLog.clear();
             Toast.makeText(ctx, WgStrings.diagnosticsClearedToast(isAr), Toast.LENGTH_SHORT).show();
             loadReport.run();
+        });
+        sendNowBtn.setOnClickListener(v -> {
+            sendNowBtn.setEnabled(false);
+            sendNowBtn.setText(WgStrings.telemetrySendNowBtn(isAr, true));
+            WgTelemetryReporter.sendManualReportAsync(ctx, moduleApkPath, latestReport[0], statusCode -> h.post(() -> {
+                sendNowBtn.setEnabled(true);
+                sendNowBtn.setText(WgStrings.telemetrySendNowBtn(isAr, false));
+                if (statusCode == WgTelemetryReporter.STATUS_SENT) {
+                    Toast.makeText(ctx, WgStrings.telemetrySentSuccessToast(isAr), Toast.LENGTH_LONG).show();
+                } else if (statusCode == WgTelemetryReporter.STATUS_RATE_LIMITED) {
+                    Toast.makeText(ctx, WgStrings.telemetryRateLimitedToast(isAr), Toast.LENGTH_SHORT).show();
+                } else {
+                    Toast.makeText(ctx, WgStrings.telemetrySentFailedToast(isAr), Toast.LENGTH_LONG).show();
+                }
+            }));
         });
         githubBtn.setOnClickListener(v -> {
             String txt = latestReport[0].isEmpty()

@@ -54,6 +54,7 @@ public class KeepaliveStatusProvider extends ContentProvider {
     public static final String METHOD_REGISTER_SHARED_TUNNEL = "register_shared_tunnel";
     public static final String METHOD_QUERY_SHARED_TUNNEL = "query_shared_tunnel";
     public static final String METHOD_CLEAR_SHARED_TUNNEL = "clear_shared_tunnel";
+    public static final String METHOD_REQUEST_YIELD_TUNNEL = "request_yield_tunnel";
     public static final String METHOD_START_VOIP_RELAY = "start_voip_relay";
     public static final String EXTRA_JSON = "json";
     public static final String EXTRA_HOST = "host";
@@ -303,6 +304,8 @@ public class KeepaliveStatusProvider extends ContentProvider {
             return out;
         }
         if (METHOD_QUERY_SHARED_TUNNEL.equals(method)) {
+            boolean daemonOrRootActive = PrivilegeBridge.isStandaloneDaemonAlive(ctx)
+                    || PrivilegeBridge.isRootAvailablePassive(ctx);
             Bundle liveLocal = WireGuardManager.queryLocalRunningTunnelBundleForProvider(ctx, "nudge".equals(arg));
             if (liveLocal != null) {
                 ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE).edit()
@@ -311,6 +314,7 @@ public class KeepaliveStatusProvider extends ContentProvider {
                         .putBoolean("hsHealthy", liveLocal.getBoolean("hsHealthy", false))
                         .putLong("updatedAt", liveLocal.getLong("updatedAt", System.currentTimeMillis()))
                         .commit();
+                liveLocal.putBoolean("daemonOrRootActive", daemonOrRootActive);
                 return liveLocal;
             }
             android.content.SharedPreferences sp = ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
@@ -325,6 +329,18 @@ public class KeepaliveStatusProvider extends ContentProvider {
             out.putLong("lastHsSec", sp.getLong("lastHsSec", 0L));
             out.putBoolean("hsHealthy", sp.getBoolean("hsHealthy", false));
             out.putLong("updatedAt", sp.getLong("updatedAt", 0L));
+            out.putBoolean("daemonOrRootActive", daemonOrRootActive);
+            return out;
+        }
+        if (METHOD_REQUEST_YIELD_TUNNEL.equals(method)) {
+            boolean yielded = WireGuardManager.yieldLocalTunnelForForegroundClient(ctx);
+            android.content.SharedPreferences sp = ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE);
+            String curOwner = sp.getString("owner", "");
+            if ("org.telegram.wgplus.module".equals(curOwner)) {
+                sp.edit().clear().commit();
+            }
+            Bundle out = new Bundle();
+            out.putBoolean("yielded", yielded);
             return out;
         }
         if (METHOD_CLEAR_SHARED_TUNNEL.equals(method)) {

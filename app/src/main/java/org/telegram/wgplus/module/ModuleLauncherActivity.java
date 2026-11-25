@@ -69,11 +69,17 @@ public class ModuleLauncherActivity extends Activity {
         };
         renderScreen();
         UpdateGate.check(this);
+        TelemetryConsentDialog.maybeShowFirstRun(
+                this,
+                getApplicationInfo() != null ? getApplicationInfo().sourceDir : null,
+                this::renderScreen
+        );
     }
 
     @Override
     protected void onDestroy() {
         mDestroyed = true;
+        TelemetryConsentDialog.dismissActiveIfShowing();
         mUiHandler.removeCallbacksAndMessages(null);
         super.onDestroy();
     }

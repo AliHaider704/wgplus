@@ -51,6 +51,7 @@ var (
 	activeUseDoH             bool
 	activeKeepAlive          int
 	activeStartTime          time.Time
+	lastHandshakeInitAt      time.Time
 	baseRxBytes              uint64
 	baseTxBytes              uint64
 	running                  bool
@@ -67,6 +68,10 @@ var (
 	socksAuthUser         string
 	socksAuthPass         string
 	lastSocksAuthDiagNano atomic.Int64
+
+	proxyStreamsMu     sync.Mutex
+	nextProxyStreamID  uint64
+	activeProxyStreams = make(map[uint64]func())
 
 	tcpCopyBufPool = sync.Pool{
 		New: func() any {
@@ -409,6 +414,52 @@ func GetRecoveryEpoch() int64 {
 	return recoveryEpoch.Load()
 }
 
+func registerProxyStream(closeFn func()) uint64 {
+	if closeFn == nil {
+		return 0
+	}
+	proxyStreamsMu.Lock()
+	nextProxyStreamID++
+	id := nextProxyStreamID
+	activeProxyStreams[id] = closeFn
+	proxyStreamsMu.Unlock()
+	return id
+}
+
+func unregisterProxyStream(id uint64) {
+	if id == 0 {
+		return
+	}
+	proxyStreamsMu.Lock()
+	delete(activeProxyStreams, id)
+	proxyStreamsMu.Unlock()
+}
+
+// ResetActiveProxyConnections forcefully closes all open local SOCKS5 TCP and UDP proxy streams
+// so Telegram tgnet immediately drops zombie loopback sockets after long sleep or session expiry.
+func ResetActiveProxyConnections(reason string) int {
+	proxyStreamsMu.Lock()
+	if len(activeProxyStreams) == 0 {
+		proxyStreamsMu.Unlock()
+		return 0
+	}
+	closers := make([]func(), 0, len(activeProxyStreams))
+	for id, fn := range activeProxyStreams {
+		closers = append(closers, fn)
+		delete(activeProxyStreams, id)
+	}
+	proxyStreamsMu.Unlock()
+
+	for _, fn := range closers {
+		if fn != nil {
+			fn()
+		}
+	}
+	recoveryEpoch.Add(1)
+	RecordDiag("TUNNEL", "PROXY_RESET", fmt.Sprintf("closed=%d reason=%s", len(closers), strings.TrimSpace(reason)))
+	return len(closers)
+}
+
 func readActiveTotals(dev *device.Device) (rx uint64, tx uint64, hsSec int64) {
 	rawRx, rawTx, hs := readDeviceCounters(dev)
 	mu.Lock()
@@ -604,6 +655,7 @@ func StartTunnelAdvanced(
 	activeRawEp = endpoint
 	activeUseDoH = useDoH
 	activeKeepAlive = keepAlive
+	prevInitAt := lastHandshakeInitAt
 	activeStartTime = time.Now()
 	baseRxBytes = 0
 	baseTxBytes = 0
@@ -611,6 +663,19 @@ func StartTunnelAdvanced(
 	muxStartupPend = false
 	notifyMuxWaitersLocked()
 
+	mu.Unlock()
+
+	// Ensure consecutive restarts/handovers advance past WireGuard's ~16.77ms TAI64N quantization bucket
+	// so the remote peer does not drop the new handshake initiation as a timestamp replay.
+	if !prevInitAt.IsZero() {
+		if sinceInit := time.Since(prevInitAt); sinceInit >= 0 && sinceInit < 25*time.Millisecond {
+			time.Sleep(25*time.Millisecond - sinceInit)
+		}
+	}
+	mu.Lock()
+	if activeDev == dev {
+		lastHandshakeInitAt = time.Now()
+	}
 	mu.Unlock()
 
 	// Kick off immediate Noise_IKpsk2 Handshake Initiation at t=0ms
@@ -726,6 +791,9 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 				watchdogRecoveries.Add(1)
 				RecordDiag("WATCHDOG", "STALL_HOP", fmt.Sprintf("txDelta=%d hsAge=%d", txDelta, hsAge))
 				hopActivePeer(true, true)
+				if hsAge >= 180 {
+					ResetActiveProxyConnections("watchdog_expired_stall")
+				}
 				lastHardHopAt = time.Now()
 				stalledTicks = 0
 				lastRx, lastTx, _ = readActiveTotals(dev)
@@ -891,9 +959,13 @@ func EnsureTunnelAlive(timeoutMs int) bool {
 		}
 	}
 
+	wasExpired := hsSec <= 0 || (nowSec-hsSec) >= 180
 	RecordDiag("TUNNEL", "ENSURE_HOP", fmt.Sprintf("hsSec=%d timeoutMs=%d", hsSec, timeoutMs))
 	if !hopActivePeer(true, true) {
 		return false
+	}
+	if wasExpired {
+		ResetActiveProxyConnections("expired_handshake_recovery")
 	}
 	waitDur := time.Duration(timeoutMs) * time.Millisecond
 	if waitDur < 1500*time.Millisecond {
@@ -1411,6 +1483,20 @@ func RequestRemoteVoipRelayAddr(muxPort int, socksPass string, targetHost string
 	return ""
 }
 
+// RequestRemoteTunnelYield asks a live local mux owner over authenticated WGP1 to release
+// its tunnel, kill switch guard, and local mux port for foreground takeover.
+func RequestRemoteTunnelYield(muxPort int, socksPass string) bool {
+	if muxPort < 1 || muxPort > 65535 {
+		return false
+	}
+	resp := SendLocalWgp1Command(muxPort, socksPass, "YIELD", 800)
+	if !strings.HasPrefix(resp, "OK") {
+		return false
+	}
+	time.Sleep(25 * time.Millisecond)
+	return true
+}
+
 func handleWgpControlConn(client net.Conn, firstByte byte) {
 	_ = client.SetDeadline(time.Now().Add(2 * time.Second))
 	buf := make([]byte, 512)
@@ -1506,6 +1592,12 @@ func handleWgpControlConn(client net.Conn, firstByte byte) {
 		} else {
 			_, _ = fmt.Fprintf(client, "OK %t %t %d\n", isUp, hsHealthy, hsSec)
 		}
+	case "YIELD":
+		SetKillSwitchArmed(false)
+		StopKillSwitchGuard()
+		StopTunnel()
+		RecordDiag("TUNNEL", "YIELDED", "released local mux on authenticated YIELD")
+		_, _ = client.Write([]byte("OK YIELDED\n"))
 	default:
 		_, _ = client.Write([]byte("ERR CMD\n"))
 	}
@@ -1652,13 +1744,22 @@ func handleTcpConnectTracked(ctx context.Context, client net.Conn, dialer udpDia
 }
 
 func relayTcpBidirectional(ctx context.Context, client, remote net.Conn, statEnt *clientStatEntry) {
+	var closeOnce sync.Once
+	closePair := func() {
+		closeOnce.Do(func() {
+			_ = client.Close()
+			_ = remote.Close()
+		})
+	}
+	streamID := registerProxyStream(closePair)
+	defer unregisterProxyStream(streamID)
+
 	stopDone := make(chan struct{})
 	defer close(stopDone)
 	go func() {
 		select {
 		case <-ctx.Done():
-			_ = client.Close()
-			_ = remote.Close()
+			closePair()
 		case <-stopDone:
 		}
 	}()
@@ -1920,6 +2021,12 @@ func handleUdpAssociateTracked(ctx context.Context, tcpControl net.Conn, dialer 
 		}
 		sessMu.Unlock()
 	}
+	streamID := registerProxyStream(func() {
+		assocCancel()
+		_ = udpLn.Close()
+		_ = tcpControl.Close()
+	})
+	defer unregisterProxyStream(streamID)
 	defer cleanupAll()
 
 	// Tear down immediately if parent tunnel context cancels

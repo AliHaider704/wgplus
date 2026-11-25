@@ -846,6 +846,88 @@ public class WgPlusFeatureSuiteTest {
         assertTrue(WireGuardManager.PROACTIVE_HANDSHAKE_NUDGE_AGE_SEC < WireGuardManager.HANDSHAKE_HEALTHY_WINDOW_SEC);
     }
 
+    @Test
+    public void testTelemetryFirestoreSchemaAndRedaction() throws Exception {
+        String hex64 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        String dirtyRaw = "### WireGuard Plus Diagnostics (Android)\n"
+                + "- Device / OS: Xiaomi 23129RAA4G (Android 15 / API 35)\n"
+                + "- PrivateKey = " + SAMPLE_PRIV_B64 + "\n"
+                + "- PskHex = " + hex64 + "\n"
+                + "- socksPass=secret-pass-999\n"
+                + "- Endpoint: 162.159.193.10:2408\n"
+                + "[2026-11-25T07:24:21Z] [VOIP_RELAY/OPEN] target=91.108.9.58:1400 localPort=42842\n"
+                + "[2026-11-25T07:24:21Z] [VOIP/RELAY] 1400->127.0.0.1:48729 (rtc)\n";
+
+        String jsonStr = WgTelemetryReporter.buildFirestoreDocumentJsonFromParts(
+                "v2.0.0",
+                "org.telegram.messenger.web",
+                "13.3.1",
+                "Xiaomi 23129RAA4G",
+                "15",
+                35,
+                "FROZEN_OWNER_TAKEOVER",
+                "STANDARD_FGS",
+                dirtyRaw
+        );
+        assertNotNull(jsonStr);
+        assertFalse(jsonStr.isEmpty());
+
+        org.json.JSONObject root = new org.json.JSONObject(jsonStr);
+        org.json.JSONObject fields = root.getJSONObject("fields");
+        assertEquals(12, fields.length());
+        String[] expectedKeys = new String[]{
+                "schemaVersion", "createdAt", "moduleVersion", "hostPackage",
+                "hostVersion", "deviceModel", "androidRelease", "sdkInt",
+                "triggerCode", "continuityTier", "fingerprint", "reportMarkdown"
+        };
+        for (String key : expectedKeys) {
+            assertTrue("Missing Firestore field: " + key, fields.has(key));
+        }
+        assertEquals("1", fields.getJSONObject("schemaVersion").getString("integerValue"));
+        assertEquals("35", fields.getJSONObject("sdkInt").getString("integerValue"));
+        assertEquals("Xiaomi 23129RAA4G", fields.getJSONObject("deviceModel").getString("stringValue"));
+        assertEquals("org.telegram.messenger.web", fields.getJSONObject("hostPackage").getString("stringValue"));
+        assertEquals("FROZEN_OWNER_TAKEOVER", fields.getJSONObject("triggerCode").getString("stringValue"));
+
+        String reportMd = fields.getJSONObject("reportMarkdown").getString("stringValue");
+        assertFalse("Base64 key must be redacted", reportMd.contains(SAMPLE_PRIV_B64));
+        assertFalse("64-hex key must be redacted", reportMd.contains(hex64));
+        assertFalse("socksPass value must be redacted", reportMd.contains("secret-pass-999"));
+        assertFalse("Public peer IP:port must be redacted", reportMd.contains("162.159.193.10"));
+        assertFalse("Public relay target IP:port must be redacted", reportMd.contains("91.108.9.58"));
+        assertTrue("Loopback address should remain visible for debugging", reportMd.contains("127.0.0.1:48729"));
+    }
+
+    @Test
+    public void testSharedHubUnprotectedOwnerTakeoverDecisionAndStrings() {
+        assertTrue(WireGuardManager.shouldTakeOverSharedTunnelFromUnprotectedOwner(
+                "org.telegram.messenger.web", "org.telegram.wgplus.module", false));
+        assertTrue(WireGuardManager.shouldTakeOverSharedTunnelFromUnprotectedOwner(
+                "org.telegram.plus", "org.telegram.wgplus.module", false));
+        assertFalse(WireGuardManager.shouldTakeOverSharedTunnelFromUnprotectedOwner(
+                "org.telegram.messenger.web", "org.telegram.wgplus.module", true));
+        assertFalse(WireGuardManager.shouldTakeOverSharedTunnelFromUnprotectedOwner(
+                "org.telegram.wgplus.module", "org.telegram.wgplus.module", false));
+        assertFalse(WireGuardManager.shouldTakeOverSharedTunnelFromUnprotectedOwner(
+                "org.telegram.messenger.web", "org.telegram.plus", false));
+
+        boolean[] langs = new boolean[]{true, false};
+        for (boolean ar : langs) {
+            String[] checks = new String[]{
+                    WgStrings.telemetryAutoStatusSummary(ar, false),
+                    WgStrings.telemetryAutoStatusSummary(ar, true),
+                    WgStrings.telemetrySendNowBtn(ar, false),
+                    WgStrings.telemetrySendNowBtn(ar, true)
+            };
+            for (String s : checks) {
+                assertNotNull(s);
+                assertFalse(s.trim().isEmpty());
+                assertFalse("Em dash found: " + s, s.contains("\u2014"));
+                assertFalse("Tanween on alef found: " + s, s.contains("\u0627\u064B"));
+            }
+        }
+    }
+
     private static double contrastRatio(int rgb1, int rgb2) {
         double l1 = relativeLuminance(rgb1);
         double l2 = relativeLuminance(rgb2);

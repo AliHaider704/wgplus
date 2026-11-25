@@ -50,6 +50,9 @@ public final class NativeBridgeLoader {
         if (hostContext == null) {
             throw new IllegalArgumentException("hostContext cannot be null");
         }
+        String effectiveModulePath = (moduleApkPath == null || moduleApkPath.trim().isEmpty())
+                ? XposedInit.getModulePath()
+                : moduleApkPath.trim();
 
         Context appCtx = hostContext.getApplicationContext() != null
                 ? hostContext.getApplicationContext()
@@ -68,13 +71,13 @@ public final class NativeBridgeLoader {
         }
 
         try {
-            boolean fastPathHit = isFastPathValid(appCtx, moduleApkPath, targetSo, metaFile);
-            boolean extracted = fastPathHit || tryExtractFromCandidates(appCtx, moduleApkPath, targetSo);
+            boolean fastPathHit = isFastPathValid(appCtx, effectiveModulePath, targetSo, metaFile);
+            boolean extracted = fastPathHit || tryExtractFromCandidates(appCtx, effectiveModulePath, targetSo);
             if (extracted && targetSo.exists()) {
                 applyReadOnlyExecPermissions(targetSo);
                 System.load(targetSo.getAbsolutePath());
                 if (!fastPathHit) {
-                    writeFastPathMeta(appCtx, moduleApkPath, targetSo, metaFile);
+                    writeFastPathMeta(appCtx, effectiveModulePath, targetSo, metaFile);
                 }
             } else {
                 System.loadLibrary("gojni");
@@ -107,17 +110,45 @@ public final class NativeBridgeLoader {
         long hostLen = hostApk != null && hostApk.exists() ? hostApk.length() : 0L;
         long modLen = 0L;
         long modTime = 0L;
-        if (moduleApkPath != null && !moduleApkPath.isEmpty() && !moduleApkPath.contains("!/")) {
-            File mf = new File(moduleApkPath.trim());
-            if (mf.exists()) {
-                modLen = mf.length();
-                modTime = mf.lastModified();
+        long modCrc = 0L;
+        String resolvedPath = moduleApkPath != null ? moduleApkPath.trim() : "";
+        if (resolvedPath.isEmpty() && !"org.telegram.wgplus.module".equals(appCtx.getPackageName())) {
+            try {
+                android.content.pm.ApplicationInfo modAi = appCtx.getPackageManager()
+                        .getApplicationInfo("org.telegram.wgplus.module", 0);
+                if (modAi != null && modAi.sourceDir != null) {
+                    resolvedPath = modAi.sourceDir;
+                }
+            } catch (Throwable ignored) {
+            }
+        }
+        if (!resolvedPath.isEmpty()) {
+            if (resolvedPath.contains("!/")) {
+                String[] parts = resolvedPath.split("!/", 2);
+                File outerFile = new File(parts[0]);
+                if (outerFile.exists()) {
+                    modLen = outerFile.length();
+                    modTime = outerFile.lastModified();
+                    try (ZipFile outerZip = new ZipFile(outerFile)) {
+                        ZipEntry inner = outerZip.getEntry(parts[1]);
+                        if (inner != null) {
+                            modCrc = inner.getCrc() ^ inner.getSize();
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }
+            } else {
+                File mf = new File(resolvedPath);
+                if (mf.exists()) {
+                    modLen = mf.length();
+                    modTime = mf.lastModified();
+                }
             }
         }
         String abi = (Build.SUPPORTED_ABIS != null && Build.SUPPORTED_ABIS.length > 0)
                 ? Build.SUPPORTED_ABIS[0]
                 : "unknown";
-        return BuildConfigSafeVersion() + "|" + abi + "|" + hostMod + "|" + hostLen + "|" + modTime + "|" + modLen;
+        return BuildConfigSafeVersion() + "|" + abi + "|" + hostMod + "|" + hostLen + "|" + modTime + "|" + modLen + "|" + modCrc;
     }
 
     private static String BuildConfigSafeVersion() {
