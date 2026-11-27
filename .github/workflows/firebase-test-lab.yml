@@ -24,7 +24,7 @@ jobs:
     name: Firebase Test Lab Real-Device Matrix
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Check Firebase Test Lab credentials
         id: check_auth
