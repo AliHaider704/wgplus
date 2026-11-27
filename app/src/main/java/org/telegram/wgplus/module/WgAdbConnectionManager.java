@@ -162,6 +162,9 @@ public final class WgAdbConnectionManager extends AbsAdbConnectionManager {
         try {
             List<String> targets = collectTargets();
             String modulePkg = mAppCtx.getPackageName();
+            if (!DaemonProcessHelper.isSafeToken(modulePkg)) {
+                return false;
+            }
             String listenerComp = modulePkg + "/" + KeepaliveBridgeListenerService.class.getName();
             boolean daemonAlreadyAlive = PrivilegeBridge.isStandaloneDaemonAlive(mAppCtx);
             StringBuilder quickCmd = new StringBuilder();
@@ -172,7 +175,8 @@ public final class WgAdbConnectionManager extends AbsAdbConnectionManager {
                 quickCmd.append("pm grant ").append(modulePkg)
                         .append(" android.permission.WRITE_SECURE_SETTINGS 2>/dev/null || true; ");
             }
-            if (!KeepaliveBridgeListenerService.isNotificationListenerEnabled(mAppCtx)) {
+            if (!KeepaliveBridgeListenerService.isNotificationListenerEnabled(mAppCtx)
+                    && DaemonProcessHelper.isSafeComponent(listenerComp)) {
                 quickCmd.append("cmd notification allow_listener ").append(listenerComp)
                         .append(" 2>/dev/null || true; ");
             }

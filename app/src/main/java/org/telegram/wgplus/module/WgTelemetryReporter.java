@@ -273,7 +273,10 @@ public final class WgTelemetryReporter {
             fmt.setTimeZone(TimeZone.getTimeZone("UTC"));
             String nowIso = fmt.format(new Date());
 
-            String safeModVer = normalizeToken(moduleVersion, WgStrings.VERSION_LABEL, 32);
+            String cleanVer = moduleVersion != null
+                    ? moduleVersion.trim().replaceFirst("^[vV](?=\\d)", "")
+                    : "";
+            String safeModVer = normalizeToken(cleanVer, WgStrings.VERSION_LABEL, 32);
             String safePkg = normalizeToken(hostPackage, "unknown", 128);
             String safeHostVer = normalizeToken(hostVersion, "unknown", 48);
             String safeModel = normalizeToken(deviceModel, "unknown", 96);

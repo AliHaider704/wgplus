@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -25,7 +26,7 @@ import (
 )
 
 // AppVersion must match the release tag (without "v") of this build.
-const AppVersion = "2.0.0"
+const AppVersion = "2.0.3"
 
 // GetAppVersion returns the running desktop app version string.
 func (a *App) GetAppVersion() string {
@@ -33,10 +34,16 @@ func (a *App) GetAppVersion() string {
 }
 
 const (
-	releasesAPI         = "https://api.github.com/repos/AliHaider704/wgplus/releases/"
-	windowsAssetNm      = "WireGuardPlus-Windows-x64.exe"
-	lastSeenFile        = "last_seen_version"
-	runningInstanceFile = "running_instance.json"
+	releasesAPI           = "https://api.github.com/repos/AliHaider704/wgplus/releases/"
+	allowedDownloadPrefix = "https://github.com/AliHaider704/wgplus/releases/download/"
+	windowsAssetNm        = "WireGuardPlus-Windows-x64.exe"
+	windowsSumsAssetNm    = "SHA256SUMS-windows.txt"
+	windowsSumsSigAssetNm = "SHA256SUMS-windows.txt.sig"
+	// Offline-signed release manifest public keys (backup key stays embedded in v2.0.3+ for disaster recovery).
+	updaterEd25519PrimaryPubHex = "7754522d3d13afdcf099a8b7f0b6bf4fdd53a73d1edb2f346df3fbc4e6b81660"
+	updaterEd25519BackupPubHex  = "29bdbf62b4ffd4036299415a9f874346877ea01628dd532c8265d5e2445c068b"
+	lastSeenFile                = "last_seen_version"
+	runningInstanceFile         = "running_instance.json"
 )
 
 // ReleaseNotes holds bilingual bullet lists parsed from a release body.
@@ -361,8 +368,8 @@ func fileSHA256Hex(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func isProcessAliveWin(pid uint32) bool {
-	if pid == 0 || pid == uint32(os.Getpid()) {
+func isMatchingRunningProcessWin(pid uint32, expectedExePath string) bool {
+	if pid == 0 || pid == uint32(os.Getpid()) || strings.TrimSpace(expectedExePath) == "" {
 		return false
 	}
 	h, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
@@ -375,7 +382,16 @@ func isProcessAliveWin(pid uint32) bool {
 		return false
 	}
 	const stillActive = 259
-	return code == stillActive
+	if code != stillActive {
+		return false
+	}
+	var pathBuf [windows.MAX_PATH * 2]uint16
+	n := uint32(len(pathBuf))
+	if err := windows.QueryFullProcessImageName(h, 0, &pathBuf[0], &n); err != nil || n == 0 {
+		return false
+	}
+	procPath := windows.UTF16ToString(pathBuf[:n])
+	return strings.EqualFold(filepath.Clean(procPath), filepath.Clean(expectedExePath))
 }
 
 // maybeUpgradeInstalledCopyInPlace detects when a newly downloaded WireGuardPlus .exe was launched
@@ -420,7 +436,7 @@ func maybeUpgradeInstalledCopyInPlace() bool {
 		return false
 	}
 
-	pidAlive := isProcessAliveWin(targetPid)
+	pidAlive := isMatchingRunningProcessWin(targetPid, targetExe)
 	fromDownloads := strings.Contains(lowMy, `\downloads\`)
 	if !pidAlive && !fromDownloads {
 		return false
@@ -462,10 +478,130 @@ func maybeUpgradeInstalledCopyInPlace() bool {
 	return true
 }
 
+func parseAllowedReleaseExeURL(rawURL string) (tagVer, sumsURL, sigURL, assetName string, ok bool) {
+	u := strings.TrimSpace(rawURL)
+	if !strings.HasPrefix(u, allowedDownloadPrefix) || strings.ContainsAny(u, "?#\\@") || strings.Contains(u, "..") {
+		return "", "", "", "", false
+	}
+	rest := strings.TrimPrefix(u, allowedDownloadPrefix)
+	parts := strings.Split(rest, "/")
+	if len(parts) != 2 {
+		return "", "", "", "", false
+	}
+	tag, asset := parts[0], parts[1]
+	if !strings.HasPrefix(tag, "v") || len(tag) <= 1 || !strings.EqualFold(asset, windowsAssetNm) {
+		return "", "", "", "", false
+	}
+	tagVer = strings.TrimSpace(strings.TrimPrefix(tag, "v"))
+	if tagVer == "" {
+		return "", "", "", "", false
+	}
+	base := allowedDownloadPrefix + tag + "/"
+	return tagVer, base + windowsSumsAssetNm, base + windowsSumsSigAssetNm, asset, true
+}
+
+func isAllowedReleaseExeURL(rawURL string) (sumsURL string, assetName string, ok bool) {
+	_, sumsURL, _, assetName, ok = parseAllowedReleaseExeURL(rawURL)
+	return sumsURL, assetName, ok
+}
+
+func isAllowedUpdaterRedirectHost(rawHost string) bool {
+	h := strings.TrimSpace(rawHost)
+	if h == "" {
+		return false
+	}
+	if parsedHost, _, err := net.SplitHostPort(h); err == nil {
+		h = parsedHost
+	}
+	h = strings.ToLower(strings.TrimSuffix(h, "."))
+	return h == "github.com" || strings.HasSuffix(h, ".githubusercontent.com")
+}
+
+func verifySumsEd25519Signature(sumsRaw, sigText string, pubHexes ...string) error {
+	fields := strings.Fields(strings.TrimSpace(sigText))
+	if len(fields) == 0 {
+		return errors.New("missing Ed25519 signature for SHA256SUMS-windows.txt")
+	}
+	sigBytes, err := hex.DecodeString(strings.TrimSpace(fields[0]))
+	if err != nil || len(sigBytes) != ed25519.SignatureSize {
+		return errors.New("malformed Ed25519 signature for SHA256SUMS-windows.txt")
+	}
+	msg := []byte(sumsRaw)
+	for _, pubHex := range pubHexes {
+		trimmed := strings.TrimSpace(pubHex)
+		if trimmed == "" {
+			continue
+		}
+		pubBytes, pErr := hex.DecodeString(trimmed)
+		if pErr != nil || len(pubBytes) != ed25519.PublicKeySize {
+			continue
+		}
+		if ed25519.Verify(ed25519.PublicKey(pubBytes), msg, sigBytes) {
+			return nil
+		}
+	}
+	return errors.New("invalid Ed25519 signature on SHA256SUMS-windows.txt")
+}
+
+func parseExpectedSHA256(sumsText, targetFileName string) (string, error) {
+	for _, ln := range strings.Split(sumsText, "\n") {
+		fields := strings.Fields(strings.TrimSpace(ln))
+		if len(fields) < 2 {
+			continue
+		}
+		hashStr := strings.ToLower(strings.TrimSpace(fields[0]))
+		rawName := strings.TrimPrefix(strings.TrimSpace(fields[1]), "*")
+		if !strings.EqualFold(filepath.Base(rawName), targetFileName) || len(hashStr) != 64 {
+			continue
+		}
+		if raw, err := hex.DecodeString(hashStr); err == nil && len(raw) == 32 {
+			return hashStr, nil
+		}
+	}
+	return "", fmt.Errorf("SHA-256 entry for %s not found", targetFileName)
+}
+
+func fetchSumsWithClient(c *http.Client, sumsURL string) (string, error) {
+	dlClient := &http.Client{
+		Timeout:   15 * time.Second,
+		Transport: c.Transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if req.URL.Scheme != "https" || !isAllowedUpdaterRedirectHost(req.URL.Host) || len(via) >= 10 {
+				return errors.New("invalid redirect")
+			}
+			return nil
+		},
+	}
+	req, err := http.NewRequest("GET", sumsURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "WireGuardPlus/"+AppVersion)
+	resp, err := dlClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("checksums HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64*1024))
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
 func downloadBinaryWithClient(c *http.Client, fullURL, dstPath string) error {
 	dlClient := &http.Client{
 		Timeout:   90 * time.Second,
 		Transport: c.Transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if req.URL.Scheme != "https" || !isAllowedUpdaterRedirectHost(req.URL.Host) || len(via) >= 10 {
+				return errors.New("invalid redirect")
+			}
+			return nil
+		},
 	}
 	req, err := http.NewRequest("GET", fullURL, nil)
 	if err != nil {
@@ -513,16 +649,58 @@ func downloadBinaryWithClient(c *http.Client, fullURL, dstPath string) error {
 	return nil
 }
 
-// ApplySelfUpdate downloads downloadURL and overwrites the running executable in-place,
-// then restarts into the updated version cleanly without manual file moving.
+// ApplySelfUpdate downloads downloadURL, verifies the Ed25519 signature on SHA256SUMS-windows.txt,
+// checks SHA-256 and version monotonicity, overwrites the running executable in-place, and restarts cleanly.
 func (a *App) ApplySelfUpdate(downloadURL string) error {
 	cleanURL := strings.TrimSpace(downloadURL)
-	if !strings.HasPrefix(cleanURL, "https://") || !strings.HasSuffix(strings.ToLower(cleanURL), ".exe") {
-		if a.ctx != nil && cleanURL != "" {
-			runtime.BrowserOpenURL(a.ctx, cleanURL)
+	if !strings.HasSuffix(strings.ToLower(cleanURL), ".exe") {
+		if strings.HasPrefix(cleanURL, "https://github.com/AliHaider704/wgplus/releases") {
+			if a.ctx != nil {
+				runtime.BrowserOpenURL(a.ctx, cleanURL)
+			}
+			return nil
 		}
-		return nil
+		return errors.New("untrusted update URL")
 	}
+	tagVer, sumsURL, sigURL, assetNm, ok := parseAllowedReleaseExeURL(cleanURL)
+	if !ok {
+		return errors.New("untrusted update URL")
+	}
+	if !versionNewer(tagVer, AppVersion) {
+		return fmt.Errorf("refusing non-newer update v%s (current v%s)", tagVer, AppVersion)
+	}
+
+	clients := a.buildUpdaterHTTPClients()
+	var sumsRaw string
+	var sigRaw string
+	var fetchErr error
+	for _, client := range clients {
+		txt, err := fetchSumsWithClient(client, sumsURL)
+		if err != nil {
+			fetchErr = err
+			continue
+		}
+		sigTxt, sErr := fetchSumsWithClient(client, sigURL)
+		if sErr != nil {
+			fetchErr = sErr
+			continue
+		}
+		sumsRaw = txt
+		sigRaw = sigTxt
+		fetchErr = nil
+		break
+	}
+	if fetchErr != nil {
+		return fmt.Errorf("failed fetching signed update checksums: %w", fetchErr)
+	}
+	if err := verifySumsEd25519Signature(sumsRaw, sigRaw, updaterEd25519PrimaryPubHex, updaterEd25519BackupPubHex); err != nil {
+		return err
+	}
+	expectedHash, err := parseExpectedSHA256(sumsRaw, assetNm)
+	if err != nil {
+		return err
+	}
+
 	exePath, err := os.Executable()
 	if err != nil || strings.TrimSpace(exePath) == "" {
 		return errors.New("cannot resolve current executable path")
@@ -531,7 +709,7 @@ func (a *App) ApplySelfUpdate(downloadURL string) error {
 	tmpPath := cleanExe + ".download"
 
 	var lastErr error
-	for _, client := range a.buildUpdaterHTTPClients() {
+	for _, client := range clients {
 		if dErr := downloadBinaryWithClient(client, cleanURL, tmpPath); dErr == nil {
 			lastErr = nil
 			break
@@ -541,6 +719,12 @@ func (a *App) ApplySelfUpdate(downloadURL string) error {
 	}
 	if lastErr != nil {
 		return lastErr
+	}
+
+	gotHash, err := fileSHA256Hex(tmpPath)
+	if err != nil || !strings.EqualFold(gotHash, expectedHash) {
+		_ = os.Remove(tmpPath)
+		return fmt.Errorf("update SHA-256 mismatch: got %s, want %s", gotHash, expectedHash)
 	}
 
 	if err := replaceBinaryFileInPlace(cleanExe, tmpPath); err != nil {

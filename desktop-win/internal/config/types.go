@@ -64,8 +64,6 @@ type AppSettings struct {
 	AlwaysRunAsAdmin         bool   `json:"alwaysRunAsAdmin"`
 	TelemetryConsentDecided  bool   `json:"telemetryConsentDecided"`
 	TelemetryOptIn           bool   `json:"telemetryOptIn"`
-	ChannelInvitedV2         bool   `json:"channelInvitedV2,omitempty"`
-	ChannelInvitedV3         bool   `json:"channelInvitedV3,omitempty"`
 	ChannelInvitedV4         bool   `json:"channelInvitedV4,omitempty"`
 }
 

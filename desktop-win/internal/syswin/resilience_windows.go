@@ -21,7 +21,57 @@ var (
 	modIphlpapi                 = windows.NewLazySystemDLL("iphlpapi.dll")
 	procNotifyIpInterfaceChange = modIphlpapi.NewProc("NotifyIpInterfaceChange")
 	procCancelMibChangeNotify2  = modIphlpapi.NewProc("CancelMibChangeNotify2")
+
+	modResilienceKernel32     = windows.NewLazySystemDLL("kernel32.dll")
+	procSetProcessInformation = modResilienceKernel32.NewProc("SetProcessInformation")
+	procSetPriorityClass      = modResilienceKernel32.NewProc("SetPriorityClass")
 )
+
+const (
+	processPowerThrottling             = 4
+	processPowerThrottlingVersion      = 1
+	powerThrottlingExecSpeed           = 0x1
+	powerThrottlingIgnoreTimerRes      = 0x4
+	aboveNormalPriorityClass     uint32 = 0x00008000
+)
+
+type processPowerThrottlingState struct {
+	Version     uint32
+	ControlMask uint32
+	StateMask   uint32
+}
+
+// DisableProcessPowerThrottling opts the background tunnel process out of Windows 11 EcoQoS
+// efficiency-core pinning and timer coalescing so WireGuard keepalives stay sub-millisecond.
+func DisableProcessPowerThrottling() {
+	hProc := windows.CurrentProcess()
+	if err := procSetProcessInformation.Find(); err == nil {
+		// Disable both EXECUTION_SPEED and IGNORE_TIMER_RESOLUTION (Win11 22H2+); fall back to EXEC_SPEED on older builds.
+		st := processPowerThrottlingState{
+			Version:     processPowerThrottlingVersion,
+			ControlMask: powerThrottlingExecSpeed | powerThrottlingIgnoreTimerRes,
+			StateMask:   0,
+		}
+		r1, _, _ := procSetProcessInformation.Call(
+			uintptr(hProc),
+			uintptr(processPowerThrottling),
+			uintptr(unsafe.Pointer(&st)),
+			unsafe.Sizeof(st),
+		)
+		if r1 == 0 {
+			st.ControlMask = powerThrottlingExecSpeed
+			_, _, _ = procSetProcessInformation.Call(
+				uintptr(hProc),
+				uintptr(processPowerThrottling),
+				uintptr(unsafe.Pointer(&st)),
+				unsafe.Sizeof(st),
+			)
+		}
+	}
+	if err := procSetPriorityClass.Find(); err == nil {
+		_, _, _ = procSetPriorityClass.Call(uintptr(hProc), uintptr(aboveNormalPriorityClass))
+	}
+}
 
 var (
 	netCallbackOnce    sync.Once
@@ -32,23 +82,124 @@ var (
 	lastNetFingerprint string
 )
 
-// getOutboundIPv4Fingerprint returns a deterministic snapshot of the active outbound
-// IPv4 route and UP non-loopback IPv4 interfaces so noisy virtual/IPv6 link events are ignored.
-func getOutboundIPv4Fingerprint() string {
-	outIP := "none"
-	if conn, err := net.Dial("udp4", "1.1.1.1:80"); err == nil {
-		if ua, ok := conn.LocalAddr().(*net.UDPAddr); ok && ua != nil && ua.IP != nil {
-			if v4 := ua.IP.To4(); v4 != nil {
-				outIP = v4.String()
+func isIsolatedVirtualAdapter(name string) bool {
+	low := strings.ToLower(strings.TrimSpace(name))
+	if low == "" {
+		return false
+	}
+	for _, tok := range []string{
+		"wireguardpluscalls",
+		"vmware",
+		"vmnet",
+		"virtualbox",
+		"vboxnet",
+		"vethernet",
+		"teredo",
+		"isatap",
+		"6to4",
+		"wsl",
+		"hyper-v",
+	} {
+		if strings.Contains(low, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+func isOuterVpnAdapter(name string) bool {
+	low := strings.ToLower(strings.TrimSpace(name))
+	if low == "" || strings.Contains(low, "wireguardpluscalls") {
+		return false
+	}
+	for _, tok := range []string{
+		"wireguard",
+		"wintun",
+		"radmin",
+		"tailscale",
+		"zerotier",
+		"nordlynx",
+		"proton",
+		"openvpn",
+		"tap-windows",
+		"tun",
+	} {
+		if strings.Contains(low, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+func detectOutboundIPv4AndInterface() (net.IP, int, bool) {
+	conn, err := net.Dial("udp4", "1.1.1.1:80")
+	if err != nil {
+		return nil, 0, false
+	}
+	defer conn.Close()
+	ua, ok := conn.LocalAddr().(*net.UDPAddr)
+	if !ok || ua == nil || ua.IP == nil {
+		return nil, 0, false
+	}
+	v4 := ua.IP.To4()
+	if v4 == nil || v4.IsLoopback() || v4.IsUnspecified() {
+		return nil, 0, false
+	}
+	if ifaces, iErr := net.Interfaces(); iErr == nil {
+		for _, iface := range ifaces {
+			addrs, aErr := iface.Addrs()
+			if aErr != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				ipNet, okAddr := addr.(*net.IPNet)
+				if okAddr && ipNet != nil && ipNet.IP != nil && ipNet.IP.Equal(v4) {
+					if isIsolatedVirtualAdapter(iface.Name) {
+						return nil, 0, false
+					}
+					return v4, iface.MTU, isOuterVpnAdapter(iface.Name)
+				}
 			}
 		}
-		_ = conn.Close()
+	}
+	return v4, 0, false
+}
+
+func detectOutboundIPv4() net.IP {
+	v4, _, _ := detectOutboundIPv4AndInterface()
+	return v4
+}
+
+// DetectOutboundLinkMTU returns the active physical/VPN outbound interface MTU and whether another VPN is active.
+func DetectOutboundLinkMTU() (int, bool) {
+	_, mtu, outerVpn := detectOutboundIPv4AndInterface()
+	return mtu, outerVpn
+}
+
+// HasOutboundIPv4 reports whether the host currently has an active non-loopback IPv4 default route.
+func HasOutboundIPv4() bool {
+	return detectOutboundIPv4() != nil
+}
+
+func shouldIncludeInterfaceInFingerprint(name string, flags net.Flags) bool {
+	if flags&net.FlagUp == 0 || flags&net.FlagLoopback != 0 {
+		return false
+	}
+	return !isIsolatedVirtualAdapter(name)
+}
+
+// getOutboundIPv4Fingerprint returns a deterministic snapshot of the active outbound
+// IPv4 route and UP non-loopback IPv4 interfaces so noisy virtual/IPv6/Wintun link events are ignored.
+func getOutboundIPv4Fingerprint() string {
+	outIP := "none"
+	if v4 := detectOutboundIPv4(); v4 != nil {
+		outIP = v4.String()
 	}
 
 	var entries []string
 	if ifaces, err := net.Interfaces(); err == nil {
 		for _, iface := range ifaces {
-			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			if !shouldIncludeInterfaceInFingerprint(iface.Name, iface.Flags) {
 				continue
 			}
 			addrs, aErr := iface.Addrs()
@@ -64,7 +215,7 @@ func getOutboundIPv4Fingerprint() string {
 				if v4 == nil || v4.IsLoopback() || v4.IsLinkLocalUnicast() || v4.IsUnspecified() {
 					continue
 				}
-				entries = append(entries, iface.Name+"="+v4.String())
+				entries = append(entries, fmt.Sprintf("%s=%s/%d", iface.Name, v4.String(), iface.MTU))
 			}
 		}
 	}

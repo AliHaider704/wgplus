@@ -69,6 +69,49 @@ func GetKillSwitchPort() int {
 	return muxPort
 }
 
+// ProbeActiveTunnelRttMs measures TCP 1-RTT latency inside the live WireGuard tunnel
+// without opening a competing WireGuard device or resetting active peer session keys.
+func ProbeActiveTunnelRttMs(timeoutMs int) (int, error) {
+	if timeoutMs <= 0 {
+		timeoutMs = 2500
+	}
+	if timeoutMs > 10000 {
+		timeoutMs = 10000
+	}
+	mu.Lock()
+	isUp := running && activeDev != nil && activeTnet != nil
+	dialer := activeTnet
+	mu.Unlock()
+	if !isUp || dialer == nil || !IsHandshakeHealthy() {
+		return 0, errors.New("tunnel is not healthy")
+	}
+
+	perDial := time.Duration(timeoutMs) * time.Millisecond
+	if perDial > 2200*time.Millisecond {
+		perDial = 2200 * time.Millisecond
+	}
+	var lastErr error
+	for _, target := range []string{"1.0.0.1:443", "149.154.167.51:443"} {
+		ctx, cancel := context.WithTimeout(context.Background(), perDial)
+		start := time.Now()
+		c, err := dialer.DialContext(ctx, "tcp", target)
+		cancel()
+		if err == nil {
+			_ = c.Close()
+			ms := int(time.Since(start).Milliseconds())
+			if ms < 1 {
+				ms = 1
+			}
+			return ms, nil
+		}
+		lastErr = err
+	}
+	if lastErr != nil {
+		return 0, lastErr
+	}
+	return 0, errors.New("active tunnel probe failed")
+}
+
 // ProbeEndpointHandshakeMs performs an isolated cryptographic WireGuard / AmneziaWG handshake probe
 // without disturbing any active tunnel, returning the verified handshake RTT in milliseconds.
 func ProbeEndpointHandshakeMs(
@@ -94,6 +137,12 @@ func ProbeEndpointHandshakeMs(
 		if err != nil {
 			return 0, fmt.Errorf("preshared key error: %w", err)
 		}
+	}
+	if isActivePeerPublicKey(pubHex) && IsHandshakeHealthy() {
+		if ms, pErr := ProbeActiveTunnelRttMs(timeoutMs); pErr == nil && ms > 0 {
+			return ms, nil
+		}
+		return 1, nil
 	}
 	awgCfg, err := parseAwgConfig(awgParams)
 	if err != nil {
@@ -242,6 +291,11 @@ func DiscoverOptimalMTU(
 	awgCfg, err := parseAwgConfig(awgParams)
 	if err != nil {
 		return 0, err
+	}
+	if strings.TrimSpace(probeTarget) == "" && isActivePeerPublicKey(pubHex) && IsHandshakeHealthy() {
+		if best := CalibrateActiveTunnelMTU(stepTimeoutMs); best >= minMTU {
+			return best, nil
+		}
 	}
 	resolvedEndpoint, err := ResolveEndpointDoH(endpoint, useDoH)
 	if err != nil {

@@ -242,3 +242,18 @@ func TestVoipTunTcpForwarderLoopback(t *testing.T) {
 	}
 }
 
+func TestIsAllowedTelegramVoipDstBlocksWindowsLanNoise(t *testing.T) {
+	if isAllowedTelegramVoipDst([4]byte{10, 254, 254, 3}, 137, 137) {
+		t.Fatalf("must reject NetBIOS broadcast on 10.254.254.3:137")
+	}
+	if isAllowedTelegramVoipDst([4]byte{149, 154, 167, 50}, 137, 443) {
+		t.Fatalf("must reject NetBIOS srcPort 137 even on Telegram IP")
+	}
+	if isAllowedTelegramVoipDst([4]byte{8, 8, 8, 8}, 50000, 53) {
+		t.Fatalf("must reject non-Telegram IP on WireGuardPlusCalls")
+	}
+	if !isAllowedTelegramVoipDst([4]byte{149, 154, 167, 50}, 50123, 599) {
+		t.Fatalf("expected official Telegram DC/VoIP IP+port to be allowed")
+	}
+}
+

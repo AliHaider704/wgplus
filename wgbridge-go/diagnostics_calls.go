@@ -1,6 +1,7 @@
 package wgbridge
 
 import (
+	"bufio"
 	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
@@ -49,7 +50,7 @@ type verifyTargets struct {
 
 func defaultVerifyTargets() verifyTargets {
 	return verifyTargets{
-		traceDialAddr:   "1.1.1.1:443",
+		traceDialAddr:   "1.0.0.1:443",
 		traceServerName: "one.one.one.one",
 		traceUseTLS:     true,
 		udpDnsTarget:    netip.MustParseAddrPort("1.1.1.1:53"),
@@ -176,12 +177,19 @@ func VerifyRouteAndCallsJSON(socksPort int, username, password string) string {
 
 func probeExitTrace(socksPort int, username, password, dialAddr, serverName string, useTLS bool) (exitIP, country string, rttMs int64, errStr string) {
 	start := time.Now()
-	c, err := dialViaLocalSocks5(socksPort, username, password, dialAddr, 6*time.Second)
+	c, err := dialViaLocalSocks5(socksPort, username, password, dialAddr, 3500*time.Millisecond)
 	if err != nil {
 		return "", "", 0, err.Error()
 	}
 	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(6 * time.Second))
+
+	// Measure pure 1-RTT tunnel connect latency to match DC probes and Android,
+	// excluding TLS handshake and HTTP connection teardown waits.
+	connectRtt := time.Since(start).Milliseconds()
+	if connectRtt < 1 {
+		connectRtt = 1
+	}
+	_ = c.SetDeadline(time.Now().Add(3500 * time.Millisecond))
 
 	var rw io.ReadWriter = c
 	if useTLS {
@@ -199,26 +207,26 @@ func probeExitTrace(socksPort int, username, password, dialAddr, serverName stri
 	if _, wErr := io.WriteString(rw, req); wErr != nil {
 		return "", "", 0, wErr.Error()
 	}
-	bodyBytes, rErr := io.ReadAll(io.LimitReader(rw, 8192))
-	if rErr != nil && len(bodyBytes) == 0 {
-		return "", "", 0, rErr.Error()
-	}
-	for _, line := range strings.Split(string(bodyBytes), "\n") {
-		line = strings.TrimSpace(line)
+
+	scanner := bufio.NewScanner(io.LimitReader(rw, 8192))
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
 		if strings.HasPrefix(line, "ip=") {
 			exitIP = strings.TrimPrefix(line, "ip=")
 		} else if strings.HasPrefix(line, "loc=") {
 			country = strings.TrimPrefix(line, "loc=")
 		}
+		if exitIP != "" && country != "" {
+			break
+		}
 	}
 	if exitIP == "" {
+		if sErr := scanner.Err(); sErr != nil {
+			return "", "", 0, sErr.Error()
+		}
 		return "", "", 0, "missing ip field in trace response"
 	}
-	rtt := time.Since(start).Milliseconds()
-	if rtt < 1 {
-		rtt = 1
-	}
-	return exitIP, country, rtt, ""
+	return exitIP, country, connectRtt, ""
 }
 
 func probeUdpDnsOnce(socksPort int, username, password string, target netip.AddrPort) (int64, string) {
@@ -249,8 +257,8 @@ func probeUdpDnsOnce(socksPort int, username, password string, target netip.Addr
 	if qErr != nil {
 		return 0, qErr.Error()
 	}
-	dnsQuery[0] = 0x57
-	dnsQuery[1] = 0x48
+	txID := cryptoRandDnsTxID()
+	binary.BigEndian.PutUint16(dnsQuery[0:2], txID)
 
 	v4 := target.Addr().As4()
 	udpPkt := make([]byte, 10+len(dnsQuery))
@@ -275,7 +283,7 @@ func probeUdpDnsOnce(socksPort int, username, password string, target netip.Addr
 		}
 		return 0, pErr.Error()
 	}
-	if payload[0] != 0x57 || payload[1] != 0x48 {
+	if binary.BigEndian.Uint16(payload[0:2]) != txID {
 		return 0, "UDP DNS txid mismatch"
 	}
 	if _, parseErr := parseDnsResponseA(payload, true); parseErr != nil {
@@ -301,17 +309,26 @@ func verifyRouteAndCallsWithTargets(socksPort int, username, password string, tg
 
 	var wg sync.WaitGroup
 
-	// 1. Exit IP + Country via trace endpoint (with 1.0.0.1 fallback if 1.1.1.1:443 fails)
+	// 1. Exit IP + Country via trace endpoint (fall back across 1.0.0.1 / 162.159.36.1 / 1.1.1.1)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		ip, cc, rtt, errStr := probeExitTrace(socksPort, username, password, tgt.traceDialAddr, tgt.traceServerName, tgt.traceUseTLS)
-		if errStr != "" && tgt.traceDialAddr == "1.1.1.1:443" {
-			ip2, cc2, rtt2, errStr2 := probeExitTrace(socksPort, username, password, "1.0.0.1:443", tgt.traceServerName, tgt.traceUseTLS)
-			if errStr2 == "" {
-				ip, cc, rtt, errStr = ip2, cc2, rtt2, ""
-			} else {
-				errStr = errStr2
+		var addrs []string
+		addrs = append(addrs, tgt.traceDialAddr)
+		if tgt.traceDialAddr == "1.0.0.1:443" || tgt.traceDialAddr == "1.1.1.1:443" {
+			for _, alt := range []string{"1.0.0.1:443", "162.159.36.1:443", "1.1.1.1:443"} {
+				if alt != tgt.traceDialAddr {
+					addrs = append(addrs, alt)
+				}
+			}
+		}
+		var ip, cc string
+		var rtt int64
+		var errStr string
+		for _, addr := range addrs {
+			ip, cc, rtt, errStr = probeExitTrace(socksPort, username, password, addr, tgt.traceServerName, tgt.traceUseTLS)
+			if errStr == "" {
+				break
 			}
 		}
 		report.ExitIP = ip

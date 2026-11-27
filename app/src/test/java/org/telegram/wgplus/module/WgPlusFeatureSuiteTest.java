@@ -450,7 +450,10 @@ public class WgPlusFeatureSuiteTest {
 
     @Test
     public void testHybridContinuityTierResolutionAndVersionLabel() {
-        assertEquals("2.0.0", WgStrings.VERSION_LABEL);
+        assertEquals("2.0.3", WgStrings.VERSION_LABEL);
+        assertFalse(WgStrings.standaloneBindTelegramBtn(true).matches(".*[A-Za-z].*"));
+        assertFalse(WgStrings.allowUnrestrictedBatteryBtn(true).matches(".*[A-Za-z].*"));
+        assertTrue(WgStrings.standaloneBindTelegramBtn(true).contains("تيليجرام"));
 
         assertEquals(
                 ContinuityBridgeManager.ContinuityTier.HYBRID_FULL,
@@ -885,6 +888,7 @@ public class WgPlusFeatureSuiteTest {
         }
         assertEquals("1", fields.getJSONObject("schemaVersion").getString("integerValue"));
         assertEquals("35", fields.getJSONObject("sdkInt").getString("integerValue"));
+        assertEquals("2.0.0", fields.getJSONObject("moduleVersion").getString("stringValue"));
         assertEquals("Xiaomi 23129RAA4G", fields.getJSONObject("deviceModel").getString("stringValue"));
         assertEquals("org.telegram.messenger.web", fields.getJSONObject("hostPackage").getString("stringValue"));
         assertEquals("FROZEN_OWNER_TAKEOVER", fields.getJSONObject("triggerCode").getString("stringValue"));
@@ -984,6 +988,224 @@ public class WgPlusFeatureSuiteTest {
         assertTrue(md.contains("127.0.0.1:48729"));
         assertFalse("Secret must be redacted from instance matrix", md.contains("leak123"));
         assertFalse("Public endpoint must be redacted from instance matrix", md.contains("162.159.193.10"));
+    }
+
+    @Test
+    public void testProviderPackageAllowlistAndCertTrustDecisions() {
+        assertTrue(KeepaliveStatusProvider.isSupportedTelegramPackage("org.telegram.plus"));
+        assertTrue(KeepaliveStatusProvider.isSupportedTelegramPackage("org.telegram.messenger.web"));
+        assertFalse(KeepaliveStatusProvider.isSupportedTelegramPackage("com.instagram.android"));
+        assertFalse(KeepaliveStatusProvider.isSupportedTelegramPackage("com.evil.gram"));
+        assertFalse(KeepaliveStatusProvider.isSupportedTelegramPackage("com.foo.telegraph"));
+        assertFalse(KeepaliveStatusProvider.isSupportedTelegramPackage(""));
+
+        String officialCert = "496b68c0f0e38839e141ef48b636260b8215c255a0e7aa80147f9bb2e149c173";
+        String nekoCert = "5ce932b970199fbda2aae7bf21e1ad9e70b0809a7b1ac94c0699f5d5ada83313";
+        assertEquals(1, KeepaliveStatusProvider.evaluateCallerTrustDecision(
+                "org.telegram.messenger", officialCert, "own", ""));
+        assertEquals(1, KeepaliveStatusProvider.evaluateCallerTrustDecision(
+                "tw.nekomimi.nekogram", nekoCert, "own", ""));
+        // Empty certHash must always deny
+        assertEquals(0, KeepaliveStatusProvider.evaluateCallerTrustDecision(
+                "org.telegram.plus", "", "own", ""));
+        // Matching module signature (local LSPatch) allowed
+        assertEquals(1, KeepaliveStatusProvider.evaluateCallerTrustDecision(
+                "org.telegram.plus", "own", "own", ""));
+        // Unknown unapproved cert must deny (NO silent TOFU!)
+        assertEquals(0, KeepaliveStatusProvider.evaluateCallerTrustDecision(
+                "org.telegram.plus", "certA", "own", ""));
+        // Explicit user approval allowed
+        assertEquals(1, KeepaliveStatusProvider.evaluateCallerTrustDecision(
+                "org.telegram.plus", "certA", "own", "certA"));
+        // Changed cert on previously approved package rejected (NO silent auto-repin!)
+        assertEquals(0, KeepaliveStatusProvider.evaluateCallerTrustDecision(
+                "org.telegram.plus", "certEvil", "own", "certA"));
+    }
+
+    @Test
+    public void testCallWatchdogIgnoresShortCancelledCallsAndCatchesDeadMedia() {
+        // Short cancelled call (5s active, sitting idle for 50s in 90s reaper) -> must NOT alert
+        String cancelledJson = "{\"voipRelays\":[{\"udpTxPkts\":6,\"udpRxPkts\":4,\"udpErrs\":0,\"tcpConns\":0,\"ageSec\":55,\"idleSec\":50}]}";
+        org.junit.Assert.assertNull(WgCallWatchdog.evaluateDiagnosticsJson(cancelledJson));
+
+        // 55s call that stayed active (~45s) with < 60 pkts -> LOW
+        String lowMediaJson = "{\"voipRelays\":[{\"udpTxPkts\":11,\"udpRxPkts\":7,\"udpErrs\":0,\"tcpConns\":2,\"ageSec\":56,\"idleSec\":10}]}";
+        String lowRes = WgCallWatchdog.evaluateDiagnosticsJson(lowMediaJson);
+        assertNotNull(lowRes);
+        assertTrue(lowRes.startsWith("LOW("));
+
+        // Active 25s call with outbound packets and zero return traffic -> DEAD
+        String oneWayJson = "{\"voipRelays\":[{\"udpTxPkts\":14,\"udpRxPkts\":0,\"udpErrs\":0,\"tcpConns\":0,\"ageSec\":25,\"idleSec\":1}]}";
+        String oneWayRes = WgCallWatchdog.evaluateDiagnosticsJson(oneWayJson);
+        assertNotNull(oneWayRes);
+        assertTrue(oneWayRes.startsWith("DEAD(no return traffic)"));
+
+        // Healthy call -> null
+        String healthyJson = "{\"voipRelays\":[{\"udpTxPkts\":400,\"udpRxPkts\":420,\"udpErrs\":0,\"tcpConns\":1,\"ageSec\":55,\"idleSec\":0}]}";
+        org.junit.Assert.assertNull(WgCallWatchdog.evaluateDiagnosticsJson(healthyJson));
+    }
+
+    @Test
+    public void testUpdateGateSemverPreReleaseHandling() {
+        assertTrue(UpdateGate.newer("2.0.1", "2.0.0"));
+        assertTrue(UpdateGate.newer("2.1.0", "2.0.9"));
+        assertFalse(UpdateGate.newer("2.0.0-rc1", "2.0.0"));
+        assertFalse(UpdateGate.newer("2.0.0", "2.0.0"));
+    }
+
+    @Test
+    public void testClearReflectorIdAndModuleSourceInvariants() throws Exception {
+        class MockIntEndpoint {
+            int reflectorId = 7;
+        }
+        class MockLongEndpoint {
+            long reflectorId = 7L;
+        }
+        MockIntEndpoint intEp = new MockIntEndpoint();
+        MockLongEndpoint longEp = new MockLongEndpoint();
+        WgSharedHubAndVoip.clearReflectorIdSafe(intEp);
+        WgSharedHubAndVoip.clearReflectorIdSafe(longEp);
+        assertEquals(0, intEp.reflectorId);
+        assertEquals(0L, longEp.reflectorId);
+
+        Path srcDir = resolveThemeFilePath().getParent();
+        try (java.util.stream.Stream<Path> walk = Files.walk(srcDir)) {
+            List<Path> javaFiles = walk.filter(p -> p.toString().endsWith(".java")).collect(java.util.stream.Collectors.toList());
+            assertFalse(javaFiles.isEmpty());
+            for (Path jf : javaFiles) {
+                String content = new String(Files.readAllBytes(jf), StandardCharsets.UTF_8);
+                assertFalse("XC_MethodReplacement forbidden in " + jf.getFileName(), content.contains("XC_MethodReplacement"));
+                assertFalse("Em dash U+2014 forbidden in " + jf.getFileName(), content.contains("\u2014"));
+                int lineCount = Files.readAllLines(jf, StandardCharsets.UTF_8).size();
+                assertTrue("File exceeds 2000 lines: " + jf.getFileName() + " (" + lineCount + ")", lineCount < 2000);
+            }
+        }
+
+        // Source-level checks for XposedInit.java multi-layer VoIP armor invariants.
+        Path xposedFile = srcDir.resolve("XposedInit.java");
+        String xposedSrc = new String(Files.readAllBytes(xposedFile), StandardCharsets.UTF_8);
+        assertFalse("Regressive IP-stripping pattern must not exist in XposedInit.java",
+                xposedSrc.contains("\"127.0.0.1:\" + lp"));
+        assertTrue("Canonical full ip:port relay helper must be used in XposedInit.java",
+                xposedSrc.contains("startVoipEndpointRelayAddr"));
+        assertTrue("TCP fallback expansion must be wired in XposedInit.java",
+                xposedSrc.contains("expandEndpointsWithTcpFallbacks"));
+
+        String sharedVoipSrc = new String(Files.readAllBytes(srcDir.resolve("WgSharedHubAndVoip.java")), StandardCharsets.UTF_8);
+        assertTrue("ENDPOINT_TYPE_TCP_RELAY lookup must be present in WgSharedHubAndVoip.java",
+                sharedVoipSrc.contains("ENDPOINT_TYPE_TCP_RELAY"));
+    }
+
+    public static final class MockVoipInstance {
+        public static final int ENDPOINT_TYPE_TCP_RELAY = 3;
+    }
+
+    public static final class MockVoipEndpoint {
+        public final boolean isRtc;
+        public final long id;
+        public final String ipv4;
+        public final String ipv6;
+        public final int port;
+        public final int type;
+        public final byte[] peerTag;
+        public final boolean turn;
+        public final boolean stun;
+        public final String username;
+        public final String password;
+        public final boolean tcp;
+        public int reflectorId;
+
+        public MockVoipEndpoint(
+                boolean isRtc, long id, String ipv4, String ipv6, int port, int type,
+                byte[] peerTag, boolean turn, boolean stun, String username, String password, boolean tcp
+        ) {
+            this.isRtc = isRtc;
+            this.id = id;
+            this.ipv4 = ipv4;
+            this.ipv6 = ipv6;
+            this.port = port;
+            this.type = type;
+            this.peerTag = peerTag;
+            this.turn = turn;
+            this.stun = stun;
+            if (isRtc) {
+                this.username = username;
+                this.password = password;
+            } else if (peerTag != null) {
+                this.username = "reflector";
+                this.password = "deadbeef";
+            } else {
+                this.username = null;
+                this.password = null;
+            }
+            this.tcp = tcp;
+        }
+    }
+
+    @Test
+    public void testVoipShouldClearReflectorIdAndTcpFallbackCloning() {
+        // Preserves reflectorId when port matches (including root <1024), clears only on mismatch with viable primary.
+        assertFalse(WgSharedHubAndVoip.shouldClearReflectorId(false, 1400, 1400, true));
+        assertFalse(WgSharedHubAndVoip.shouldClearReflectorId(false, 598, 598, true));
+        assertFalse(WgSharedHubAndVoip.shouldClearReflectorId(true, 1400, 44450, true));
+        assertFalse(WgSharedHubAndVoip.shouldClearReflectorId(false, 598, 44450, false));
+        assertTrue(WgSharedHubAndVoip.shouldClearReflectorId(false, 598, 44450, true));
+
+        // Build representative array: Case A (WebRTC TURN 127.0.0.1:1400), Case B (root preserved Reflector 127.0.0.1:598),
+        // and cleared low-port non-RTC (reflectorId=0) that must NOT get a broken Case B clone.
+        MockVoipEndpoint rtcTurn = new MockVoipEndpoint(
+                true, 101L, "127.0.0.1", "", 1400, 2, null, true, false, "webrtcUser", "webrtcPass", false);
+        byte[] tag = new byte[]{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
+        MockVoipEndpoint rootReflector = new MockVoipEndpoint(
+                false, 202L, "127.0.0.1", "", 598, 2, tag, true, false, "reflector", "hex", false);
+        rootReflector.reflectorId = 2;
+        MockVoipEndpoint clearedReflector = new MockVoipEndpoint(
+                false, 303L, "127.0.0.1", "", 51833, 2, tag, true, false, "reflector", "hex", false);
+        clearedReflector.reflectorId = 0;
+
+        MockVoipEndpoint[] input = new MockVoipEndpoint[]{rtcTurn, rootReflector, clearedReflector};
+        Object[] expandedObj = WgSharedHubAndVoip.expandEndpointsWithTcpFallbacks(
+                input, MockVoipEndpoint.class, MockVoipInstance.class);
+        assertTrue(expandedObj instanceof MockVoipEndpoint[]);
+        MockVoipEndpoint[] expanded = (MockVoipEndpoint[]) expandedObj;
+        assertEquals(5, expanded.length);
+
+        // First 3 elements remain original UDP candidates in order.
+        org.junit.Assert.assertSame(rtcTurn, expanded[0]);
+        org.junit.Assert.assertSame(rootReflector, expanded[1]);
+        org.junit.Assert.assertSame(clearedReflector, expanded[2]);
+
+        // Clone 1 (Case A): preserves username/password despite isRtc=false and peerTag=null!
+        MockVoipEndpoint cA = expanded[3];
+        assertFalse(cA.isRtc);
+        assertTrue(cA.tcp);
+        assertTrue(cA.turn);
+        assertFalse(cA.stun);
+        assertEquals(MockVoipInstance.ENDPOINT_TYPE_TCP_RELAY, cA.type);
+        assertEquals("127.0.0.1", cA.ipv4);
+        assertEquals(1400, cA.port);
+        assertEquals(0, cA.reflectorId);
+        assertEquals("webrtcUser", cA.username);
+        assertEquals("webrtcPass", cA.password);
+        assertEquals(101L ^ 0x4000000000000000L, cA.id);
+
+        // Clone 2 (Case B): preserves reflectorId, peerTag copy, "reflector" login, and password.
+        MockVoipEndpoint cB = expanded[4];
+        assertFalse(cB.isRtc);
+        assertTrue(cB.tcp);
+        assertTrue(cB.turn);
+        assertEquals(MockVoipInstance.ENDPOINT_TYPE_TCP_RELAY, cB.type);
+        assertEquals("127.0.0.1", cB.ipv4);
+        assertEquals(598, cB.port);
+        assertEquals(2, cB.reflectorId);
+        assertEquals("reflector", cB.username);
+        assertNotNull(cB.peerTag);
+        assertEquals(16, cB.peerTag.length);
+
+        // Second call (simulating makeInstance -> NativeInstance.make) MUST be idempotent.
+        Object[] idempotent = WgSharedHubAndVoip.expandEndpointsWithTcpFallbacks(
+                expanded, MockVoipEndpoint.class, MockVoipInstance.class);
+        org.junit.Assert.assertSame(expanded, idempotent);
     }
 
     private static double contrastRatio(int rgb1, int rgb2) {

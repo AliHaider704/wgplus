@@ -3,6 +3,11 @@ keystore.properties
 *.p12
 *.jks
 *.keystore
+/.offline_keys/
+.offline_keys/
+*.ed25519.key
+updater_ed25519_*
+*.priv
 
 # Build output
 /build/
@@ -34,3 +39,4 @@ wgplus-data/
 Thumbs.db
 *.log
 .tmp.driveupload/
+/diagnostics_archive/

@@ -13,6 +13,7 @@ let probingMtu = false;
 let onboardingDismissed = false;
 let telemetryConsentDismissedThisVisit = false;
 let sendingDiagCloud = false;
+let editingProfileSnapshot = null;
 
 const el = (id) => document.getElementById(id);
 
@@ -283,13 +284,13 @@ function renderStatusAndTelemetry() {
     titleText = tr.statusConnecting;
   } else if (state.connected) {
     const hsAge = typeof s.handshakeAgeSec === "number" ? s.handshakeAgeSec : -1;
-    const hsHealthy = typeof s.handshakeHealthy === "boolean" ? s.handshakeHealthy : (hsAge >= 0 && hsAge < 150);
+    const hsHealthy = typeof s.handshakeHealthy === "boolean" ? s.handshakeHealthy : (hsAge >= 0 && hsAge < 210);
     const nowSec = Math.floor(Date.now() / 1000);
     const connElapsed = state.connectedSinceUnix > 0 ? Math.max(0, nowSec - state.connectedSinceUnix) : 0;
-    if (hsHealthy && hsAge >= 0 && hsAge < 150) {
+    if (hsHealthy && hsAge >= 0 && hsAge < 210) {
       dotClass = "dot-connected";
       titleText = tr.statusConnected;
-    } else if ((hsAge < 0 && connElapsed >= 10) || hsAge >= 150) {
+    } else if ((hsAge < 0 && connElapsed >= 10) || hsAge >= 210) {
       dotClass = "dot-warn";
       titleText = tr.statusStalled;
       showRecovery = true;
@@ -354,8 +355,10 @@ function renderStatusAndTelemetry() {
   el("val-live-speed").textContent = `${formatBytes(s.rxBps, tr)}/${tr.unitsSec} | ${formatBytes(s.txBps, tr)}/${tr.unitsSec}`;
   const voipModeTag = s.voipTunActive ? tr.voipTunTag : tr.voipRelayTag;
   el("val-voip-calls").textContent = `${s.activeUdpAssocs || 0} (${voipModeTag})`;
-  el("val-handshake-age").textContent =
-    s.handshakeAgeSec >= 0 ? tr.handshakeAge(s.handshakeAgeSec) : tr.handshakeNever;
+  const hsText = s.handshakeAgeSec >= 0 ? tr.handshakeAge(s.handshakeAgeSec) : tr.handshakeNever;
+  el("val-handshake-age").textContent = (state.connected && s.activeMtu > 0)
+    ? `${hsText} | ${tr.mtuLiveTag(s.activeMtu)}`
+    : hsText;
 
   updateSparkline(state.rxHistory, state.txHistory);
 
@@ -489,7 +492,8 @@ function renderProfiles(forceRender) {
   const profiles = state.profiles || [];
   const activeId = state.activeProfileId || state.settings.activeProfileId;
   const lang = state?.settings?.language === "ar" ? "ar" : "en";
-  const sig = `${lang}|${state.connected ? 1 : 0}|${activeId || ""}|` +
+  const activeLiveMtu = (state.connected && state.stats?.activeMtu > 0) ? state.stats.activeMtu : 0;
+  const sig = `${lang}|${state.connected ? 1 : 0}|${activeId || ""}|${activeLiveMtu}|` +
     profiles.map((p) => `${p.id}:${p.name}:${p.endpoint}:${p.mtu}:${p.awgParams ? 1 : 0}:${p.lastPingMs}`).join(";");
   if (!forceRender && sig === lastProfilesRenderSig && listEl.childElementCount > 0) {
     return;
@@ -536,7 +540,9 @@ function renderProfiles(forceRender) {
     const meta = document.createElement("div");
     meta.className = "row-meta mono";
     const awgPart = p.awgParams ? ` | ${tr.awgTag}` : "";
-    meta.textContent = `${lri(p.endpoint)} | ${tr.mtuTag(p.mtu || 1280)}${awgPart}`;
+    const liveMtu = (isActive && activeLiveMtu > 0) ? activeLiveMtu : 0;
+    const mtuText = liveMtu > 0 ? tr.mtuLiveTag(liveMtu) : tr.mtuTag(p.mtu || 1280);
+    meta.textContent = `${lri(p.endpoint)} | ${mtuText}${awgPart}`;
 
     main.appendChild(title);
     main.appendChild(meta);
@@ -694,6 +700,7 @@ async function persistCurrentSettings(mutator) {
 function openEditor(profile) {
   const tr = t();
   const isNew = !profile;
+  editingProfileSnapshot = profile ? { ...profile } : null;
   const p = profile || {
     id: "",
     name: "",
@@ -726,6 +733,7 @@ function openEditor(profile) {
 }
 
 function closeAllModals() {
+  editingProfileSnapshot = null;
   el("modal-editor").classList.add("hidden");
   el("modal-paste").classList.add("hidden");
   el("modal-qr").classList.add("hidden");
@@ -1267,6 +1275,8 @@ function wireEvents() {
         mtu: parseInt(el("ed-mtu").value, 10) || 1280,
         awgParams: el("ed-awg-raw").value.trim(),
         useDoH: el("ed-use-doh").checked,
+        isWarp: !!editingProfileSnapshot?.isWarp,
+        lastPingMs: editingProfileSnapshot?.lastPingMs || 0,
       });
       closeAllModals();
       await refreshBootstrap();
@@ -1293,6 +1303,8 @@ function wireEvents() {
         mtu: parseInt(el("ed-mtu").value, 10) || 1280,
         awgParams: el("ed-awg-raw").value.trim(),
         useDoH: el("ed-use-doh").checked,
+        isWarp: !!editingProfileSnapshot?.isWarp,
+        lastPingMs: editingProfileSnapshot?.lastPingMs || 0,
       });
       el("ed-mtu").value = best;
       showToast(t().toastMtuFound(best));

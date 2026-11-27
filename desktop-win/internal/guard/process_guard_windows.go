@@ -1,8 +1,11 @@
 package guard
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -127,6 +130,14 @@ type cachedProcEntry struct {
 	expiresAt  time.Time
 }
 
+type sigCacheEntry struct {
+	modUnixNano int64
+	size        int64
+	sha256Hex   string
+	verifiedAt  time.Time
+	valid       bool
+}
+
 // ProcessGuard enforces zero-admin per-process loopback firewall checks on 127.0.0.1.
 type ProcessGuard struct {
 	mu               sync.RWMutex
@@ -135,7 +146,7 @@ type ProcessGuard struct {
 	monitoredPorts   map[uint16]bool
 	allowedNames     map[string]bool
 	allowedPaths     map[string]bool
-	verifiedSigPaths map[string]bool
+	verifiedSigCache map[string]sigCacheEntry
 	procCache        map[uint32]cachedProcEntry
 	events           []GuardEvent
 	blockedCount     atomic.Uint64
@@ -164,7 +175,7 @@ func NewProcessGuard() *ProcessGuard {
 		monitoredPorts:   make(map[uint16]bool),
 		allowedNames:     make(map[string]bool),
 		allowedPaths:     make(map[string]bool),
-		verifiedSigPaths: make(map[string]bool),
+		verifiedSigCache: make(map[string]sigCacheEntry),
 		procCache:        make(map[uint32]cachedProcEntry),
 		events:           make([]GuardEvent, 0, maxGuardEvents),
 	}
@@ -239,11 +250,6 @@ func (pg *ProcessGuard) AllowExecutablePath(exePath string) {
 		pg.allowedNames[base] = true
 	}
 	pg.mu.Unlock()
-}
-
-// AllowExecutableForTest adds an explicit binary path/name during automated tests.
-func (pg *ProcessGuard) AllowExecutableForTest(exePath string) {
-	pg.AllowExecutablePath(exePath)
 }
 
 func (pg *ProcessGuard) Events() []GuardEvent {
@@ -581,42 +587,147 @@ func extractAuthenticodeSignerName(exePath string) (string, bool) {
 	return name, name != ""
 }
 
+func isASCIIAlphaNum(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= '0' && b <= '9')
+}
+
+func hasWordBoundedToken(haystackLower, tokenLower string) bool {
+	if tokenLower == "" {
+		return false
+	}
+	offset := 0
+	for {
+		idx := strings.Index(haystackLower[offset:], tokenLower)
+		if idx < 0 {
+			return false
+		}
+		start := offset + idx
+		end := start + len(tokenLower)
+		beforeOk := start == 0 || !isASCIIAlphaNum(haystackLower[start-1])
+		afterOk := end == len(haystackLower) || !isASCIIAlphaNum(haystackLower[end])
+		if beforeOk && afterOk {
+			return true
+		}
+		offset = start + 1
+	}
+}
+
+func windowsAppsRootPrefix() string {
+	pf := strings.TrimSpace(os.Getenv("ProgramFiles"))
+	if pf == "" {
+		pf = `C:\Program Files`
+	}
+	return strings.ToLower(filepath.Clean(pf)) + `\windowsapps\`
+}
+
+func isTrustedWindowsStoreTelegramPath(normPath string) bool {
+	prefix := windowsAppsRootPrefix()
+	if !strings.HasPrefix(normPath, prefix) {
+		return false
+	}
+	rel := normPath[len(prefix):]
+	pkgDir := rel
+	if sep := strings.IndexByte(rel, '\\'); sep >= 0 {
+		pkgDir = rel[:sep]
+	}
+	return strings.HasPrefix(pkgDir, "telegrammessengerllp.") || strings.HasPrefix(pkgDir, "38833ff26ba1d.")
+}
+
 func isTrustedTelegramPublisher(signerName, normPath string) bool {
 	low := strings.ToLower(strings.TrimSpace(signerName))
 	if low == "" {
 		return false
 	}
-	if strings.Contains(low, "telegram") ||
-		strings.Contains(low, "ayugram") ||
-		strings.Contains(low, "kotatogram") ||
-		strings.Contains(low, "64gram") ||
-		strings.Contains(low, "forkgram") ||
-		strings.Contains(low, "materialgram") ||
-		strings.Contains(low, "exteragram") ||
-		strings.Contains(low, "cherrygram") ||
-		strings.Contains(low, "nicegram") ||
-		strings.Contains(low, "unigram") {
-		return true
+	for _, token := range []string{
+		"telegram",
+		"ayugram",
+		"kotatogram",
+		"64gram",
+		"forkgram",
+		"materialgram",
+		"exteragram",
+		"cherrygram",
+		"nicegram",
+		"ime messenger",
+		"unigram",
+	} {
+		if hasWordBoundedToken(low, token) {
+			return true
+		}
 	}
-	if strings.Contains(normPath, `\windowsapps\`) &&
-		(strings.Contains(low, "38833ff26ba1d") || strings.Contains(low, "microsoft corporation")) {
+	cleanNorm := strings.ToLower(filepath.Clean(strings.TrimSpace(normPath)))
+	if isTrustedWindowsStoreTelegramPath(cleanNorm) &&
+		(hasWordBoundedToken(low, "38833ff26ba1d") || strings.Contains(low, "microsoft corporation")) {
 		return true
 	}
 	return false
 }
 
-func (pg *ProcessGuard) verifyAuthenticodeCached(exePath, normPath string) bool {
-	pg.mu.RLock()
-	cached, ok := pg.verifiedSigPaths[normPath]
-	pg.mu.RUnlock()
-	if ok {
-		return cached
+func isProtectedInstallDir(normPath string) bool {
+	for _, envVar := range []string{"ProgramFiles", "ProgramFiles(x86)"} {
+		if base := strings.TrimSpace(os.Getenv(envVar)); base != "" {
+			prefix := strings.ToLower(filepath.Clean(base)) + `\`
+			if strings.HasPrefix(normPath, prefix) {
+				return true
+			}
+		}
 	}
+	return false
+}
+
+func fastExecutableSHA256(path string, size int64) (string, bool) {
+	const maxHashBytes = 256 * 1024 * 1024
+	if size < 0 || size > maxHashBytes {
+		return "", false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, io.LimitReader(f, maxHashBytes+1)); err != nil {
+		return "", false
+	}
+	return hex.EncodeToString(h.Sum(nil)), true
+}
+
+func (pg *ProcessGuard) verifyAuthenticodeCached(exePath, normPath string) bool {
+	st, err := os.Stat(exePath)
+	if err != nil || st.IsDir() {
+		return false
+	}
+	modNano := st.ModTime().UnixNano()
+	sz := st.Size()
+	now := time.Now()
+	protectedDir := isProtectedInstallDir(normPath)
+
+	pg.mu.RLock()
+	ent, ok := pg.verifiedSigCache[normPath]
+	pg.mu.RUnlock()
+	if ok && ent.modUnixNano == modNano && ent.size == sz {
+		if protectedDir {
+			return ent.valid
+		}
+		// Outside Program Files, verify SHA-256 or TTL expiry to prevent Chtimes + same-size binary swap.
+		if now.Sub(ent.verifiedAt) <= 30*time.Second && ent.sha256Hex != "" {
+			if curHash, hOk := fastExecutableSHA256(exePath, sz); hOk && curHash == ent.sha256Hex {
+				return ent.valid
+			}
+		}
+	}
+	curHash, _ := fastExecutableSHA256(exePath, sz)
 	valid := verifyAuthenticodeFile(exePath)
 	pg.mu.Lock()
-	pg.verifiedSigPaths[normPath] = valid
-	if valid {
-		pg.allowedPaths[normPath] = true
+	if len(pg.verifiedSigCache) > 256 {
+		pg.verifiedSigCache = make(map[string]sigCacheEntry)
+	}
+	pg.verifiedSigCache[normPath] = sigCacheEntry{
+		modUnixNano: modNano,
+		size:        sz,
+		sha256Hex:   curHash,
+		verifiedAt:  now,
+		valid:       valid,
 	}
 	pg.mu.Unlock()
 	return valid
@@ -656,6 +767,9 @@ func (pg *ProcessGuard) lookupProcessInfo(pid uint32) (exePath string, baseName 
 	}
 
 	pg.mu.Lock()
+	if len(pg.procCache) > 512 {
+		pg.procCache = make(map[uint32]cachedProcEntry)
+	}
 	pg.procCache[pid] = cachedProcEntry{
 		exePath:    exePath,
 		baseName:   baseName,

@@ -9,12 +9,11 @@ import (
 	"image"
 	_ "image/gif"
 	_ "image/jpeg"
-	_ "image/png"
+	"image/png"
 	"unsafe"
 
 	"github.com/makiuchi-d/gozxing"
 	qrreader "github.com/makiuchi-d/gozxing/qrcode"
-	"github.com/skip2/go-qrcode"
 	_ "golang.org/x/image/bmp"
 	"golang.org/x/sys/windows"
 )
@@ -38,7 +37,17 @@ func EncodeConfToPNGBytes(confText string) ([]byte, error) {
 	if confText == "" {
 		return nil, errors.New("empty QR content")
 	}
-	return qrcode.Encode(confText, qrcode.Medium, 320)
+	bm, err := qrreader.NewQRCodeWriter().Encode(confText, gozxing.BarcodeFormat_QR_CODE, 320, 320, map[gozxing.EncodeHintType]interface{}{
+		gozxing.EncodeHintType_MARGIN: 2,
+	})
+	if err != nil {
+		return nil, err
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, bm); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
 }
 
 // EncodeConfToPNGDataURL renders a base64 PNG data URL for embedding directly inside dark/light UI frames.

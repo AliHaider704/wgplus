@@ -3,6 +3,7 @@ package wgbridge
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/tls"
 	"encoding/binary"
 	"errors"
@@ -429,14 +430,23 @@ func resolveHostViaParallelDoH(host string, timeout time.Duration) (netip.Addr, 
 	}
 }
 
+func cryptoRandDnsTxID() uint16 {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err == nil {
+		if id := binary.BigEndian.Uint16(b[:]); id != 0 {
+			return id
+		}
+	}
+	return (uint16(time.Now().UnixNano()) & 0xfffe) | 1
+}
+
 func resolveHostViaDirectUdpDns(ctx context.Context, dnsServerAddr string, host string) (netip.Addr, error) {
 	wireQuery, err := encodeDnsQueryA(host)
 	if err != nil {
 		return netip.Addr{}, err
 	}
-	// Prepend non-zero transaction ID (0x5747)
-	wireQuery[0] = 0x57
-	wireQuery[1] = 0x47
+	txID := cryptoRandDnsTxID()
+	binary.BigEndian.PutUint16(wireQuery[0:2], txID)
 
 	var d net.Dialer
 	conn, err := d.DialContext(ctx, "udp4", dnsServerAddr)
@@ -459,7 +469,7 @@ func resolveHostViaDirectUdpDns(ctx context.Context, dnsServerAddr string, host 
 	if err != nil || n < 12 {
 		return netip.Addr{}, errors.New("short UDP DNS reply")
 	}
-	if resp[0] != 0x57 || resp[1] != 0x47 {
+	if binary.BigEndian.Uint16(resp[0:2]) != txID {
 		return netip.Addr{}, errors.New("UDP DNS txid mismatch")
 	}
 	return parseDnsResponseA(resp[:n], false)

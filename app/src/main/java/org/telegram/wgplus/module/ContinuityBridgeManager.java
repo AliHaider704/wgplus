@@ -578,7 +578,7 @@ public final class ContinuityBridgeManager {
 
     private static List<Integer> resolveRunningPidsViaDaemon(Context context, String pkg) {
         ArrayList<Integer> pids = new ArrayList<>();
-        if (context == null || !PrivilegeBridge.isStandaloneDaemonAlive(context)) {
+        if (context == null || !DaemonProcessHelper.isSafeToken(pkg) || !PrivilegeBridge.isStandaloneDaemonAlive(context)) {
             return pids;
         }
         PrivilegeBridge.ShellResult res = PrivilegeBridge.runShellCommand(context, "pidof " + pkg, 3000);

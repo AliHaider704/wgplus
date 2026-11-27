@@ -61,7 +61,15 @@ jobs:
             (($lines -join "`n") + "`n"),
             [System.Text.UTF8Encoding]::new($false)
           )
+          if (-not [string]::IsNullOrWhiteSpace($env:WGPLUS_UPDATER_ED25519_PRIV_HEX)) {
+            go run scripts/sign-windows-sums.go -sign -in "dist\SHA256SUMS-windows.txt" -out "dist\SHA256SUMS-windows.txt.sig"
+            if ($LASTEXITCODE -ne 0) { throw "Ed25519 signing failed" }
+          } else {
+            Write-Host "Offline Ed25519 signing policy active: upload local dist/WireGuardPlus-Windows-x64.exe, SHA256SUMS-windows.txt, and SHA256SUMS-windows.txt.sig signed via .offline_keys/."
+          }
           Get-Content "dist\SHA256SUMS-windows.txt"
+        env:
+          WGPLUS_UPDATER_ED25519_PRIV_HEX: ${{ secrets.WGPLUS_UPDATER_ED25519_PRIV_HEX }}
 
       - name: Attest Build Provenance
         uses: actions/attest-build-provenance@v2
@@ -78,6 +86,8 @@ jobs:
             dist/WireGuardPlus-Windows-x64.exe
             dist/WireGuardPlus-Windows-x64-Portable.zip
             dist/SHA256SUMS-windows.txt
+            dist/SHA256SUMS-windows.txt.sig
+          if-no-files-found: ignore
 
       - name: Upload Windows Assets to GitHub Release (if tagged or dispatched)
         shell: pwsh
@@ -105,26 +115,24 @@ jobs:
 
           if ($viewExit -ne 0 -or [string]::IsNullOrWhiteSpace($releaseJson)) {
             Write-Host "Creating GitHub release $tag with Windows assets..."
-            & gh release create $tag `
-              "dist\WireGuardPlus-Windows-x64.exe" `
-              "dist\WireGuardPlus-Windows-x64-Portable.zip" `
-              "dist\SHA256SUMS-windows.txt" `
-              --notes-file "docs\release-notes\$tag.md"
+            $assets = @("dist\WireGuardPlus-Windows-x64.exe", "dist\WireGuardPlus-Windows-x64-Portable.zip", "dist\SHA256SUMS-windows.txt")
+            if (Test-Path "dist\SHA256SUMS-windows.txt.sig") { $assets += "dist\SHA256SUMS-windows.txt.sig" }
+            & gh release create $tag @assets --notes-file "docs\release-notes\$tag.md"
             if ($LASTEXITCODE -ne 0) { throw "gh release create failed" }
             exit 0
           }
 
           $parsed = $releaseJson | ConvertFrom-Json
           $hasExe = @($parsed.assets | Where-Object { $_.name -eq "WireGuardPlus-Windows-x64.exe" }).Count -gt 0
+          $hasSig = @($parsed.assets | Where-Object { $_.name -eq "SHA256SUMS-windows.txt.sig" }).Count -gt 0
           if (Test-Path "docs\release-notes\$tag.md") { & gh release edit $tag --notes-file "docs\release-notes\$tag.md" }
-          if ($hasExe) {
-            Write-Host "Release $tag already contains WireGuardPlus-Windows-x64.exe; skipping asset overwrite to preserve unified SHA256SUMS.txt."
+          if ($hasExe -or $hasSig) {
+            Write-Host "Release $tag already contains offline-signed Windows assets; skipping asset overwrite to preserve SHA256SUMS-windows.txt and its offline Ed25519 signature."
             exit 0
           }
 
           Write-Host "Uploading Windows assets to existing release $tag..."
-          & gh release upload $tag `
-            "dist\WireGuardPlus-Windows-x64.exe" `
-            "dist\WireGuardPlus-Windows-x64-Portable.zip" `
-            "dist\SHA256SUMS-windows.txt"
+          $assets = @("dist\WireGuardPlus-Windows-x64.exe", "dist\WireGuardPlus-Windows-x64-Portable.zip", "dist\SHA256SUMS-windows.txt")
+          if (Test-Path "dist\SHA256SUMS-windows.txt.sig") { $assets += "dist\SHA256SUMS-windows.txt.sig" }
+          & gh release upload $tag @assets
           if ($LASTEXITCODE -ne 0) { throw "gh release upload failed" }

@@ -7,10 +7,12 @@ import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Typeface;
+import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.PowerManager;
 import android.os.SystemClock;
 import android.provider.Settings;
 import android.util.TypedValue;
@@ -488,9 +490,16 @@ public class ModuleLauncherActivity extends Activity {
         statusCardLp.bottomMargin = WgTheme.dp(this, 16);
         content.addView(statusCard, statusCardLp);
 
+        // 1b. Pending unverified client signing-certificate approvals (explicit consent instead of silent TOFU)
+        java.util.List<KeepaliveStatusProvider.PendingClientApproval> pendingClients =
+                KeepaliveStatusProvider.getPendingClientApprovals(this);
+        for (final KeepaliveStatusProvider.PendingClientApproval req : pendingClients) {
+            content.addView(buildPendingClientApprovalCard(isAr, theme, cardPad, req), createCardParamsWithBottom(12));
+        }
+
         // 2. Live Setup Readiness Checklist + Collapsible Quick Guide + Safe Cache Optimizer
         content.addView(
-                buildReadinessChecklistCard(isAr, theme, cardPad, hasProfile, handshakeStateCode),
+                buildReadinessChecklistCard(isAr, theme, cardPad, hasProfile, handshakeStateCode, active, port),
                 createCardParamsWithBottom(16)
         );
 
@@ -580,12 +589,71 @@ public class ModuleLauncherActivity extends Activity {
         }, "wg-plus-launcher-warp").start();
     }
 
+    private LinearLayout buildPendingClientApprovalCard(
+            final boolean isAr,
+            WgTheme theme,
+            int cardPad,
+            final KeepaliveStatusProvider.PendingClientApproval req
+    ) {
+        LinearLayout card = new LinearLayout(this);
+        card.setOrientation(LinearLayout.VERTICAL);
+        card.setBackground(WgTheme.cardBackground(this, theme.pendingBg, theme.pendingBorder, 12f));
+        card.setPadding(cardPad, cardPad, cardPad, cardPad);
+
+        TextView title = new TextView(this);
+        styleText(title, isAr, theme.pendingText, 14.5f, true);
+        title.setText(WgStrings.pendingClientApprovalTitle(isAr, req.certChanged));
+        card.addView(title);
+
+        String certPrefix = req.certSha256 != null && req.certSha256.length() >= 12
+                ? req.certSha256.substring(0, 12)
+                : String.valueOf(req.certSha256);
+        TextView desc = new TextView(this);
+        styleText(desc, isAr, theme.textSecondary, 12.5f, false);
+        desc.setText(WgStrings.pendingClientApprovalDesc(isAr, req.pkg, certPrefix, req.certChanged));
+        LinearLayout.LayoutParams dLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+        );
+        dLp.topMargin = WgTheme.dp(this, 6);
+        dLp.bottomMargin = WgTheme.dp(this, 10);
+        card.addView(desc, dLp);
+
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+
+        Button approveBtn = createActionButton(WgStrings.approveClientBtn(isAr), theme, false);
+        approveBtn.setContentDescription("wgplus_btn_approve_client_" + req.pkg);
+        approveBtn.setOnClickListener(v -> {
+            KeepaliveStatusProvider.approveClientCertificate(this, req.pkg, req.certSha256);
+            Toast.makeText(this, WgStrings.clientApprovedToast(isAr, req.pkg), Toast.LENGTH_SHORT).show();
+            renderScreen();
+        });
+        LinearLayout.LayoutParams aLp = new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+        setMarginEnd(aLp, WgTheme.dp(this, 8), isAr);
+        row.addView(approveBtn, aLp);
+
+        Button rejectBtn = createActionButton(WgStrings.rejectClientBtn(isAr), theme, true);
+        rejectBtn.setContentDescription("wgplus_btn_reject_client_" + req.pkg);
+        rejectBtn.setOnClickListener(v -> {
+            KeepaliveStatusProvider.rejectClientCertificate(this, req.pkg, req.certSha256);
+            Toast.makeText(this, WgStrings.clientRejectedToast(isAr, req.pkg), Toast.LENGTH_SHORT).show();
+            renderScreen();
+        });
+        row.addView(rejectBtn, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        card.addView(row);
+        return card;
+    }
+
     private LinearLayout buildReadinessChecklistCard(
             final boolean isAr,
             WgTheme theme,
             int cardPad,
             boolean hasProfile,
-            int handshakeStateCode
+            int handshakeStateCode,
+            final boolean tunnelActive,
+            final int tunnelPort
     ) {
         LinearLayout card = new LinearLayout(this);
         card.setOrientation(LinearLayout.VERTICAL);
@@ -630,6 +698,31 @@ public class ModuleLauncherActivity extends Activity {
                 handshakeStateCode == 2 ? theme.activeText : theme.textSecondary,
                 WgStrings.readinessItemHandshake(isAr, handshakeStateCode)
         );
+
+        java.util.List<String> installedTargets = ContinuityBridgeManager.getInstalledTargetPackages(this);
+        if (tunnelActive && tunnelPort > 0 && !hookVerified && !installedTargets.isEmpty()) {
+            Button bindTgBtn = createActionButton(WgStrings.standaloneBindTelegramBtn(isAr), theme, false);
+            bindTgBtn.setContentDescription("wgplus_btn_bind_tg_socks");
+            bindTgBtn.setOnClickListener(v -> launchStandaloneTelegramProxyBind(isAr, tunnelPort, installedTargets.get(0)));
+            LinearLayout.LayoutParams bLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            );
+            bLp.topMargin = WgTheme.dp(this, 6);
+            card.addView(bindTgBtn, bLp);
+        }
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !isBatteryOptimizationIgnored()) {
+            Button battBtn = createActionButton(WgStrings.allowUnrestrictedBatteryBtn(isAr), theme, true);
+            battBtn.setContentDescription("wgplus_btn_unrestricted_battery");
+            battBtn.setOnClickListener(v -> requestIgnoreBatteryOptimizations());
+            LinearLayout.LayoutParams batLp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.WRAP_CONTENT
+            );
+            batLp.topMargin = WgTheme.dp(this, 6);
+            card.addView(battBtn, batLp);
+        }
 
         Button toggleGuideBtn = createActionButton(WgStrings.launcherStepsToggleBtn(isAr, mGuideExpanded), theme, true);
         toggleGuideBtn.setContentDescription("wgplus_toggle_guide");
@@ -737,6 +830,62 @@ public class ModuleLauncherActivity extends Activity {
         row.addView(tv, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
         parent.addView(row, rLp);
+    }
+
+    private void launchStandaloneTelegramProxyBind(boolean isAr, int port, String preferredPkg) {
+        try {
+            WireGuardManager.syncForegroundKeepaliveService(this, true);
+        } catch (Throwable ignored) {
+        }
+        String user = WgSyncAndCreds.getClientSocksUser(this);
+        String pass = WgSyncAndCreds.getActiveSocksPass(this);
+        String uriStr = "tg://socks?server=127.0.0.1&port=" + port
+                + "&user=" + Uri.encode(user != null ? user : "")
+                + "&pass=" + Uri.encode(pass != null ? pass : "");
+        Intent i = new Intent(Intent.ACTION_VIEW, Uri.parse(uriStr));
+        if (preferredPkg != null && !preferredPkg.isEmpty()) {
+            i.setPackage(preferredPkg);
+        }
+        try {
+            startActivity(i);
+            Toast.makeText(this, WgStrings.standaloneBindTelegramToast(isAr), Toast.LENGTH_LONG).show();
+        } catch (Throwable firstErr) {
+            try {
+                startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(uriStr)));
+                Toast.makeText(this, WgStrings.standaloneBindTelegramToast(isAr), Toast.LENGTH_LONG).show();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    private boolean isBatteryOptimizationIgnored() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return true;
+        }
+        try {
+            PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
+            return pm != null && pm.isIgnoringBatteryOptimizations(getPackageName());
+        } catch (Throwable ignored) {
+            return false;
+        }
+    }
+
+    private void requestIgnoreBatteryOptimizations() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
+            return;
+        }
+        try {
+            Intent req = new Intent(
+                    Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS,
+                    Uri.parse("package:" + getPackageName())
+            );
+            startActivity(req);
+        } catch (Throwable err) {
+            try {
+                startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            } catch (Throwable ignored) {
+            }
+        }
     }
 
     private LinearLayout buildHybridContinuityCard(boolean isAr, WgTheme theme, int cardPad) {

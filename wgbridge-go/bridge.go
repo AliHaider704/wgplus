@@ -2,14 +2,11 @@ package wgbridge
 
 import (
 	"context"
-	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"net"
 	"net/netip"
 	"strconv"
@@ -24,6 +21,7 @@ import (
 const (
 	defaultMTU               = 1280
 	minMTU                   = 1280
+	nestedMinMTU             = 1200
 	maxMTU                   = 1420
 	maxUdpSessionsCap        = 64
 	desktopMaxUdpSessionsCap = 256
@@ -40,6 +38,7 @@ var (
 	lastAppliedResolvedEp    string
 	socksAuthRejectCount     atomic.Int64
 	activeDev                *device.Device
+	activeTun                *fastNetTun
 	activeCtx                context.Context
 	activeCancel             context.CancelFunc
 	activeTnet               *fastNet
@@ -51,7 +50,10 @@ var (
 	activeUseDoH             bool
 	activeKeepAlive          int
 	activeMtu                int
+	activeAwgS4              int
+	activeMaxMtuCap          int
 	activeStartTime          time.Time
+	mtuCalibGen              atomic.Uint64
 	handshakeInitMu          sync.Mutex
 	lastHandshakeInitAt      time.Time
 	baseRxBytes              uint64
@@ -65,10 +67,18 @@ var (
 	preferredMuxPorts        = []int{48729, 48730, 48731, 48732, 0}
 	preferredMuxPortOverride int
 	recoveryEpoch            atomic.Int64
+	hostLinkMTU              atomic.Int32
+	hostOuterVpn             atomic.Bool
+	lastPeerRxAtNano         atomic.Int64
+	lastTrackedRxBytes       atomic.Uint64
+	lastTrackedHsSec         atomic.Int64
+	watchdogStalled          atomic.Bool
+	lastProactiveRekeyNano   atomic.Int64
 
 	socksAuthMu           sync.RWMutex
 	socksAuthUser         string
 	socksAuthPass         string
+	socksExtraPasses      []string
 	lastSocksAuthDiagNano atomic.Int64
 
 	proxyStreamsMu     sync.Mutex
@@ -118,6 +128,35 @@ func SetSocksAuth(username, password string) {
 	socksAuthMu.Lock()
 	socksAuthUser = username
 	socksAuthPass = password
+	if username == "" && password == "" {
+		socksExtraPasses = nil
+	}
+	socksAuthMu.Unlock()
+}
+
+// SetSocksExtraPasswords registers additional allowed loopback credentials (e.g. derived from
+// sibling local user profiles) so profile switches and multi-client hubs do not trigger auth storms.
+func SetSocksExtraPasswords(csv string) {
+	var parsed []string
+	if strings.TrimSpace(csv) != "" {
+		seen := make(map[string]struct{}, 8)
+		for _, part := range strings.Split(csv, ",") {
+			p := strings.TrimSpace(part)
+			if p == "" {
+				continue
+			}
+			if _, dup := seen[p]; dup {
+				continue
+			}
+			seen[p] = struct{}{}
+			parsed = append(parsed, p)
+			if len(parsed) >= 32 {
+				break
+			}
+		}
+	}
+	socksAuthMu.Lock()
+	socksExtraPasses = parsed
 	socksAuthMu.Unlock()
 }
 
@@ -127,6 +166,24 @@ func getSocksAuth() (string, string) {
 	p := socksAuthPass
 	socksAuthMu.RUnlock()
 	return u, p
+}
+
+func verifySocksPassBytes(candidate []byte) int {
+	socksAuthMu.RLock()
+	primary := socksAuthPass
+	var extras []string
+	if len(socksExtraPasses) > 0 {
+		extras = append([]string(nil), socksExtraPasses...)
+	}
+	socksAuthMu.RUnlock()
+
+	matched := subtle.ConstantTimeCompare(candidate, []byte(primary))
+	for _, ex := range extras {
+		if subtle.ConstantTimeCompare(candidate, []byte(ex)) == 1 {
+			matched = 1
+		}
+	}
+	return matched
 }
 
 // SetPreferredMuxPort overrides the primary local SOCKS5 port tried first when binding 127.0.0.1.
@@ -320,6 +377,84 @@ func isActiveDevice(dev *device.Device) bool {
 	return ok
 }
 
+func isIsolatedVirtualInterfaceName(name string) bool {
+	low := strings.ToLower(strings.TrimSpace(name))
+	if low == "" {
+		return false
+	}
+	for _, tok := range []string{
+		"wireguardpluscalls",
+		"vmware",
+		"vmnet",
+		"virtualbox",
+		"vboxnet",
+		"vethernet",
+		"teredo",
+		"isatap",
+		"6to4",
+		"wsl",
+		"hyper-v",
+	} {
+		if strings.Contains(low, tok) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasOutboundSystemRoute(resolvedEp string) bool {
+	target := strings.TrimSpace(resolvedEp)
+	network := "udp4"
+	isLoopbackTarget := false
+	if target == "" {
+		target = "1.1.1.1:80"
+	} else if host, _, err := net.SplitHostPort(target); err == nil {
+		if ip, pErr := netip.ParseAddr(strings.Trim(host, "[]")); pErr == nil {
+			unmapped := ip.Unmap()
+			if unmapped.IsLoopback() {
+				isLoopbackTarget = true
+			}
+			if unmapped.Is6() {
+				network = "udp6"
+			}
+		}
+	}
+	c, err := net.Dial(network, target)
+	if err != nil {
+		return false
+	}
+	localAddr := c.LocalAddr()
+	_ = c.Close()
+	if isLoopbackTarget {
+		return true
+	}
+	ua, ok := localAddr.(*net.UDPAddr)
+	if !ok || ua == nil || ua.IP == nil {
+		return true
+	}
+	if ua.IP.IsLoopback() {
+		return false
+	}
+	if ifaces, iErr := net.Interfaces(); iErr == nil {
+		for _, ifc := range ifaces {
+			addrs, aErr := ifc.Addrs()
+			if aErr != nil {
+				continue
+			}
+			for _, addr := range addrs {
+				ipn, okAddr := addr.(*net.IPNet)
+				if okAddr && ipn != nil && ipn.IP != nil && ipn.IP.Equal(ua.IP) {
+					if isIsolatedVirtualInterfaceName(ifc.Name) {
+						return false
+					}
+					return true
+				}
+			}
+		}
+	}
+	return true
+}
+
 func waitForHandshakeQuick(dev *device.Device, maxWait time.Duration) bool {
 	if dev == nil {
 		return false
@@ -344,6 +479,37 @@ func muxDeviceClosedOrReplaced(dev *device.Device) bool {
 }
 
 const minHardHopInterval = 3500 * time.Millisecond
+
+var (
+	cloudflareWarpPeerPubHex, _ = normalizeHexKey("bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=")
+	warpFallbackPorts           = [...]string{"2408", "4500", "500", "1701"}
+	warpPortCursor              atomic.Uint32
+)
+
+func nextWarpFallbackEndpoint(resolvedEp string, pubHex string, curHsSec int64) (string, bool) {
+	if curHsSec > 0 || cloudflareWarpPeerPubHex == "" || !strings.EqualFold(strings.TrimSpace(pubHex), cloudflareWarpPeerPubHex) {
+		return "", false
+	}
+	host, port, err := net.SplitHostPort(strings.TrimSpace(resolvedEp))
+	if err != nil || host == "" {
+		return "", false
+	}
+	isKnownWarpPort := false
+	for _, p := range warpFallbackPorts {
+		if port == p {
+			isKnownWarpPort = true
+			break
+		}
+	}
+	if !isKnownWarpPort {
+		return "", false
+	}
+	nextPort := warpFallbackPorts[warpPortCursor.Add(1)%uint32(len(warpFallbackPorts))]
+	if nextPort == port {
+		nextPort = warpFallbackPorts[warpPortCursor.Add(1)%uint32(len(warpFallbackPorts))]
+	}
+	return net.JoinHostPort(host, nextPort), true
+}
 
 // hopActivePeer forces wireguard-go onto a fresh OS ephemeral UDP port (listen_port=0) and,
 // when forcePeerReset is true, cleanly recreates the peer so stale lastSentHandshake (5s RekeyTimeout)
@@ -392,7 +558,7 @@ func hopActivePeerInternal(hopPort bool, forcePeerReset bool, bypassCooldown boo
 		// Advance past WireGuard's 20ms HandshakeInitationRate & ~16.77ms TAI64N window BEFORE
 		// applyPeerUapi(..., replace_peers=true) because persistent_keepalive immediately triggers an initiation inside IpcSet.
 		waitNextTai64nTick()
-		rawRx, rawTx, _ := readDeviceCounters(dev)
+		rawRx, rawTx, curHs := readDeviceCounters(dev)
 		mu.Lock()
 		if !running || activeDev != dev {
 			mu.Unlock()
@@ -400,6 +566,9 @@ func hopActivePeerInternal(hopPort bool, forcePeerReset bool, bypassCooldown boo
 		}
 		baseRxBytes += rawRx
 		baseTxBytes += rawTx
+		if rotatedEp, ok := nextWarpFallbackEndpoint(activeResolvedEp, activePeerPubHex, curHs); ok {
+			activeResolvedEp = rotatedEp
+		}
 		params = peerHandshakeParams{
 			pubHex:     activePeerPubHex,
 			pskHex:     activePskHex,
@@ -612,21 +781,30 @@ func StartTunnelAdvanced(
 	if err != nil {
 		return 0, err
 	}
-	effectiveMTU := normalizeMTU(mtu)
-	// Ensure S4 transport padding never pushes outer UDP frames past typical cellular 1452-byte ceiling
-	if awgCfg.S4 > 0 && effectiveMTU+awgCfg.S4 > maxMTU {
-		effectiveMTU = normalizeMTU(maxMTU - awgCfg.S4)
+	// Boot safely at 1280 so handshake/first frames never blackhole on strict routers;
+	// store requested custom cap (1281..1419) or allow full auto-calibration up to 1420.
+	userCap := maxMTU
+	if mtu > defaultMTU && mtu <= maxMTU {
+		userCap = mtu
+	}
+	initialMTU := defaultMTU
+	if nestedCap := computeNestedCapMTU(int(hostLinkMTU.Load()), hostOuterVpn.Load()); nestedCap < initialMTU {
+		initialMTU = nestedCap
 	}
 
 	// Ensure consecutive restarts/handovers advance past WireGuard's 20ms rate limit & TAI64N bucket
 	// BEFORE dev.Up() starts the keepalive initiation timer.
 	waitNextTai64nTick()
 
+	if getActiveProxyStreamCount() > 0 {
+		ResetActiveProxyConnections("tunnel_restart")
+	}
+
 	mu.Lock()
 
 	stopTunnelOnlyLocked()
 
-	tunDev, tnet, err := createFastNetTUN(clientAddrs, dnsAddrs, effectiveMTU)
+	tunDev, tnet, err := createFastNetTUN(clientAddrs, dnsAddrs, initialMTU)
 	if err != nil {
 		stopMuxIfIdleLocked()
 		mu.Unlock()
@@ -676,6 +854,7 @@ func StartTunnelAdvanced(
 	ctx, cancel := context.WithCancel(context.Background())
 
 	activeDev = dev
+	activeTun, _ = tunDev.(*fastNetTun)
 	activeCtx = ctx
 	activeCancel = cancel
 	activeTnet = tnet
@@ -686,10 +865,16 @@ func StartTunnelAdvanced(
 	activeRawEp = endpoint
 	activeUseDoH = useDoH
 	activeKeepAlive = keepAlive
-	activeMtu = effectiveMTU
+	activeMtu = initialMTU
+	activeAwgS4 = awgCfg.S4
+	activeMaxMtuCap = userCap
 	activeStartTime = time.Now()
 	baseRxBytes = 0
 	baseTxBytes = 0
+	lastTrackedRxBytes.Store(0)
+	lastTrackedHsSec.Store(0)
+	lastPeerRxAtNano.Store(0)
+	watchdogStalled.Store(false)
 	running = true
 	muxStartupPend = false
 	notifyMuxWaitersLocked()
@@ -701,6 +886,8 @@ func StartTunnelAdvanced(
 	// Give fast peers up to 160ms to complete handshake before returning port to Telegram
 	waitForHandshakeQuick(dev, 160*time.Millisecond)
 
+	calibGen := mtuCalibGen.Add(1)
+	go autoCalibrateAfterHandshake(ctx, dev, calibGen)
 	go tunnelWatchdogLoop(ctx, dev, pubHex)
 	go tunnelBandwidthSamplerLoop(ctx, dev)
 
@@ -744,6 +931,7 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 	var noHandshakeTicks int
 	var noHandshakeBackoffTicks = 3 // 9s -> 18s -> 30s
 	var lastHardHopAt time.Time
+	var wasSystemOffline bool
 
 	for {
 		select {
@@ -755,14 +943,43 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 			return
 		}
 
+		mu.Lock()
+		curEp := activeResolvedEp
+		mu.Unlock()
+		if !hasOutboundSystemRoute(curEp) {
+			wasSystemOffline = true
+			stalledTicks = 0
+			noHandshakeTicks = 0
+			watchdogStalled.Store(false)
+			continue
+		}
+		if wasSystemOffline {
+			wasSystemOffline = false
+			if hopActivePeer(true, true) {
+				CalibrateActiveTunnelMTUAsync()
+			}
+			ResetActiveProxyConnections("watchdog_route_restored")
+			lastHardHopAt = time.Now()
+			stalledTicks = 0
+			noHandshakeTicks = 0
+			watchdogStalled.Store(false)
+			lastRx, lastTx, _ = readActiveTotals(dev)
+			continue
+		}
+
 		rx, tx, hsSec := readActiveTotals(dev)
+		updatePeerLivenessFromCounters(rx, hsSec)
 		nowSec := time.Now().Unix()
 
 		if rx < lastRx || tx < lastTx {
 			lastRx, lastTx = rx, tx
 			stalledTicks = 0
 			noHandshakeTicks = 0
+			watchdogStalled.Store(false)
 			continue
+		}
+		if rx > lastRx {
+			watchdogStalled.Store(false)
 		}
 
 		txDelta := tx - lastTx
@@ -789,22 +1006,29 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 		noHandshakeTicks = 0
 		noHandshakeBackoffTicks = 3
 
-		// Case A2: Handshake aging (>135s while real traffic is flowing).
-		// Soft-rehandshake ONLY — never wipe the live peer session or hop UDP port here,
-		// otherwise active Telegram TCP sockets stall for 2-5 seconds on retransmission.
+		// Case A2: Proactive background session key renewal starting at 115s so idle sessions
+		// stay hot (<180s) continuously 24/7 while online without hopping ports or breaking sockets.
 		hsAge := nowSec - hsSec
-		if hsAge > 135 && txDelta >= 128 && rx > lastRx {
-			triggerPeerHandshakeDirect(dev, pubHex, true)
+		if hsAge >= 115 && hsAge < 180 {
+			nowNano := time.Now().UnixNano()
+			prevRekey := lastProactiveRekeyNano.Load()
+			if nowNano-prevRekey >= int64(15*time.Second) && lastProactiveRekeyNano.CompareAndSwap(prevRekey, nowNano) {
+				triggerPeerHandshakeDirect(dev, pubHex, true)
+			}
 			stalledTicks = 0
 			lastRx, lastTx = rx, tx
 			continue
 		}
 
-		// Case B: Outbound payload (>=256B) with zero inbound RX across 3 consecutive 3s intervals (9s).
+		// Case B: Outbound payload (>=256B) with zero inbound RX across 3s intervals (9s -> hard hop).
 		stalled := (txDelta >= 256 && rx == lastRx) ||
 			(hsAge > 220 && txDelta >= 128 && rx == lastRx)
 		if stalled {
 			stalledTicks++
+			watchdogStalled.Store(true)
+			if stalledTicks == 1 && GetActiveMTU() > defaultMTU {
+				StepDownActiveTunnelMTU(defaultMTU, "watchdog_tx_stall")
+			}
 			if stalledTicks >= 3 && canHardHop {
 				watchdogRecoveries.Add(1)
 				RecordDiag("WATCHDOG", "STALL_HOP", fmt.Sprintf("txDelta=%d hsAge=%d", txDelta, hsAge))
@@ -820,6 +1044,7 @@ func tunnelWatchdogLoop(ctx context.Context, dev *device.Device, pubHex string) 
 			triggerPeerHandshakeDirect(dev, pubHex, true)
 		} else {
 			stalledTicks = 0
+			watchdogStalled.Store(false)
 		}
 
 		lastRx, lastTx = rx, tx
@@ -877,6 +1102,7 @@ func UpdatePeerEndpoint(endpoint string) error {
 		return errors.New("tunnel is not running")
 	}
 	if waitForHandshakeQuick(dev, 1400*time.Millisecond) {
+		CalibrateActiveTunnelMTUAsync()
 		return nil
 	}
 	// Soft re-nudge after 180ms in case Android netd switched routes asynchronously
@@ -885,7 +1111,9 @@ func UpdatePeerEndpoint(endpoint string) error {
 		return nil
 	}
 	triggerPeerHandshakeDirect(dev, pubHex, true)
-	_ = waitForHandshakeQuick(dev, 900*time.Millisecond)
+	if waitForHandshakeQuick(dev, 900*time.Millisecond) {
+		CalibrateActiveTunnelMTUAsync()
+	}
 	return nil
 }
 
@@ -921,13 +1149,18 @@ func ForceRebindAndHandshake() bool {
 		return false
 	}
 	if waitForHandshakeQuick(dev, 1800*time.Millisecond) {
+		CalibrateActiveTunnelMTUAsync()
 		return true
 	}
 	if !isActiveDevice(dev) {
 		return false
 	}
 	triggerPeerHandshakeDirect(dev, pubHex, true)
-	return waitForHandshakeQuick(dev, 900*time.Millisecond)
+	ok := waitForHandshakeQuick(dev, 900*time.Millisecond)
+	if ok {
+		CalibrateActiveTunnelMTUAsync()
+	}
+	return ok
 }
 
 // EnsureTunnelAlive verifies the active tunnel is genuinely responsive without disturbing
@@ -1032,6 +1265,9 @@ func GetTunnelStats() string {
 // StopTunnel stops the active WireGuard device and closes the unified local SOCKS5 listener
 // unless KillSwitchGuard is currently protecting outbound traffic.
 func StopTunnel() {
+	if getActiveProxyStreamCount() > 0 {
+		ResetActiveProxyConnections("tunnel_stop")
+	}
 	mu.Lock()
 	stopLocked()
 	mu.Unlock()
@@ -1045,6 +1281,7 @@ func stopTunnelOnlyLocked() {
 	}
 	activeCtx = nil
 	activeTnet = nil
+	activeTun = nil
 	if activeDev != nil {
 		activeDev.Close()
 		activeDev = nil
@@ -1057,6 +1294,8 @@ func stopTunnelOnlyLocked() {
 	activeUseDoH = false
 	activeKeepAlive = 0
 	activeMtu = 0
+	activeAwgS4 = 0
+	activeMaxMtuCap = 0
 	baseRxBytes = 0
 	baseTxBytes = 0
 	running = false
@@ -1149,46 +1388,6 @@ func awaitMuxRouteReady(maxWait time.Duration) (context.Context, udpDialer, bool
 	}
 }
 
-type udpDialer interface {
-	DialContext(ctx context.Context, network, address string) (net.Conn, error)
-}
-
-func readSocks5Target(r io.Reader, atyp byte) (host string, port uint16, err error) {
-	switch atyp {
-	case 0x01: // IPv4
-		ipBuf := make([]byte, 4)
-		if _, err = io.ReadFull(r, ipBuf); err != nil {
-			return "", 0, err
-		}
-		host = net.IP(ipBuf).String()
-	case 0x03: // Domain name
-		lenBuf := make([]byte, 1)
-		if _, err = io.ReadFull(r, lenBuf); err != nil {
-			return "", 0, err
-		}
-		domBuf := make([]byte, int(lenBuf[0]))
-		if _, err = io.ReadFull(r, domBuf); err != nil {
-			return "", 0, err
-		}
-		host = string(domBuf)
-	case 0x04: // IPv6
-		ipBuf := make([]byte, 16)
-		if _, err = io.ReadFull(r, ipBuf); err != nil {
-			return "", 0, err
-		}
-		host = net.IP(ipBuf).String()
-	default:
-		return "", 0, errors.New("unsupported SOCKS5 ATYP")
-	}
-
-	portBuf := make([]byte, 2)
-	if _, err = io.ReadFull(r, portBuf); err != nil {
-		return "", 0, err
-	}
-	port = binary.BigEndian.Uint16(portBuf)
-	return host, port, nil
-}
-
 // IsHandshakeHealthy returns true only when the tunnel is running and has completed
 // a fresh WireGuard Noise handshake (last_handshake_time_sec > 0 and < 210s old).
 func IsHandshakeHealthy() bool {
@@ -1206,1129 +1405,428 @@ func IsHandshakeHealthy() bool {
 	return (time.Now().Unix() - hsSec) < 210
 }
 
-// GetSocksAuthRejectCount returns the number of rejected local SOCKS5 authentication attempts.
-func GetSocksAuthRejectCount() int64 {
-	return socksAuthRejectCount.Load()
-}
-
-// ResetSocksAuthRejectCount resets the SOCKS5 auth rejection counter (e.g., after credential sync).
-func ResetSocksAuthRejectCount() {
-	socksAuthRejectCount.Store(0)
-}
-
-func awaitHandshakeReadyOrFail(ctx context.Context, dialer udpDialer, maxWait time.Duration) bool {
-	if _, isWgNet := dialer.(*fastNet); !isWgNet {
-		return true
+func isActivePeerPublicKey(pubHex string) bool {
+	if strings.TrimSpace(pubHex) == "" {
+		return false
 	}
 	mu.Lock()
-	dev := activeDev
-	pubHex := activePeerPubHex
-	isUp := running
+	match := running && activeDev != nil && activePeerPubHex != "" && strings.EqualFold(activePeerPubHex, pubHex)
 	mu.Unlock()
-
-	if !isUp || dev == nil || pubHex == "" {
-		return false
-	}
-	_, _, hsSec := readDeviceCounters(dev)
-	if hsSec > 0 {
-		if time.Now().Unix()-hsSec > 135 {
-			triggerPeerHandshakeDirect(dev, pubHex, true)
-		}
-		return true
-	}
-	// Handshake not yet completed: nudge softly with isRetry=true and wait up to maxWait before failing fast.
-	triggerPeerHandshakeDirect(dev, pubHex, true)
-	deadline := time.Now().Add(maxWait)
-	for time.Now().Before(deadline) {
-		if ctx != nil && ctx.Err() != nil {
-			return false
-		}
-		if hasCompletedHandshake(dev) {
-			return true
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	return hasCompletedHandshake(dev)
+	return match
 }
 
-func recordSocksAuthReject(reason string) {
-	socksAuthRejectCount.Add(1)
-	nowNano := time.Now().UnixNano()
-	prev := lastSocksAuthDiagNano.Load()
-	if nowNano-prev > int64(3*time.Second) && lastSocksAuthDiagNano.CompareAndSwap(prev, nowNano) {
-		RecordDiag("SOCKS_AUTH", "REJECT", reason)
-	}
-}
-
-func sanitizeAuthSubLabel(raw string) string {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return ""
-	}
-	var b strings.Builder
-	b.Grow(len(raw))
-	for i := 0; i < len(raw) && b.Len() < 64; i++ {
-		c := raw[i]
-		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-' || c == '#' {
-			b.WriteByte(c)
-		}
-	}
-	return b.String()
-}
-
-func readSocks5HandshakeAndReqWithLabel(client net.Conn) (cmd byte, host string, dstPort uint16, authSubLabel string, reqParsed bool) {
-	// 1. Greeting: VER, NMETHODS, METHODS...
-	hdr := make([]byte, 2)
-	if _, err := io.ReadFull(client, hdr); err != nil {
-		return 0, "", 0, "", false
-	}
-	if hdr[0] != 0x05 {
-		return 0, "", 0, "", false
-	}
-	nMethods := int(hdr[1])
-	var methods []byte
-	if nMethods > 0 {
-		methods = make([]byte, nMethods)
-		if _, err := io.ReadFull(client, methods); err != nil {
-			return 0, "", 0, "", false
-		}
-	}
-
-	expectedUser, expectedPass := getSocksAuth()
-	if expectedUser == "" && expectedPass == "" {
-		// Reply: SOCKS5, NO AUTHENTICATION REQUIRED (0x00)
-		if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
-			return 0, "", 0, "", false
-		}
-	} else {
-		hasUserPass := false
-		for _, m := range methods {
-			if m == 0x02 {
-				hasUserPass = true
-				break
-			}
-		}
-		if !hasUserPass {
-			_, _ = client.Write([]byte{0x05, 0xFF})
-			recordSocksAuthReject("client omitted user/pass method 0x02")
-			return 0, "", 0, "", false
-		}
-		if _, err := client.Write([]byte{0x05, 0x02}); err != nil {
-			return 0, "", 0, "", false
-		}
-		// RFC 1929 subnegotiation: VER(1) | ULEN(1) | UNAME | PLEN(1) | PASSWD
-		var subHdr [2]byte
-		if _, err := io.ReadFull(client, subHdr[:]); err != nil || subHdr[0] != 0x01 {
-			_, _ = client.Write([]byte{0x01, 0x01})
-			recordSocksAuthReject("invalid rfc1929 subnegotiation header")
-			return 0, "", 0, "", false
-		}
-		uBuf := make([]byte, int(subHdr[1]))
-		if len(uBuf) > 0 {
-			if _, err := io.ReadFull(client, uBuf); err != nil {
-				_, _ = client.Write([]byte{0x01, 0x01})
-				recordSocksAuthReject("truncated rfc1929 username")
-				return 0, "", 0, "", false
-			}
-		}
-		var pLen [1]byte
-		if _, err := io.ReadFull(client, pLen[:]); err != nil {
-			_, _ = client.Write([]byte{0x01, 0x01})
-			recordSocksAuthReject("missing rfc1929 password length")
-			return 0, "", 0, "", false
-		}
-		pBuf := make([]byte, int(pLen[0]))
-		if len(pBuf) > 0 {
-			if _, err := io.ReadFull(client, pBuf); err != nil {
-				_, _ = client.Write([]byte{0x01, 0x01})
-				recordSocksAuthReject("truncated rfc1929 password")
-				return 0, "", 0, "", false
-			}
-		}
-		uOk := 0
-		expLen := len(expectedUser)
-		if len(uBuf) == expLen {
-			uOk = subtle.ConstantTimeCompare(uBuf, []byte(expectedUser))
-		} else if expectedUser != "" && len(uBuf) > expLen+1 && uBuf[expLen] == ':' {
-			if subtle.ConstantTimeCompare(uBuf[:expLen], []byte(expectedUser)) == 1 {
-				uOk = 1
-				authSubLabel = sanitizeAuthSubLabel(string(uBuf[expLen+1:]))
-			}
-		}
-		pOk := subtle.ConstantTimeCompare(pBuf, []byte(expectedPass))
-		if (uOk & pOk) != 1 {
-			_, _ = client.Write([]byte{0x01, 0x01})
-			recordSocksAuthReject("username/password mismatch")
-			return 0, "", 0, "", false
-		}
-		if _, err := client.Write([]byte{0x01, 0x00}); err != nil {
-			return 0, "", 0, "", false
-		}
-	}
-
-	// 2. Request: VER, CMD, RSV, ATYP, DST.ADDR, DST.PORT
-	reqHdr := make([]byte, 4)
-	if _, err := io.ReadFull(client, reqHdr); err != nil {
-		return 0, "", 0, "", false
-	}
-	if reqHdr[0] != 0x05 {
-		return 0, "", 0, "", false
-	}
-
-	cmd = reqHdr[1]
-	host, dstPort, err := readSocks5Target(client, reqHdr[3])
-	if err != nil {
-		_, _ = client.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return 0, "", 0, "", false
-	}
-	return cmd, host, dstPort, authSubLabel, true
-}
-
-func readSocks5HandshakeAndReq(client net.Conn) (cmd byte, host string, dstPort uint16, reqParsed bool) {
-	cmd, host, dstPort, _, reqParsed = readSocks5HandshakeAndReqWithLabel(client)
-	return
-}
-
-func dispatchSocks5Cmd(ctx context.Context, client net.Conn, dialer udpDialer, cmd byte, host string, dstPort uint16) {
-	dispatchSocks5CmdWithLabel(ctx, client, dialer, cmd, host, dstPort, "local-client")
-}
-
-func dispatchSocks5CmdWithLabel(ctx context.Context, client net.Conn, dialer udpDialer, cmd byte, host string, dstPort uint16, clientLabel string) {
-	switch cmd {
-	case 0x01: // TCP CONNECT (MTProto signaling, channels, media, VoIP TCP fallback)
-		handleTcpConnectTracked(ctx, client, dialer, host, dstPort, clientLabel)
-	case 0x03: // UDP ASSOCIATE (Telegram VoIP / tgcalls voice & video RTP/STUN media)
-		handleUdpAssociateTracked(ctx, client, dialer, clientLabel)
-	default:
-		_, _ = client.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-	}
-}
-
-func handleSocks5Client(ctx context.Context, client net.Conn, dialer udpDialer) {
-	defer client.Close()
-	_ = client.SetDeadline(time.Now().Add(20 * time.Second))
-
-	cmd, host, dstPort, authSubLabel, ok := readSocks5HandshakeAndReqWithLabel(client)
-	if !ok {
-		return
-	}
-	label := "local-client"
-	if authSubLabel != "" {
-		label = authSubLabel
-	}
-	dispatchSocks5CmdWithLabel(ctx, client, dialer, cmd, host, dstPort, label)
-}
-
-type prependByteConn struct {
-	net.Conn
-	firstByte byte
-	consumed  bool
-}
-
-func (c *prependByteConn) Read(p []byte) (int, error) {
-	if !c.consumed {
-		if len(p) == 0 {
-			return 0, nil
-		}
-		p[0] = c.firstByte
-		c.consumed = true
-		return 1, nil
-	}
-	return c.Conn.Read(p)
-}
-
-// ComputeProfileSigHash returns the 12-hex-char SHA-256 prefix of a normalized profileSig
-// so non-secret PUBLIC_STATUS probes can confirm shared-hub profile equivalence without leaking endpoints.
-func ComputeProfileSigHash(profileSig string) string {
-	trimmed := strings.TrimSpace(profileSig)
-	if trimmed == "" {
-		return ""
-	}
-	sum := sha256.Sum256([]byte(trimmed))
-	return hex.EncodeToString(sum[:])[:12]
-}
-
-func readWgpStatusSnapshot() (isUp bool, hsHealthy bool, hsSec int64, profileSig string) {
+// GetActiveMTU returns the current live inner tunnel MTU, or 0 if stopped.
+func GetActiveMTU() int {
 	mu.Lock()
-	isUp = running
-	dev := activeDev
-	rawEp := strings.TrimSpace(activeRawEp)
-	pubHex := strings.TrimSpace(activePeerPubHex)
-	mu.Unlock()
-	if isUp && dev != nil {
-		_, _, hsSec = readDeviceCounters(dev)
-	}
-	hsHealthy = IsHandshakeHealthy()
-	if rawEp != "" && len(pubHex) == 64 {
-		if pubRaw, dErr := hex.DecodeString(pubHex); dErr == nil && len(pubRaw) == 32 {
-			profileSig = rawEp + "|" + base64.StdEncoding.EncodeToString(pubRaw)
-		}
-	}
-	return isUp, hsHealthy, hsSec, profileSig
-}
-
-// SendLocalWgp1Command executes a single-line WGP1 loopback control command from Go so Android
-// Main UI Thread callers (such as VoIPService endpoint setup) never trigger StrictMode NetworkOnMainThreadException.
-func SendLocalWgp1Command(muxPort int, socksPass string, command string, timeoutMs int) string {
-	return sendLocalWgp1CommandLimit(muxPort, socksPass, command, timeoutMs, 512)
-}
-
-func sendLocalWgp1CommandLimit(muxPort int, socksPass string, command string, timeoutMs int, maxBytes int) string {
-	cmd := strings.TrimSpace(command)
-	if muxPort < 1 || muxPort > 65535 || cmd == "" {
-		return ""
-	}
-	if maxBytes < 512 {
-		maxBytes = 512
-	}
-	if timeoutMs < 80 {
-		timeoutMs = 80
-	} else if timeoutMs > 2000 {
-		timeoutMs = 2000
-	}
-	timeout := time.Duration(timeoutMs) * time.Millisecond
-	passTok := strings.TrimSpace(socksPass)
-	if passTok == "" {
-		passTok = "-"
-	}
-
-	c, err := net.DialTimeout("tcp4", fmt.Sprintf("127.0.0.1:%d", muxPort), timeout)
-	if err != nil {
-		return ""
-	}
-	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(timeout))
-	line := "WGP1 " + passTok + " " + cmd + "\n"
-	if _, err := c.Write([]byte(line)); err != nil {
-		return ""
-	}
-	out := make([]byte, 0, minInt(maxBytes, 2048))
-	chunk := make([]byte, 1024)
-	for len(out) < maxBytes {
-		rn, rErr := c.Read(chunk)
-		if rn > 0 {
-			for i := 0; i < rn && len(out) < maxBytes; i++ {
-				if chunk[i] == '\n' {
-					return strings.TrimSpace(string(out))
-				}
-				out = append(out, chunk[i])
-			}
-		}
-		if rErr != nil {
-			break
-		}
-	}
-	return strings.TrimSpace(string(out))
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-// RequestRemoteDiagnosticsBundleJSON queries a live local mux owner over authenticated WGP1
-// for its complete sanitized diagnostic bundle JSON (counters, VoIP relays, and ring buffer).
-func RequestRemoteDiagnosticsBundleJSON(muxPort int, socksPass string) string {
-	resp := sendLocalWgp1CommandLimit(muxPort, socksPass, "DIAG_BUNDLE", 1200, 65536)
-	if !strings.HasPrefix(resp, "OK ") {
-		return ""
-	}
-	return strings.TrimSpace(resp[3:])
-}
-
-// RequestRemoteVoipRelayAddr asks a live local mux owner over WGP1 to bind or reuse a
-// port-preserving loopback relay ("ip:port") for targetHost:targetPort.
-func RequestRemoteVoipRelayAddr(muxPort int, socksPass string, targetHost string, targetPort int) string {
-	host := strings.TrimSpace(targetHost)
-	if muxPort < 1 || muxPort > 65535 || host == "" || targetPort < 1 || targetPort > 65535 {
-		return ""
-	}
-	resp := SendLocalWgp1Command(muxPort, socksPass, fmt.Sprintf("VOIP_RELAY_ADDR %s %d", host, targetPort), 650)
-	if strings.HasPrefix(resp, "OK ") {
-		addr := strings.TrimSpace(resp[3:])
-		if strings.Contains(addr, ":") {
-			return addr
-		}
-	}
-	respLegacy := SendLocalWgp1Command(muxPort, socksPass, fmt.Sprintf("VOIP_RELAY %s %d", host, targetPort), 650)
-	if strings.HasPrefix(respLegacy, "OK ") {
-		portNum, err := strconv.Atoi(strings.TrimSpace(respLegacy[3:]))
-		if err == nil && portNum > 0 && portNum <= 65535 {
-			return fmt.Sprintf("127.0.0.1:%d", portNum)
-		}
-	}
-	return ""
-}
-
-// RequestRemoteTunnelYield asks a live local mux owner over authenticated WGP1 to release
-// its tunnel, kill switch guard, and local mux port for foreground takeover.
-func RequestRemoteTunnelYield(muxPort int, socksPass string) bool {
-	if muxPort < 1 || muxPort > 65535 {
-		return false
-	}
-	resp := SendLocalWgp1Command(muxPort, socksPass, "YIELD", 800)
-	if !strings.HasPrefix(resp, "OK") {
-		return false
-	}
-	time.Sleep(25 * time.Millisecond)
-	return true
-}
-
-func handleWgpControlConn(client net.Conn, firstByte byte) {
-	_ = client.SetDeadline(time.Now().Add(2 * time.Second))
-	buf := make([]byte, 512)
-	buf[0] = firstByte
-	n := 1
-	for n < len(buf) {
-		rn, err := client.Read(buf[n : n+1])
-		if rn > 0 {
-			if buf[n] == '\n' {
-				break
-			}
-			n++
-		}
-		if err != nil {
-			break
-		}
-	}
-	line := strings.TrimSpace(string(buf[:n]))
-	fields := strings.Fields(line)
-	if len(fields) < 3 || fields[0] != "WGP1" {
-		_, _ = client.Write([]byte("ERR CMD\n"))
-		return
-	}
-
-	// Non-secret status metadata allows local sandboxed clients (before credential sync)
-	// to detect whether port 48729 already hosts a running tunnel for the same profile hash.
-	if fields[2] == "PUBLIC_STATUS" {
-		isUp, hsHealthy, hsSec, profileSig := readWgpStatusSnapshot()
-		sigHash := ComputeProfileSigHash(profileSig)
-		if sigHash != "" {
-			_, _ = fmt.Fprintf(client, "OK %t %t %d %s\n", isUp, hsHealthy, hsSec, sigHash)
-		} else {
-			_, _ = fmt.Fprintf(client, "OK %t %t %d -\n", isUp, hsHealthy, hsSec)
-		}
-		return
-	}
-
-	_, expectedPass := getSocksAuth()
-	if expectedPass != "" {
-		passMatch := len(fields[1]) == len(expectedPass) &&
-			subtle.ConstantTimeCompare([]byte(fields[1]), []byte(expectedPass)) == 1
-		if !passMatch {
-			_, _ = client.Write([]byte("ERR AUTH\n"))
-			return
-		}
-	}
-
-	switch fields[2] {
-	case "VOIP_RELAY":
-		if len(fields) != 5 {
-			_, _ = client.Write([]byte("ERR ARGS\n"))
-			return
-		}
-		portNum, err := strconv.Atoi(fields[4])
-		if err != nil || portNum < 1 || portNum > 65535 {
-			_, _ = client.Write([]byte("ERR PORT\n"))
-			return
-		}
-		if !IsRunning() {
-			_, _ = client.Write([]byte("ERR STOPPED\n"))
-			return
-		}
-		lp := StartVoipEndpointRelay(fields[3], portNum)
-		if lp <= 0 {
-			_, _ = client.Write([]byte("ERR RELAY\n"))
-			return
-		}
-		_, _ = fmt.Fprintf(client, "OK %d\n", lp)
-	case "VOIP_RELAY_ADDR":
-		if len(fields) != 5 {
-			_, _ = client.Write([]byte("ERR ARGS\n"))
-			return
-		}
-		portNum, err := strconv.Atoi(fields[4])
-		if err != nil || portNum < 1 || portNum > 65535 {
-			_, _ = client.Write([]byte("ERR PORT\n"))
-			return
-		}
-		if !IsRunning() {
-			_, _ = client.Write([]byte("ERR STOPPED\n"))
-			return
-		}
-		addr := StartVoipEndpointRelayAddr(fields[3], portNum)
-		if addr == "" {
-			_, _ = client.Write([]byte("ERR RELAY\n"))
-			return
-		}
-		_, _ = fmt.Fprintf(client, "OK %s\n", addr)
-	case "STATUS":
-		isUp, hsHealthy, hsSec, profileSig := readWgpStatusSnapshot()
-		if profileSig != "" {
-			_, _ = fmt.Fprintf(client, "OK %t %t %d %s\n", isUp, hsHealthy, hsSec, profileSig)
-		} else {
-			_, _ = fmt.Fprintf(client, "OK %t %t %d\n", isUp, hsHealthy, hsSec)
-		}
-	case "DIAG_BUNDLE":
-		_, _ = client.Write([]byte("OK " + BuildEngineDiagnosticsBundleJSON() + "\n"))
-	case "YIELD":
-		SetKillSwitchArmed(false)
-		StopKillSwitchGuard()
-		StopTunnel()
-		RecordDiag("TUNNEL", "YIELDED", "released local mux on authenticated YIELD")
-		_, _ = client.Write([]byte("OK YIELDED\n"))
-	default:
-		_, _ = client.Write([]byte("ERR CMD\n"))
-	}
-}
-
-func handleMuxConn(client net.Conn) {
-	defer client.Close()
-
-	clientLabel, clientAllowed := invokeClientGuard(client.RemoteAddr())
-	if !clientAllowed {
-		blockedLocalAttempts.Add(1)
-		return
-	}
-
-	_ = client.SetDeadline(time.Now().Add(2 * time.Second))
-	var first [1]byte
-	if _, err := io.ReadFull(client, first[:]); err != nil {
-		return
-	}
-	if first[0] == 'W' {
-		handleWgpControlConn(client, first[0])
-		return
-	}
-
-	wrapped := &prependByteConn{Conn: client, firstByte: first[0]}
-	_ = wrapped.SetDeadline(time.Now().Add(20 * time.Second))
-
-	cmd, host, dstPort, authSubLabel, ok := readSocks5HandshakeAndReqWithLabel(wrapped)
-	if !ok {
-		return
-	}
-	if authSubLabel != "" && (clientLabel == "android" || clientLabel == "local-client" || clientLabel == "") {
-		clientLabel = authSubLabel
-	}
-
-	devCtx, dialer, allowed := awaitMuxRouteReady(2800 * time.Millisecond)
-	if !allowed {
-		// Fail closed: zero plaintext traffic leaves device when tunnel is down.
-		_, _ = wrapped.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-	dispatchSocks5CmdWithLabel(devCtx, wrapped, dialer, cmd, host, dstPort, clientLabel)
-}
-
-type writeCloserConn interface {
-	CloseWrite() error
-}
-
-func closeWriteOrConn(c net.Conn) {
-	if wc, ok := c.(writeCloserConn); ok {
-		_ = wc.CloseWrite()
-	} else {
-		_ = c.Close()
-	}
-}
-
-func copyWithPooledBufTracked(dst io.Writer, src io.Reader, statEnt *clientStatEntry, isTx bool) {
-	pool := &tcpCopyBufPool
-	if desktopModeFlag.Load() {
-		pool = &desktopTcpCopyBufPool
-	}
-	bufPtr := pool.Get().(*[]byte)
-	defer pool.Put(bufPtr)
-	buf := *bufPtr
-
-	for {
-		nr, rErr := src.Read(buf)
-		if nr > 0 {
-			written := 0
-			for written < nr {
-				nw, wErr := dst.Write(buf[written:nr])
-				if nw > 0 {
-					written += nw
-					if statEnt != nil {
-						if isTx {
-							recordClientTx(statEnt, nw)
-						} else {
-							recordClientRx(statEnt, nw)
-						}
-					}
-				}
-				if wErr != nil {
-					return
-				}
-				if nw == 0 {
-					return
-				}
-			}
-		}
-		if rErr != nil {
-			return
-		}
-	}
-}
-
-func handleTcpConnect(ctx context.Context, client net.Conn, dialer udpDialer, host string, dstPort uint16) {
-	handleTcpConnectTracked(ctx, client, dialer, host, dstPort, "local-client")
-}
-
-func handleTcpConnectTracked(ctx context.Context, client net.Conn, dialer udpDialer, host string, dstPort uint16, clientLabel string) {
-	// Fast-fail IPv6 literal dials when the tunnel has no IPv6 or IPv6 is blocked so clients
-	// (especially logged-out Telegram tgnet) immediately fall back to IPv4 DCs in <1ms.
-	if ip, pErr := netip.ParseAddr(host); pErr == nil && ip.Unmap().Is6() {
-		if fnet, ok := dialer.(*fastNet); ok && !fnet.SupportsIPv6() {
-			udpIpv6DialFastFails.Add(1)
-			_, _ = client.Write([]byte{0x05, 0x03, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-			return
-		}
-	}
-
-	if !awaitHandshakeReadyOrFail(ctx, dialer, 2500*time.Millisecond) {
-		_, _ = client.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-
-	targetAddr := net.JoinHostPort(host, strconv.Itoa(int(dstPort)))
-
-	dialCtx, cancel := context.WithTimeout(ctx, 12*time.Second)
-	remote, err := dialer.DialContext(dialCtx, "tcp", targetAddr)
-	cancel()
-	if err != nil {
-		var repCode byte = 0x04
-		errStr := strings.ToLower(err.Error())
-		if strings.Contains(errStr, "ipv6 blocked") || strings.Contains(errStr, "no route") || strings.Contains(errStr, "network") {
-			repCode = 0x03
-		} else if strings.Contains(errStr, "refused") {
-			repCode = 0x05
-		}
-		_, _ = client.Write([]byte{0x05, repCode, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
-	}
-	defer remote.Close()
-
-	// Clear handshake deadline before streaming
-	_ = client.SetDeadline(time.Time{})
-
-	if _, err := client.Write([]byte{0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0, 0}); err != nil {
-		return
-	}
-
-	activeTcpConns.Add(1)
-	defer activeTcpConns.Add(-1)
-	statEnt := trackClientConnStart(clientLabel)
-	defer trackClientConnEnd(statEnt)
-
-	relayTcpBidirectional(ctx, client, remote, statEnt)
-}
-
-func relayTcpBidirectional(ctx context.Context, client, remote net.Conn, statEnt *clientStatEntry) {
-	var closeOnce sync.Once
-	closePair := func() {
-		closeOnce.Do(func() {
-			_ = client.Close()
-			_ = remote.Close()
-		})
-	}
-	streamID := registerProxyStream(closePair)
-	defer unregisterProxyStream(streamID)
-
-	stopDone := make(chan struct{})
-	defer close(stopDone)
-	go func() {
-		select {
-		case <-ctx.Done():
-			closePair()
-		case <-stopDone:
-		}
-	}()
-
-	done := make(chan struct{}, 2)
-	go func() {
-		copyWithPooledBufTracked(remote, client, statEnt, true)
-		closeWriteOrConn(remote)
-		done <- struct{}{}
-	}()
-	go func() {
-		copyWithPooledBufTracked(client, remote, statEnt, false)
-		closeWriteOrConn(client)
-		done <- struct{}{}
-	}()
-	<-done
-	// Allow the reverse direction up to 10s to flush remaining half-closed frames cleanly.
-	drainTimer := time.NewTimer(10 * time.Second)
-	select {
-	case <-done:
-		drainTimer.Stop()
-	case <-drainTimer.C:
-		_ = client.Close()
-		_ = remote.Close()
-		<-done
-	}
-}
-
-type udpClientSession struct {
-	key        string
-	clientAddr *net.UDPAddr
-	v4Conn     net.PacketConn
-	v6Conn     net.PacketConn
-	lastActive atomic.Int64 // UnixNano
-	closeOnce  sync.Once
-}
-
-func (s *udpClientSession) close() {
-	s.closeOnce.Do(func() {
-		if s.v4Conn != nil {
-			_ = s.v4Conn.Close()
-		}
-		if s.v6Conn != nil {
-			_ = s.v6Conn.Close()
-		}
-	})
-}
-
-type udpGuardDecision struct {
-	allowed     bool
-	expiresNano int64
-}
-
-type udpDnsCacheEntry struct {
-	ip          netip.Addr
-	expiresNano int64
-}
-
-func parseSocks5UdpDatagram(pkt []byte) (host string, dstPort uint16, payload []byte, err error) {
-	if len(pkt) < 10 {
-		return "", 0, nil, errors.New("short SOCKS5 UDP packet")
-	}
-	// RSV must be 0x0000 and FRAG must be 0x00 (RFC 1928 Section 7)
-	if pkt[2] != 0x00 {
-		return "", 0, nil, errors.New("fragmented SOCKS5 UDP not supported")
-	}
-
-	atyp := pkt[3]
-	var hdrEnd int
-
-	switch atyp {
-	case 0x01: // IPv4: 4 + 4 + 2 = 10
-		if len(pkt) < 10 {
-			return "", 0, nil, errors.New("truncated IPv4 UDP header")
-		}
-		host = net.IP(pkt[4:8]).String()
-		hdrEnd = 10
-	case 0x03: // Domain: 4 + 1 + L + 2
-		domLen := int(pkt[4])
-		hdrEnd = 4 + 1 + domLen + 2
-		if domLen == 0 || len(pkt) < hdrEnd {
-			return "", 0, nil, errors.New("truncated domain UDP header")
-		}
-		host = string(pkt[5 : 5+domLen])
-	case 0x04: // IPv6: 4 + 16 + 2 = 22
-		if len(pkt) < 22 {
-			return "", 0, nil, errors.New("truncated IPv6 UDP header")
-		}
-		host = net.IP(pkt[4:20]).String()
-		hdrEnd = 22
-	default:
-		return "", 0, nil, errors.New("unsupported UDP ATYP")
-	}
-
-	dstPort = binary.BigEndian.Uint16(pkt[hdrEnd-2 : hdrEnd])
-	return host, dstPort, pkt[hdrEnd:], nil
-}
-
-func encodeSocks5UdpReplyHeader(dst []byte, remoteAddr net.Addr) int {
-	udpAddr, ok := remoteAddr.(*net.UDPAddr)
-	if !ok || udpAddr == nil {
+	defer mu.Unlock()
+	if !running || activeDev == nil {
 		return 0
 	}
-	dst[0] = 0x00
-	dst[1] = 0x00
-	dst[2] = 0x00
-	if ip4 := udpAddr.IP.To4(); ip4 != nil {
-		dst[3] = 0x01
-		copy(dst[4:8], ip4)
-		binary.BigEndian.PutUint16(dst[8:10], uint16(udpAddr.Port))
-		return 10
-	}
-	if ip16 := udpAddr.IP.To16(); ip16 != nil {
-		dst[3] = 0x04
-		copy(dst[4:20], ip16)
-		binary.BigEndian.PutUint16(dst[20:22], uint16(udpAddr.Port))
-		return 22
-	}
-	return 0
+	return activeMtu
 }
 
-func resolveUdpTargetIP(
-	ctx context.Context,
-	dialer udpDialer,
-	host string,
-	dnsCache map[string]udpDnsCacheEntry,
-	dnsMu *sync.Mutex,
-) (netip.Addr, error) {
-	if directIP, err := netip.ParseAddr(host); err == nil {
-		unmapped := directIP.Unmap()
-		if fnet, ok := dialer.(*fastNet); ok && unmapped.Is6() && !fnet.SupportsIPv6() {
-			return netip.Addr{}, errors.New("IPv6 unavailable or blocked")
+func updatePeerLivenessFromCounters(rx uint64, hsSec int64) {
+	prevRx := lastTrackedRxBytes.Load()
+	prevHs := lastTrackedHsSec.Load()
+	if rx > prevRx || (hsSec > 0 && hsSec > prevHs) {
+		if rx > prevRx {
+			lastTrackedRxBytes.CompareAndSwap(prevRx, rx)
 		}
-		return unmapped, nil
-	}
-
-	nowNano := time.Now().UnixNano()
-	dnsMu.Lock()
-	ent, ok := dnsCache[host]
-	dnsMu.Unlock()
-	if ok && nowNano < ent.expiresNano {
-		return ent.ip, nil
-	}
-
-	rCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
-	defer cancel()
-
-	var chosen netip.Addr
-	if fnet, ok := dialer.(*fastNet); ok {
-		addrs, err := fnet.ResolveUDPTarget(rCtx, host, fnet.SupportsIPv6())
-		if err != nil || len(addrs) == 0 {
-			if err == nil {
-				err = errors.New("no UDP target IP")
-			}
-			return netip.Addr{}, err
+		if hsSec > prevHs {
+			lastTrackedHsSec.CompareAndSwap(prevHs, hsSec)
 		}
-		chosen = addrs[0]
-		for _, a := range addrs {
-			if a.Is4() {
-				chosen = a
-				break
-			}
-		}
-	} else {
-		ips, err := net.DefaultResolver.LookupNetIP(rCtx, "ip4", host)
-		if err != nil || len(ips) == 0 {
-			ips, err = net.DefaultResolver.LookupNetIP(rCtx, "ip", host)
-		}
-		if err != nil || len(ips) == 0 {
-			if err == nil {
-				err = errors.New("no UDP target IP")
-			}
-			return netip.Addr{}, err
-		}
-		chosen = ips[0].Unmap()
+		lastPeerRxAtNano.Store(time.Now().UnixNano())
 	}
-
-	dnsMu.Lock()
-	if len(dnsCache) > 256 {
-		clear(dnsCache)
-	}
-	dnsCache[host] = udpDnsCacheEntry{
-		ip:          chosen,
-		expiresNano: time.Now().Add(30 * time.Second).UnixNano(),
-	}
-	dnsMu.Unlock()
-	return chosen, nil
 }
 
-func openFullConePacketConn(dialer udpDialer, isV6 bool) (net.PacketConn, error) {
-	if fnet, ok := dialer.(*fastNet); ok {
-		return fnet.DialUDPUnconnected(isV6)
+func computeNestedCapMTU(linkMtu int, outerVpn bool) int {
+	if outerVpn {
+		return nestedMinMTU
 	}
-	if isV6 {
-		return net.ListenPacket("udp6", "[::]:0")
+	if linkMtu > 0 && linkMtu <= 1360 {
+		return nestedMinMTU
 	}
-	return net.ListenPacket("udp4", "0.0.0.0:0")
+	return maxMTU
 }
 
-func handleUdpAssociate(ctx context.Context, tcpControl net.Conn, dialer udpDialer) {
-	handleUdpAssociateTracked(ctx, tcpControl, dialer, "local-client")
+func clampStepDownMTU(mtu int) int {
+	floorMtu := minMTU
+	if hostOuterVpn.Load() || (hostLinkMTU.Load() > 0 && hostLinkMTU.Load() <= 1360) || (mtu >= nestedMinMTU && mtu < minMTU) {
+		floorMtu = nestedMinMTU
+	}
+	if mtu < floorMtu {
+		return floorMtu
+	}
+	if mtu > maxMTU {
+		return maxMTU
+	}
+	return mtu
 }
 
-func handleUdpAssociateTracked(ctx context.Context, tcpControl net.Conn, dialer udpDialer, clientLabel string) {
-	if !awaitHandshakeReadyOrFail(ctx, dialer, 2500*time.Millisecond) {
-		_, _ = tcpControl.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
+// SetHostLinkMTU records outer interface MTU and nested-VPN status so inner MTU automatically
+// fits inside an outer VPN (e.g. tun1 MTU 1280 -> inner MTU 1200) without blackholing.
+func SetHostLinkMTU(linkMtu int, outerVpn bool) {
+	prevOuter := hostOuterVpn.Swap(outerVpn)
+	prevLink := hostLinkMTU.Swap(int32(linkMtu))
+	capMtu := computeNestedCapMTU(linkMtu, outerVpn)
+	if capMtu < minMTU {
+		StepDownActiveTunnelMTU(capMtu, "nested_link_mtu")
+	} else if (prevOuter != outerVpn || (prevLink > 0 && prevLink <= 1360)) && capMtu >= minMTU {
+		cur := GetActiveMTU()
+		if cur > 0 && cur < minMTU {
+			CalibrateActiveTunnelMTUAsync()
+		}
 	}
+}
 
-	udpLn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+// IsTunnelHotVerified returns true when the active WireGuard tunnel has a fresh, un-stalled
+// handshake and healthy outbound route so foreground wakeups can resume in 0ms without resetting sockets.
+func IsTunnelHotVerified() bool {
+	mu.Lock()
+	dev := activeDev
+	isUp := running
+	resolvedEp := activeResolvedEp
+	mu.Unlock()
+	if !isUp || dev == nil {
+		return false
+	}
+	rx, _, hsSec := readActiveTotals(dev)
+	if hsSec <= 0 {
+		return false
+	}
+	updatePeerLivenessFromCounters(rx, hsSec)
+	if watchdogStalled.Load() {
+		return false
+	}
+	now := time.Now()
+	hsAge := now.Unix() - hsSec
+	if hsAge >= 135 {
+		return false
+	}
+	if !hasOutboundSystemRoute(resolvedEp) {
+		return false
+	}
+	if hsAge < 90 {
+		return true
+	}
+	lastRxAt := lastPeerRxAtNano.Load()
+	return lastRxAt > 0 && (now.UnixNano()-lastRxAt) < int64(45*time.Second)
+}
+
+func setActiveTunnelMTUInternal(newMtu int, reason string) int {
+	clamped := clampStepDownMTU(newMtu)
+	mu.Lock()
+	isUp := running && activeDev != nil && activeTun != nil
+	tunDev := activeTun
+	prev := activeMtu
+	if isUp {
+		activeMtu = clamped
+	}
+	mu.Unlock()
+	if !isUp || tunDev == nil {
+		return 0
+	}
+	changed := tunDev.SetDynamicMTU(clamped)
+	if changed || prev != clamped {
+		RecordDiag("MTU", reason, fmt.Sprintf("mtu=%d prev=%d", clamped, prev))
+	}
+	return clamped
+}
+
+// StepDownActiveTunnelMTU lowers the live tunnel MTU in-place immediately without restarting the tunnel.
+func StepDownActiveTunnelMTU(targetMtu int, reason string) int {
+	clamped := clampStepDownMTU(targetMtu)
+	mu.Lock()
+	cur := activeMtu
+	isUp := running && activeDev != nil && activeTun != nil
+	mu.Unlock()
+	if !isUp {
+		return 0
+	}
+	if cur <= clamped {
+		return cur
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = "STEP_DOWN"
+	}
+	return setActiveTunnelMTUInternal(clamped, "STEP_DOWN_"+reason)
+}
+
+func detectOutboundInterfaceMTU(resolvedEp string) int {
+	probeTarget := strings.TrimSpace(resolvedEp)
+	network := "udp4"
+	if host, _, err := net.SplitHostPort(probeTarget); err == nil {
+		if ip, pErr := netip.ParseAddr(strings.Trim(host, "[]")); pErr == nil && ip.Unmap().Is6() {
+			network = "udp6"
+		}
+	}
+	if probeTarget == "" {
+		probeTarget = "1.1.1.1:80"
+	}
+	c, err := net.Dial(network, probeTarget)
 	if err != nil {
-		_, _ = tcpControl.Write([]byte{0x05, 0x01, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
-		return
+		return 1500
 	}
-	sockBufSz := activeUdpSocketBufSize()
-	_ = udpLn.SetReadBuffer(sockBufSz)
-	_ = udpLn.SetWriteBuffer(sockBufSz)
-
-	relayPort := udpLn.LocalAddr().(*net.UDPAddr).Port
-
-	// Clear deadline on TCP control connection so calls stay alive indefinitely until closed by Telegram
-	_ = tcpControl.SetDeadline(time.Time{})
-
-	reply := []byte{
-		0x05, 0x00, 0x00, 0x01,
-		127, 0, 0, 1,
-		byte(relayPort >> 8), byte(relayPort & 0xff),
+	defer c.Close()
+	ua, ok := c.LocalAddr().(*net.UDPAddr)
+	if !ok || ua == nil || ua.IP == nil {
+		return 1500
 	}
-	if _, err := tcpControl.Write(reply); err != nil {
-		_ = udpLn.Close()
-		return
-	}
-
-	RecordDiag("UDP_ASSOC", "OPEN", fmt.Sprintf("label=%s relayPort=%d", clientLabel, relayPort))
-	defer RecordDiag("UDP_ASSOC", "CLOSE", fmt.Sprintf("label=%s relayPort=%d", clientLabel, relayPort))
-
-	activeUdpAssocs.Add(1)
-	defer activeUdpAssocs.Add(-1)
-	statEnt := trackClientConnStart(clientLabel)
-	defer trackClientConnEnd(statEnt)
-
-	sessionsCap := activeMaxUdpSessionsCap()
-	assocCtx, assocCancel := context.WithCancel(ctx)
-	var sessMu sync.RWMutex
-	sessions := make(map[string]*udpClientSession)
-	var dnsMu sync.Mutex
-	dnsCache := make(map[string]udpDnsCacheEntry)
-	guardCache := make(map[int]udpGuardDecision)
-	var lastGuardDiagNano atomic.Int64
-
-	cleanupAll := func() {
-		assocCancel()
-		_ = udpLn.Close()
-		_ = tcpControl.Close()
-		sessMu.Lock()
-		for k, s := range sessions {
-			s.close()
-			delete(sessions, k)
-		}
-		sessMu.Unlock()
-	}
-	streamID := registerProxyStream(func() {
-		assocCancel()
-		_ = udpLn.Close()
-		_ = tcpControl.Close()
-	})
-	defer unregisterProxyStream(streamID)
-	defer cleanupAll()
-
-	// Tear down immediately if parent tunnel context cancels
-	go func() {
-		<-assocCtx.Done()
-		_ = udpLn.Close()
-		_ = tcpControl.Close()
-	}()
-
-	// Reap idle local client UDP sockets so long-lived associations never leak or exhaust sessionsCap
-	go func() {
-		ticker := time.NewTicker(30 * time.Second)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-assocCtx.Done():
-				return
-			case <-ticker.C:
-			}
-			cutoff := time.Now().Add(-120 * time.Second).UnixNano()
-			sessMu.Lock()
-			for k, s := range sessions {
-				if s.lastActive.Load() < cutoff {
-					s.close()
-					delete(sessions, k)
-				}
-			}
-			sessMu.Unlock()
-		}
-	}()
-
-	startReturnPump := func(s *udpClientSession, pConn net.PacketConn) {
-		go func() {
-			rBufPtr := udpFrameBufPool.Get().(*[]byte)
-			defer udpFrameBufPool.Put(rBufPtr)
-			respBuf := *rBufPtr
-
-			outBufPtr := udpFrameBufPool.Get().(*[]byte)
-			defer udpFrameBufPool.Put(outBufPtr)
-			outPkt := *outBufPtr
-
-			for {
-				rn, rAddr, readErr := pConn.ReadFrom(respBuf)
-				if readErr != nil {
-					return
-				}
-				hdrLen := encodeSocks5UdpReplyHeader(outPkt, rAddr)
-				if hdrLen == 0 || hdrLen+rn > len(outPkt) {
-					continue
-				}
-				copy(outPkt[hdrLen:hdrLen+rn], respBuf[:rn])
-				if _, wErr := udpLn.WriteToUDP(outPkt[:hdrLen+rn], s.clientAddr); wErr == nil {
-					s.lastActive.Store(time.Now().UnixNano())
-					udpPacketsRx.Add(1)
-					recordClientRx(statEnt, rn)
-				}
-			}
-		}()
-	}
-
-	// Pump local UDP frames from tgcalls into unconnected Full-Cone gVisor PacketConn sockets
-	go func() {
-		bufPtr := udpFrameBufPool.Get().(*[]byte)
-		defer udpFrameBufPool.Put(bufPtr)
-		buf := *bufPtr
-
-		for {
-			n, srcAddr, rErr := udpLn.ReadFromUDP(buf)
-			if rErr != nil {
-				return
-			}
-			// Do NOT reject non-127.0.0.1 srcAddr.IP here: on Android, tgcalls commonly binds to wlan0/rmnet
-			// and sends to 127.0.0.1 over Linux table local; listening strictly on 127.0.0.1 blocks external traffic.
-			if srcAddr == nil || srcAddr.Port <= 0 {
+	localIP := ua.IP
+	if ifaces, iErr := net.Interfaces(); iErr == nil {
+		for _, ifc := range ifaces {
+			if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
 				continue
 			}
-
-			nowNano := time.Now().UnixNano()
-			dec, hasDec := guardCache[srcAddr.Port]
-			var allowed bool
-			if hasDec && dec.allowed && nowNano < dec.expiresNano {
-				allowed = true
-			} else {
-				allowed = invokeUdpPeerGuard(srcAddr, clientLabel)
-				// Only cache positive allow decisions; never lock out a new socket for 10s
-				// if GetExtendedUdpTable missed it on the very first STUN packet.
-				if allowed {
-					if len(guardCache) > 256 {
-						clear(guardCache)
-					}
-					guardCache[srcAddr.Port] = udpGuardDecision{
-						allowed:     true,
-						expiresNano: nowNano + int64(10*time.Second),
-					}
-				}
-			}
-			if !allowed {
-				blockedLocalAttempts.Add(1)
-				udpGuardDrops.Add(1)
-				prevDiag := lastGuardDiagNano.Load()
-				if nowNano-prevDiag > int64(5*time.Second) && lastGuardDiagNano.CompareAndSwap(prevDiag, nowNano) {
-					RecordDiag("UDP_GUARD", "DROP", fmt.Sprintf("blocked udp port=%d label=%s", srcAddr.Port, clientLabel))
-				}
+			addrs, aErr := ifc.Addrs()
+			if aErr != nil {
 				continue
 			}
-
-			host, dstPort, payload, pErr := parseSocks5UdpDatagram(buf[:n])
-			if pErr != nil || len(payload) == 0 {
-				continue
-			}
-
-			clientKey := srcAddr.String()
-			sessMu.RLock()
-			sess, exists := sessions[clientKey]
-			sessMu.RUnlock()
-
-			if !exists {
-				sessMu.Lock()
-				sess, exists = sessions[clientKey]
-				if !exists {
-					if len(sessions) >= sessionsCap {
-						var oldestKey string
-						var oldestTs int64 = nowNano
-						for k, cand := range sessions {
-							ts := cand.lastActive.Load()
-							if oldestKey == "" || ts < oldestTs {
-								oldestKey = k
-								oldestTs = ts
-							}
-						}
-						if oldestKey != "" {
-							sessions[oldestKey].close()
-							delete(sessions, oldestKey)
-						}
+			for _, addr := range addrs {
+				ipn, ok := addr.(*net.IPNet)
+				if ok && ipn != nil && ipn.IP != nil && ipn.IP.Equal(localIP) {
+					if ifc.MTU >= minMTU && ifc.MTU <= 1500 {
+						return ifc.MTU
 					}
-					clientCopy := &net.UDPAddr{
-						IP:   append([]byte(nil), srcAddr.IP...),
-						Port: srcAddr.Port,
-						Zone: srcAddr.Zone,
+					if ifc.MTU > 1500 {
+						return 1500
 					}
-					sess = &udpClientSession{
-						key:        clientKey,
-						clientAddr: clientCopy,
-					}
-					sess.lastActive.Store(nowNano)
-					sessions[clientKey] = sess
 				}
-				sessMu.Unlock()
-			}
-			sess.lastActive.Store(nowNano)
-
-			targetIP, rErr := resolveUdpTargetIP(assocCtx, dialer, host, dnsCache, &dnsMu)
-			if rErr != nil {
-				continue
-			}
-			isV6 := targetIP.Is6()
-
-			var pConn net.PacketConn
-			if isV6 {
-				sessMu.RLock()
-				pConn = sess.v6Conn
-				sessMu.RUnlock()
-				if pConn == nil {
-					newConn, cErr := openFullConePacketConn(dialer, true)
-					if cErr != nil {
-						continue
-					}
-					sessMu.Lock()
-					if sess.v6Conn == nil {
-						sess.v6Conn = newConn
-						udpSocketsOpened.Add(1)
-						startReturnPump(sess, newConn)
-					} else {
-						_ = newConn.Close()
-					}
-					pConn = sess.v6Conn
-					sessMu.Unlock()
-				}
-			} else {
-				sessMu.RLock()
-				pConn = sess.v4Conn
-				sessMu.RUnlock()
-				if pConn == nil {
-					newConn, cErr := openFullConePacketConn(dialer, false)
-					if cErr != nil {
-						continue
-					}
-					sessMu.Lock()
-					if sess.v4Conn == nil {
-						sess.v4Conn = newConn
-						udpSocketsOpened.Add(1)
-						startReturnPump(sess, newConn)
-					} else {
-						_ = newConn.Close()
-					}
-					pConn = sess.v4Conn
-					sessMu.Unlock()
-				}
-			}
-
-			dstUdpAddr := &net.UDPAddr{
-				IP:   net.IP(targetIP.AsSlice()),
-				Port: int(dstPort),
-			}
-			if nw, wErr := pConn.WriteTo(payload, dstUdpAddr); wErr == nil {
-				udpPacketsTx.Add(1)
-				recordClientTx(statEnt, nw)
-			} else {
-				udpSendErrors.Add(1)
 			}
 		}
-	}()
+	}
+	return 1500
+}
 
-	// RFC 1928 Section 7: UDP association stays alive until TCP control socket closes
-	ctrlBuf := make([]byte, 16)
-	for {
-		if _, err := tcpControl.Read(ctrlBuf); err != nil {
+// ComputeLinkCeilingInnerMTU calculates the maximum unfragmented inner WireGuard MTU (1280..1420)
+// on 16-byte WireGuard padding boundaries given the physical outer link MTU, IPv4/IPv6 outer header overhead,
+// and AmneziaWG S4 junk transport header bytes.
+func ComputeLinkCeilingInnerMTU(outerLinkMtu int, resolvedEp string, s4 int) int {
+	if outerLinkMtu <= 0 || outerLinkMtu > 1500 {
+		outerLinkMtu = detectOutboundInterfaceMTU(resolvedEp)
+	}
+	outerHdr := 60 // 20B outer IPv4 + 8B UDP + 32B WireGuard transport header/tag
+	if host, _, err := net.SplitHostPort(strings.TrimSpace(resolvedEp)); err == nil {
+		if ip, pErr := netip.ParseAddr(strings.Trim(host, "[]")); pErr == nil && ip.Unmap().Is6() {
+			outerHdr = 80 // 40B outer IPv6 + 8B UDP + 32B WireGuard transport header/tag
+		}
+	}
+	if s4 > 0 {
+		outerHdr += s4
+	}
+	maxPadded := outerLinkMtu - outerHdr
+	cand := maxPadded &^ 15
+	if maxPadded >= 1424 {
+		cand = maxMTU
+	}
+	return normalizeMTU(cand)
+}
+
+func isCloudflareWarpEndpoint(rawEp, resolvedEp string) bool {
+	for _, ep := range []string{rawEp, resolvedEp} {
+		low := strings.ToLower(strings.TrimSpace(ep))
+		if low == "" {
+			continue
+		}
+		if strings.Contains(low, "cloudflareclient") {
+			return true
+		}
+		host := low
+		if h, _, err := net.SplitHostPort(low); err == nil {
+			host = strings.Trim(h, "[]")
+		}
+		if strings.HasPrefix(host, "162.159.192.") ||
+			strings.HasPrefix(host, "162.159.193.") ||
+			strings.HasPrefix(host, "162.159.195.") ||
+			strings.HasPrefix(host, "162.159.204.") {
+			return true
+		}
+	}
+	return false
+}
+
+func autoCalibrateAfterHandshake(ctx context.Context, dev *device.Device, gen uint64) {
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) {
+		if ctx.Err() != nil || mtuCalibGen.Load() != gen || !isActiveDevice(dev) {
 			return
 		}
+		if hasCompletedHandshake(dev) {
+			break
+		}
+		time.Sleep(40 * time.Millisecond)
 	}
+	if ctx.Err() != nil || mtuCalibGen.Load() != gen || !isActiveDevice(dev) || !hasCompletedHandshake(dev) {
+		return
+	}
+	timer := time.NewTimer(250 * time.Millisecond)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+		return
+	case <-timer.C:
+	}
+	if mtuCalibGen.Load() != gen || !isActiveDevice(dev) {
+		return
+	}
+	_ = CalibrateActiveTunnelMTU(1200)
+}
+
+// CalibrateActiveTunnelMTUAsync safely steps down oversized MTUs immediately if link ceiling dropped,
+// then runs in-tunnel DF ICMP Echo MTU calibration asynchronously.
+func CalibrateActiveTunnelMTUAsync() {
+	mu.Lock()
+	isUp := running && activeDev != nil && activeTun != nil
+	ctx := activeCtx
+	dev := activeDev
+	resolvedEp := activeResolvedEp
+	rawEp := activeRawEp
+	s4 := activeAwgS4
+	curMtu := activeMtu
+	mu.Unlock()
+	if !isUp || ctx == nil || dev == nil {
+		return
+	}
+	if nestedCap := computeNestedCapMTU(int(hostLinkMTU.Load()), hostOuterVpn.Load()); nestedCap < minMTU {
+		StepDownActiveTunnelMTU(nestedCap, "nested_link_mtu")
+		return
+	}
+	if isCloudflareWarpEndpoint(rawEp, resolvedEp) {
+		if curMtu > 0 && curMtu < minMTU {
+			setActiveTunnelMTUInternal(minMTU, "CALIBRATED_WARP_1280")
+		} else {
+			StepDownActiveTunnelMTU(minMTU, "warp_cap")
+		}
+		return
+	}
+	ceiling := ComputeLinkCeilingInnerMTU(0, resolvedEp, s4)
+	if curMtu > ceiling || curMtu > defaultMTU {
+		StepDownActiveTunnelMTU(defaultMTU, "pre_recalibrate")
+	}
+	gen := mtuCalibGen.Add(1)
+	go autoCalibrateAfterHandshake(ctx, dev, gen)
+}
+
+// CalibrateActiveTunnelMTU probes the live WireGuard path using DF=1 in-tunnel ICMP Echo requests
+// across 16-byte-aligned sizes (1280..1420) capped by the outbound physical NIC ceiling, and updates
+// the live tunnel MTU in-place without dropping active sockets.
+func CalibrateActiveTunnelMTU(timeoutMs int) int {
+	if timeoutMs <= 0 {
+		timeoutMs = 1200
+	}
+	if timeoutMs > 5000 {
+		timeoutMs = 5000
+	}
+
+	mu.Lock()
+	isUp := running && activeDev != nil && activeTun != nil
+	tunDev := activeTun
+	dev := activeDev
+	resolvedEp := activeResolvedEp
+	rawEp := activeRawEp
+	s4 := activeAwgS4
+	capMtu := activeMaxMtuCap
+	curMtu := activeMtu
+	mu.Unlock()
+	if !isUp || tunDev == nil || dev == nil {
+		return 0
+	}
+	if !waitForHandshakeQuick(dev, 800*time.Millisecond) {
+		return curMtu
+	}
+
+	if nestedCap := computeNestedCapMTU(int(hostLinkMTU.Load()), hostOuterVpn.Load()); nestedCap < minMTU {
+		return setActiveTunnelMTUInternal(nestedCap, "CALIBRATED_NESTED_VPN")
+	}
+	if isCloudflareWarpEndpoint(rawEp, resolvedEp) {
+		return setActiveTunnelMTUInternal(minMTU, "CALIBRATED_WARP_1280")
+	}
+	ceiling := ComputeLinkCeilingInnerMTU(0, resolvedEp, s4)
+	if capMtu >= minMTU && capMtu < ceiling {
+		ceiling = capMtu
+	}
+	allSteps := []int{1280, 1312, 1328, 1360, 1376, 1392, 1420}
+	var steps []int
+	for _, s := range allSteps {
+		if s <= ceiling {
+			steps = append(steps, s)
+		}
+	}
+	if len(steps) <= 1 {
+		return setActiveTunnelMTUInternal(minMTU, "CALIBRATED")
+	}
+
+	topTarget := steps[len(steps)-1]
+	baseSeq := uint16((time.Now().UnixNano() & 0x3fff) + 1)
+	seqToMtu := make(map[uint16]int, len(steps)*2)
+	var resMu sync.Mutex
+	confirmed := make(map[int]bool, len(steps))
+	topDoneCh := make(chan struct{}, 1)
+
+	tunDev.mtuProbeMu.Lock()
+	tunDev.mtuProbeCb = func(seq uint16, totalLen int) {
+		resMu.Lock()
+		expected, ok := seqToMtu[seq]
+		if ok && totalLen == expected {
+			confirmed[expected] = true
+			if expected == topTarget {
+				select {
+				case topDoneCh <- struct{}{}:
+				default:
+				}
+			}
+		}
+		resMu.Unlock()
+	}
+	tunDev.mtuProbeMu.Unlock()
+	defer func() {
+		tunDev.mtuProbeMu.Lock()
+		tunDev.mtuProbeCb = nil
+		tunDev.mtuProbeMu.Unlock()
+	}()
+
+	targets := [][4]byte{{1, 0, 0, 1}, {8, 8, 8, 8}}
+	for round := 0; round < len(targets); round++ {
+		for idx, sz := range steps {
+			seq := baseSeq + uint16(round*len(steps)+idx)
+			resMu.Lock()
+			seqToMtu[seq] = sz
+			resMu.Unlock()
+			_ = tunDev.sendIcmpMtuProbe(targets[round], seq, sz)
+			time.Sleep(6 * time.Millisecond)
+		}
+	}
+
+	waitDur := 450 * time.Millisecond
+	if cand := time.Duration(timeoutMs) * time.Millisecond / 2; cand > waitDur {
+		if cand > 1200*time.Millisecond {
+			waitDur = 1200 * time.Millisecond
+		} else {
+			waitDur = cand
+		}
+	}
+	timer := time.NewTimer(waitDur)
+	select {
+	case <-topDoneCh:
+		timer.Stop()
+	case <-timer.C:
+	}
+
+	resMu.Lock()
+	best := 0
+	for _, sz := range steps {
+		if confirmed[sz] && sz > best {
+			best = sz
+		}
+	}
+	resMu.Unlock()
+
+	if best < minMTU {
+		// No ICMP replies received (e.g. peer blocks ICMP): stay safely at 1280 without failing.
+		if curMtu > minMTU {
+			return setActiveTunnelMTUInternal(minMTU, "CALIBRATED_NO_ICMP")
+		}
+		return curMtu
+	}
+	return setActiveTunnelMTUInternal(best, fmt.Sprintf("CALIBRATED_CEIL%d", ceiling))
 }

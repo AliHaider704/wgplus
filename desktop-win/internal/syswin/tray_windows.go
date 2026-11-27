@@ -5,6 +5,7 @@ import (
 	"math"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -18,10 +19,12 @@ const (
 	wmTrayCallback   = wmUser + 101
 	wmTrayUpdate     = wmUser + 102
 	wmTrayShutdown   = wmUser + 103
-	wmPowerBroadcast = 0x0218
-	pbtApmSuspend    = 0x0004
-	pbtApmResumeAuto = 0x0012
-	pbtApmResumeSusp = 0x0007
+	wmPowerBroadcast      = 0x0218
+	pbtApmSuspend         = 0x0004
+	pbtApmResumeAuto      = 0x0012
+	pbtApmResumeSusp      = 0x0007
+	pbtPowerSettingChange = 0x8013
+	deviceNotifyWindow    = 0x00000000
 	wmLButtonUp      = 0x0202
 	wmLButtonDblClk  = 0x0203
 	wmRButtonUp      = 0x0205
@@ -93,6 +96,16 @@ var (
 
 	procPowerRegisterSuspendResumeNotification   = modPowrprof.NewProc("PowerRegisterSuspendResumeNotification")
 	procPowerUnregisterSuspendResumeNotification = modPowrprof.NewProc("PowerUnregisterSuspendResumeNotification")
+	procRegisterPowerSettingNotification         = modUser32.NewProc("RegisterPowerSettingNotification")
+	procUnregisterPowerSettingNotification       = modUser32.NewProc("UnregisterPowerSettingNotification")
+
+	guidConsoleDisplayState = windows.GUID{
+		Data1: 0x6fe69556,
+		Data2: 0x704a,
+		Data3: 0x47a0,
+		Data4: [8]byte{0x8f, 0x24, 0xc2, 0x8d, 0x93, 0x6f, 0xda, 0x47},
+	}
+	lastPowerWakeEmitNano atomic.Int64
 
 	procGetModuleHandleW      = modKernel32.NewProc("GetModuleHandleW")
 	procRegisterClassExW      = modUser32.NewProc("RegisterClassExW")
@@ -153,6 +166,12 @@ type iconInfo struct {
 	YHotspot uint32
 	HbmMask  uintptr
 	HbmColor uintptr
+}
+
+type powerBroadcastSetting struct {
+	PowerSetting windows.GUID
+	DataLength   uint32
+	Data         [1]byte
 }
 
 type notifyIconDataW struct {
@@ -396,7 +415,25 @@ func (h *Host) runMessageLoop(readyCh chan<- error, showTrayIcon bool) {
 				}
 			case pbtApmResumeAuto, pbtApmResumeSusp:
 				if h.callbacks.OnWake != nil {
-					go h.callbacks.OnWake()
+					nowNano := time.Now().UnixNano()
+					prev := lastPowerWakeEmitNano.Load()
+					if nowNano-prev >= int64(2*time.Second) && lastPowerWakeEmitNano.CompareAndSwap(prev, nowNano) {
+						go h.callbacks.OnWake()
+					}
+				}
+			case pbtPowerSettingChange:
+				if lParam != 0 && h.callbacks.OnWake != nil {
+					var ps powerBroadcastSetting
+					if err := procRtlMoveMemory.Find(); err == nil {
+						procRtlMoveMemory.Call(uintptr(unsafe.Pointer(&ps)), lParam, unsafe.Sizeof(ps))
+						if ps.PowerSetting == guidConsoleDisplayState && ps.DataLength >= 1 && ps.Data[0] != 0 {
+							nowNano := time.Now().UnixNano()
+							prev := lastPowerWakeEmitNano.Load()
+							if nowNano-prev >= int64(2*time.Second) && lastPowerWakeEmitNano.CompareAndSwap(prev, nowNano) {
+								go h.callbacks.OnWake()
+							}
+						}
+					}
 				}
 			}
 			return 1
@@ -446,6 +483,19 @@ func (h *Host) runMessageLoop(readyCh chan<- error, showTrayIcon bool) {
 	h.hwnd = hwnd
 	h.started = true
 	h.mu.Unlock()
+
+	var dispNotifyHandle uintptr
+	if err := procRegisterPowerSettingNotification.Find(); err == nil {
+		hReg, _, _ := procRegisterPowerSettingNotification.Call(
+			hwnd,
+			uintptr(unsafe.Pointer(&guidConsoleDisplayState)),
+			deviceNotifyWindow,
+		)
+		dispNotifyHandle = hReg
+	}
+	if dispNotifyHandle != 0 {
+		defer procUnregisterPowerSettingNotification.Call(dispNotifyHandle)
+	}
 
 	if showTrayIcon {
 		h.applyTrayIcon(hwnd, nimAdd)

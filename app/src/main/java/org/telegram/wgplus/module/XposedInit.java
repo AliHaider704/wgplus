@@ -294,6 +294,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
         }
         sLifecycleRegistered = true;
         final Application app = (Application) appCandidate;
+        WgHealthAndContinuity.registerScreenPreWarmReceiverIfNeeded(hostAppCtx, MODULE_PATH, telegramClassLoader);
         final AtomicInteger startedCount = new AtomicInteger(0);
         app.registerActivityLifecycleCallbacks(new Application.ActivityLifecycleCallbacks() {
             @Override
@@ -411,11 +412,11 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                 if (param.args == null || param.args.length < 4) {
                                     return;
                                 }
-                                if (Boolean.TRUE.equals(param.args[3])) {
-                                    Context ctx = getOrResolveAppContext(lpparam.classLoader);
-                                    if (WireGuardManager.shouldForceTelegramAlwaysAwake(ctx, MODULE_PATH)) {
-                                        param.args[3] = false;
-                                    }
+                                Context ctx = getOrResolveAppContext(lpparam.classLoader);
+                                if (WireGuardManager.shouldForceTelegramAlwaysAwake(ctx, MODULE_PATH)) {
+                                    // Keep network marked available without WaitNet(4) flicker while OS connectivity is up.
+                                    param.args[1] = true;
+                                    param.args[3] = false;
                                 }
                             } catch (Throwable ignored) {
                             }
@@ -911,20 +912,10 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
         }
     }
 
-    private static void setLongFieldSafe(Object target, String fieldName, long val) {
-        if (target == null || fieldName == null) {
-            return;
-        }
-        try {
-            XposedHelpers.setLongField(target, fieldName, val);
-        } catch (Throwable ignored) {
-        }
-    }
-
     /**
      * Idempotently rewrites an {@code Instance$Endpoint} to a local loopback relay, preserving
-     * ports {@code >= 1024} on {@code 127.0.0.x} and suppressing mismatched-port non-RTC reflectors
-     * when a WebRTC TURN server is present ({@code ReflectorPort.cpp:540} port equality check).
+     * ports {@code >= 1024} (or all ports when running as root daemon) via full {@code ip:port}
+     * binding on {@code 127.0.0.1} first, spilling to {@code 127.0.0.x} on conflict.
      *
      * @return 0 = untouched, 1 = already relayed to 127.x/::1, 2 = newly relayed or KS-blackholed
      */
@@ -934,7 +925,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
             boolean ks,
             boolean tunnelUp,
             boolean deferLowPortReflector,
-            boolean hasRtcEndpoint
+            boolean logNow
     ) {
         if (ep == null) {
             return 0;
@@ -961,7 +952,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
 
             boolean isRtc = getBooleanFieldSafe(ep, "isRtc", false);
             if (deferLowPortReflector && !ks && tunnelUp && !isRtc && rawPort < 1024) {
-                // Wait until Layer 3 (after VoIPService assigns reflectorId) so we know hasRtcEndpoint.
+                // Wait until Layer 3 (after VoIPService assigns reflectorId) so we know full Endpoint[].
                 return 0;
             }
 
@@ -981,13 +972,10 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                     } catch (Throwable ignored) {
                     }
                     XposedHelpers.setIntField(ep, "port", localPort);
-                    boolean clearedReflector = false;
-                    if (!isRtc && localPort != rawPort && hasRtcEndpoint) {
-                        setLongFieldSafe(ep, "reflectorId", 0L);
-                        clearedReflector = true;
+                    if (logNow) {
+                        WgDiagnosticsLog.record("VOIP", "RELAY",
+                                rawPort + "->" + relayAddr + (isRtc ? " (rtc)" : " (refl)"));
                     }
-                    WgDiagnosticsLog.record("VOIP", "RELAY",
-                            rawPort + "->" + relayAddr + (isRtc ? " (rtc)" : (clearedReflector ? " (turn_only)" : " (refl)")));
                     WgCallWatchdog.arm(ctx, MODULE_PATH);
                     return 2;
                 }
@@ -1002,7 +990,7 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                 } catch (Throwable ignored) {
                 }
                 XposedHelpers.setIntField(ep, "port", 9);
-                setLongFieldSafe(ep, "reflectorId", 0L);
+                WgSharedHubAndVoip.clearReflectorIdSafe(ep);
                 return 2;
             }
         } catch (Throwable ignored) {
@@ -1130,11 +1118,13 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                             }
                         }
 
-                        // Relay any un-relayed Endpoint[] elements and count pre-relayed ones
+                        // Relay any un-relayed Endpoint[] elements, normalize reflectorId, and inject TCP fallbacks
                         int newlyRelayed = 0;
                         int alreadyRelayed = 0;
+                        int tcpFallbacksAdded = 0;
                         boolean tunnelUp = WireGuardManager.isTunnelRunning(ctx, MODULE_PATH);
-                        for (Object arg : param.args) {
+                        for (int argIdx = 0; argIdx < param.args.length; argIdx++) {
+                            Object arg = param.args[argIdx];
                             if (arg == null || !arg.getClass().isArray()) {
                                 continue;
                             }
@@ -1148,19 +1138,73 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                                 continue;
                             }
                             Object[] eps = (Object[]) arg;
-                            boolean hasRtcEndpoint = false;
-                            for (Object ep : eps) {
-                                if (ep != null && getBooleanFieldSafe(ep, "isRtc", false)) {
-                                    hasRtcEndpoint = true;
-                                    break;
+                            int[] origPorts = new int[eps.length];
+                            int[] statuses = new int[eps.length];
+                            for (int i = 0; i < eps.length; i++) {
+                                Object ep = eps[i];
+                                if (ep == null) {
+                                    continue;
                                 }
-                            }
-                            for (Object ep : eps) {
-                                int status = relayEndpointIfNeeded(ctx, ep, ks, tunnelUp, false, hasRtcEndpoint);
+                                origPorts[i] = WgSharedHubAndVoip.getIntFieldSafe(ep, "port", 0);
+                                int status = relayEndpointIfNeeded(ctx, ep, ks, tunnelUp, false, false);
+                                statuses[i] = status;
                                 if (status == 2) {
                                     newlyRelayed++;
                                 } else if (status == 1) {
                                     alreadyRelayed++;
+                                }
+                            }
+
+                            if (tunnelUp) {
+                                boolean hasViablePrimary = false;
+                                for (int i = 0; i < eps.length; i++) {
+                                    Object ep = eps[i];
+                                    if (ep == null) {
+                                        continue;
+                                    }
+                                    String epIp = WgSharedHubAndVoip.getStrFieldSafe(ep, "ipv4", "").trim();
+                                    int epPort = WgSharedHubAndVoip.getIntFieldSafe(ep, "port", 0);
+                                    if (!epIp.startsWith("127.") || epPort <= 0 || epPort == 9) {
+                                        continue;
+                                    }
+                                    boolean epRtc = getBooleanFieldSafe(ep, "isRtc", false);
+                                    if (epRtc) {
+                                        hasViablePrimary = true;
+                                        break;
+                                    }
+                                    if (statuses[i] == 2 && epPort == origPorts[i]) {
+                                        hasViablePrimary = true;
+                                        break;
+                                    }
+                                    if (statuses[i] == 1 && (epPort >= 1024 || WgSharedHubAndVoip.getIntFieldSafe(ep, "reflectorId", 0) > 0)) {
+                                        hasViablePrimary = true;
+                                        break;
+                                    }
+                                }
+
+                                for (int i = 0; i < eps.length; i++) {
+                                    Object ep = eps[i];
+                                    if (ep == null || statuses[i] != 2) {
+                                        continue;
+                                    }
+                                    boolean epRtc = getBooleanFieldSafe(ep, "isRtc", false);
+                                    String relayIp = WgSharedHubAndVoip.getStrFieldSafe(ep, "ipv4", "").trim();
+                                    int localPort = WgSharedHubAndVoip.getIntFieldSafe(ep, "port", 0);
+                                    boolean clearedReflector = false;
+                                    if (WgSharedHubAndVoip.shouldClearReflectorId(epRtc, origPorts[i], localPort, hasViablePrimary)) {
+                                        WgSharedHubAndVoip.clearReflectorIdSafe(ep);
+                                        clearedReflector = true;
+                                    }
+                                    WgDiagnosticsLog.record("VOIP", "RELAY",
+                                            origPorts[i] + "->" + relayIp + ":" + localPort
+                                                    + (epRtc ? " (rtc)" : (clearedReflector ? " (turn_only)" : " (refl)")));
+                                }
+
+                                Object[] expanded = WgSharedHubAndVoip.expandEndpointsWithTcpFallbacks(
+                                        eps, endpointClass, instanceClass);
+                                if (expanded != eps) {
+                                    tcpFallbacksAdded += (expanded.length - eps.length);
+                                    param.args[argIdx] = expanded;
                                 }
                             }
                         }
@@ -1178,9 +1222,15 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
                             if (proxyArgIdx >= 0) {
                                 param.args[proxyArgIdx] = null;
                             }
-                            if (newlyRelayed > 0 || param.method.getName().contains("Native") || param.method.getName().equals("make")) {
+                            if (newlyRelayed > 0 || tcpFallbacksAdded > 0
+                                    || param.method.getName().contains("Native")
+                                    || param.method.getName().equals("make")) {
                                 WgDiagnosticsLog.record("VOIP", "RELAY_MODE",
-                                        ((Method) param.method).getName() + " new=" + newlyRelayed + " pre=" + alreadyRelayed + " proxyNull=true");
+                                        ((Method) param.method).getName()
+                                                + " new=" + newlyRelayed
+                                                + " pre=" + alreadyRelayed
+                                                + " tcpFallbacks=" + tcpFallbacksAdded
+                                                + " proxyNull=true");
                             }
                         } else if (proxyArgIdx >= 0 && proxyClass != null && effectivePort > 0) {
                             String socksUser = WireGuardManager.getClientSocksUser(ctx);
@@ -1277,6 +1327,35 @@ public class XposedInit implements IXposedHookLoadPackage, IXposedHookZygoteInit
             }
         } catch (Throwable t) {
             XposedBridge.log("WGPlus: Failed hooking VoIP Instance: " + t.getMessage());
+        }
+
+        // Prevent WebRTC AndroidNetworkMonitor from calling android_setsocknetwork(wlan0/rmnet)
+        // while loopback VoIP call relays (127.0.0.1 / 127.0.0.x) are active.
+        try {
+            Class<?> webrtcNetMonCls = XposedHelpers.findClassIfExists(
+                    "org.webrtc.NetworkMonitor",
+                    lpparam.classLoader
+            );
+            if (webrtcNetMonCls != null) {
+                XposedHelpers.findAndHookMethod(
+                        webrtcNetMonCls,
+                        "networkBindingSupported",
+                        new XC_MethodHook(XCallback.PRIORITY_DEFAULT) {
+                            @Override
+                            protected void beforeHookedMethod(MethodHookParam param) {
+                                try {
+                                    Context ctx = getOrResolveAppContext(lpparam.classLoader);
+                                    boolean ks = WireGuardManager.isKillSwitchEnabled(ctx);
+                                    if (ks || WireGuardManager.shouldRouteCallsNow(ctx, MODULE_PATH)) {
+                                        param.setResult(Boolean.FALSE);
+                                    }
+                                } catch (Throwable ignored) {
+                                }
+                            }
+                        }
+                );
+            }
+        } catch (Throwable ignored) {
         }
 
         // Legacy libtgvoip fallback

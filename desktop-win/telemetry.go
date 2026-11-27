@@ -11,21 +11,27 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	goruntime "runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
+	"github.com/wailsapp/wails/v2/pkg/runtime"
 	"golang.org/x/net/proxy"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 	"wgbridge"
+	"wgplus-win/internal/clients"
 	"wgplus-win/internal/config"
+	"wgplus-win/internal/guard"
+	"wgplus-win/internal/syswin"
 )
 
 const (
@@ -209,6 +215,10 @@ func buildFirestoreTelemetryPayload(
 	if strings.TrimSpace(hostVer) == "" {
 		hostVer = AppVersion
 	}
+	cleanVer := strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(hostVer), "v"), "V")
+	if cleanVer == "" {
+		cleanVer = AppVersion
+	}
 	if strings.TrimSpace(deviceModel) == "" {
 		deviceModel = fmt.Sprintf("Windows PC (%s)", goruntime.GOARCH)
 	}
@@ -222,7 +232,12 @@ func buildFirestoreTelemetryPayload(
 		continuityTier = "WINDOWS_SOCKS"
 	}
 
-	fpRaw := fmt.Sprintf("v%s|%s|%s|%d|%s", hostVer, triggerCode, continuityTier, buildNum, hostPkg)
+	fpRaw := fmt.Sprintf("%s|%s|%s|%s",
+		clampFirestoreStr(cleanVer, 32),
+		clampFirestoreStr(deviceModel, 96),
+		clampFirestoreStr(hostPkg, 128),
+		clampFirestoreStr(triggerCode, 64),
+	)
 	fpHash := sha256.Sum256([]byte(fpRaw))
 	fingerprint := hex.EncodeToString(fpHash[:8])
 
@@ -236,9 +251,9 @@ func buildFirestoreTelemetryPayload(
 		"fields": map[string]any{
 			"schemaVersion":  intVal{IntegerValue: "1"},
 			"createdAt":      strVal{StringValue: time.Now().UTC().Format(time.RFC3339)},
-			"moduleVersion":  strVal{StringValue: clampFirestoreStr("v"+hostVer, 32)},
+			"moduleVersion":  strVal{StringValue: clampFirestoreStr(cleanVer, 32)},
 			"hostPackage":    strVal{StringValue: clampFirestoreStr(hostPkg, 128)},
-			"hostVersion":    strVal{StringValue: clampFirestoreStr(hostVer, 64)},
+			"hostVersion":    strVal{StringValue: clampFirestoreStr(cleanVer, 64)},
 			"deviceModel":    strVal{StringValue: clampFirestoreStr(deviceModel, 128)},
 			"androidRelease": strVal{StringValue: clampFirestoreStr(osRelease, 64)},
 			"sdkInt":         intVal{IntegerValue: strconv.Itoa(buildNum)},
@@ -583,4 +598,255 @@ func (a *App) checkPreviousCrashOnStartup() {
 	}
 	_ = os.Remove(p)
 	a.reportAnomalyAsync("WINDOWS_UNCAUGHT_PANIC", strings.TrimSpace(string(raw)))
+}
+
+func describeWindowsEndpointShape(rawEp string) string {
+	ep := strings.TrimSpace(rawEp)
+	if ep == "" {
+		return "unset"
+	}
+	host, port, err := net.SplitHostPort(ep)
+	if err != nil {
+		return "custom"
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.To4() != nil {
+			return "ipv4:" + port
+		}
+		return "ipv6:" + port
+	}
+	return "domain:" + port
+}
+
+func appendWindowsNetInterfacesMarkdown(b *strings.Builder) {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return
+	}
+	var active []string
+	for _, ifc := range ifaces {
+		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, aErr := ifc.Addrs()
+		if aErr != nil || len(addrs) == 0 {
+			continue
+		}
+		v4Count, v6Global := 0, 0
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP != nil {
+				if ipn.IP.To4() != nil {
+					v4Count++
+				} else if !ipn.IP.IsLinkLocalUnicast() {
+					v6Global++
+				}
+			}
+		}
+		if v4Count == 0 && v6Global == 0 {
+			continue
+		}
+		active = append(active, fmt.Sprintf("%s(mtu=%d,v4=%d,v6=%d)", sanitizeWindowsDiagText(ifc.Name), ifc.MTU, v4Count, v6Global))
+	}
+	sort.Strings(active)
+	if len(active) == 0 {
+		b.WriteString("- **OS Network**: `OFFLINE (no active non-loopback interfaces)`\n")
+		return
+	}
+	fmt.Fprintf(b, "- **OS Network**: `%s`\n", strings.Join(active, ", "))
+}
+
+// GetDiagnosticReport builds a sanitized Markdown report safe to share with the developer or attach to GitHub Issues.
+// Never includes private keys, preshared keys, server endpoints, SOCKS credentials, or PC usernames.
+func (a *App) GetDiagnosticReport() string {
+	a.mu.Lock()
+	s := a.state.Settings
+	isConn := a.connected
+	isBusy := a.connecting
+	lastErr := a.lastError
+	activeID := a.activeID
+	startedAt := a.startedAt
+	profCount := len(a.state.Profiles)
+	var profSummary string
+	for _, p := range a.state.Profiles {
+		if p.ID == activeID {
+			hasAwg := strings.TrimSpace(p.AwgParams) != ""
+			profSummary = fmt.Sprintf("mtu=%d, keepAlive=%d, useDoH=%v, awg=%v, warp=%v, pingMs=%d, ep=%s",
+				p.MTU, p.KeepAlive, p.UseDoH, hasAwg, p.IsWarp, p.LastPingMs, describeWindowsEndpointShape(p.Endpoint))
+			break
+		}
+	}
+	clis := append([]config.TelegramClientEntry(nil), a.clients...)
+	a.mu.Unlock()
+
+	st := a.readBridgeStats()
+	mergedClis := a.mergeClientTraffic(clis, st)
+	pidsMap := clients.SnapshotRunningPIDs()
+	osRel, buildNum, devModel := queryWindowsOSInfo()
+	uptimeSec := int64(0)
+	if isConn && !startedAt.IsZero() {
+		uptimeSec = int64(time.Since(startedAt).Seconds())
+	}
+
+	var b strings.Builder
+	b.WriteString("### WireGuard Plus Diagnostics (Windows)\n")
+	fmt.Fprintf(&b, "- **App Version**: `v%s`\n", AppVersion)
+	fmt.Fprintf(&b, "- **Device / OS**: `%s` — %s (arch=%s, build=%d, portable=%v, admin=%v)\n",
+		devModel, osRel, goruntime.GOARCH, buildNum, a.store.IsPortable(), isProcessElevated())
+	fmt.Fprintf(&b, "- **Tunnel State**: connected=`%v`, connecting=`%v`, running=`%v`, voipTunActive=`%v`, hsHealthy=`%v`, uptimeSec=`%d`\n",
+		isConn, isBusy, st.Running, st.VoipTunActive, st.HandshakeHealthy, uptimeSec)
+	fmt.Fprintf(&b, "- **Security Policy**: killSwitch=`%v`, guardMode=`%s`, socksAuth=`%v`, blockIPv6=`%v`, doH=`%v`, autoFailover=`%v`, telemetryOptIn=`%v`, profiles=`%d`\n",
+		s.KillSwitch, s.ProcessGuardMode, s.SocksAuthEnabled, s.BlockIPv6, s.UseDoH, s.AutoFailover, s.TelemetryOptIn, profCount)
+	fmt.Fprintf(&b, "- **Ports & Stats**: socksPort=`%d`, httpPort=`%d`, rxBytes=`%d`, txBytes=`%d`, hsAgeSec=`%d`, activeTcp=`%d`, activeUdp=`%d`, socksReject=`%d`, guardBlocked=`%d`\n",
+		st.SocksPort, st.HttpPort, st.RxBytes, st.TxBytes, st.HandshakeAgeSec, st.ActiveTcpConns, st.ActiveUdpAssocs, st.SocksAuthRejectCount, st.BlockedLocalAttempts)
+	if profSummary != "" {
+		fmt.Fprintf(&b, "- **Profile Policy**: `%s`\n", profSummary)
+	}
+	appendWindowsNetInterfacesMarkdown(&b)
+	if strings.TrimSpace(lastErr) != "" {
+		fmt.Fprintf(&b, "- **Last Error**: `%s`\n", lastErr)
+	}
+
+	b.WriteString("\n#### Per-Instance Telegram Desktop Matrix\n")
+	if len(mergedClis) == 0 {
+		b.WriteString("- (none detected)\n")
+	} else {
+		matchedLabels := make(map[string]bool, len(mergedClis))
+		for _, c := range mergedClis {
+			exeBase := strings.ToLower(filepath.Base(c.ExePath))
+			if (exeBase == "." || exeBase == "") && c.Kind == "unigram" {
+				exeBase = "unigram.exe"
+			}
+			instLabel := guard.ClientLabelForExe(c.ExePath, exeBase)
+			matchedLabels[strings.ToLower(instLabel)] = true
+			if strings.TrimSpace(c.ExePath) == "" {
+				matchedLabels[exeBase] = true
+			}
+			var pids []uint32
+			if c.ExePath != "" {
+				pids = pidsMap[strings.ToLower(filepath.Clean(c.ExePath))]
+			}
+			if len(pids) == 0 && exeBase != "" {
+				pids = pidsMap["name:"+exeBase]
+			}
+			dirTag := sanitizeWindowsDiagText(c.InstallDir)
+			if dirTag == "" && c.IsMsix {
+				dirTag = "MSIX"
+			}
+			fmt.Fprintf(&b, "- `%s` (kind=%s, label=`%s`, running=%v, pids=%v, enabled=%v, portable=%v, msix=%v, conns=%d, rx=%d, tx=%d, dir=`%s`)\n",
+				c.DisplayName, c.Kind, instLabel, c.Running, pids, c.Enabled, c.IsPortable, c.IsMsix, c.ActiveConns, c.RxBytes, c.TxBytes, dirTag)
+		}
+		for _, cs := range st.Clients {
+			if !matchedLabels[strings.ToLower(cs.Label)] {
+				fmt.Fprintf(&b, "- (unmapped client) label=`%s`, conns=%d, rx=%d, tx=%d\n",
+					cs.Label, cs.ActiveConns, cs.RxBytes, cs.TxBytes)
+			}
+		}
+	}
+
+	bundleRaw := wgbridge.BuildEngineDiagnosticsBundleJSON()
+	var parsedBundle struct {
+		UdpTelemetry json.RawMessage `json:"udpTelemetry"`
+		VoipRelays   []struct {
+			LocalAddr   string `json:"localAddr"`
+			TargetPort  int    `json:"targetPort"`
+			UdpSessions int    `json:"udpSessions"`
+			UdpTxPkts   int64  `json:"udpTxPkts"`
+			UdpRxPkts   int64  `json:"udpRxPkts"`
+			UdpErrs     int64  `json:"udpErrs"`
+			TcpConns    int64  `json:"tcpConns"`
+			AgeSec      int64  `json:"ageSec"`
+		} `json:"voipRelays"`
+		RingBuffer []struct {
+			Ts   string `json:"ts"`
+			Cat  string `json:"cat"`
+			Code string `json:"code"`
+			Msg  string `json:"msg"`
+		} `json:"ringBuffer"`
+	}
+	if err := json.Unmarshal([]byte(bundleRaw), &parsedBundle); err == nil && len(parsedBundle.UdpTelemetry) > 0 {
+		fmt.Fprintf(&b, "\n#### UDP & Watchdog Telemetry\n```json\n%s\n```\n", string(parsedBundle.UdpTelemetry))
+		if len(parsedBundle.VoipRelays) > 0 {
+			b.WriteString("\n#### Active VoIP Relays\n```text\n")
+			for _, r := range parsedBundle.VoipRelays {
+				fmt.Fprintf(&b, "%s -> :%d sess=%d txPkts=%d rxPkts=%d errs=%d tcp=%d age=%ds\n",
+					r.LocalAddr, r.TargetPort, r.UdpSessions, r.UdpTxPkts, r.UdpRxPkts, r.UdpErrs, r.TcpConns, r.AgeSec)
+			}
+			b.WriteString("```\n")
+		}
+		b.WriteString("\n#### Go Engine Ring Buffer\n```text\n")
+		if len(parsedBundle.RingBuffer) == 0 {
+			b.WriteString("(none)\n")
+		} else {
+			for _, o := range parsedBundle.RingBuffer {
+				fmt.Fprintf(&b, "[%s] [%s/%s] %s\n", o.Ts, o.Cat, o.Code, o.Msg)
+			}
+		}
+		b.WriteString("```\n")
+	} else {
+		fmt.Fprintf(&b, "\n#### UDP & Watchdog Telemetry\n```json\n%s\n```\n", wgbridge.GetUdpTelemetryJSON())
+		fmt.Fprintf(&b, "\n#### Go Engine Ring Buffer\n```json\n%s\n```\n", wgbridge.GetDiagnosticsJSON())
+	}
+
+	anomalies := a.snapshotAppAnomalies()
+	if len(anomalies) > 0 {
+		b.WriteString("\n#### Windows App Anomaly Log\n```text\n")
+		for _, line := range anomalies {
+			b.WriteString(line)
+			b.WriteByte('\n')
+		}
+		b.WriteString("```\n")
+	}
+
+	guardEvents := a.procGuard.Events()
+	b.WriteString("\n#### Recent Process Guard Events\n```text\n")
+	if len(guardEvents) == 0 {
+		b.WriteString("(none)\n")
+	} else {
+		start := 0
+		if len(guardEvents) > 25 {
+			start = len(guardEvents) - 25
+		}
+		for _, ev := range guardEvents[start:] {
+			fmt.Fprintf(&b, "[%d] %s %s %s (pid=%d, :%d) path=%s\n",
+				ev.TimestampUnix, strings.ToUpper(ev.Action), ev.Protocol, ev.ClientLabel, ev.PID, ev.PeerPort, ev.ExePath)
+		}
+	}
+	b.WriteString("```\n")
+	return capUTF8HeadTail(sanitizeWindowsDiagText(b.String()), maxTelemetryReportUTF8Bytes)
+}
+
+func (a *App) ClearDiagnostics() {
+	wgbridge.ClearDiagnostics()
+}
+
+func (a *App) SaveDiagnosticReport() (string, error) {
+	if a.ctx == nil {
+		return "", errors.New("window context unavailable")
+	}
+	rep := a.GetDiagnosticReport()
+	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
+		Title:           "Save Diagnostic Report",
+		DefaultFilename: "wireguard-plus-diagnostics.md",
+		Filters: []runtime.FileFilter{
+			{DisplayName: "Markdown Report (*.md)", Pattern: "*.md"},
+		},
+	})
+	if err != nil || strings.TrimSpace(path) == "" {
+		return "", err
+	}
+	if err := os.WriteFile(path, []byte(rep), 0600); err != nil {
+		return "", err
+	}
+	return path, nil
+}
+
+func (a *App) OpenGitHubBugReport() error {
+	rep := a.GetDiagnosticReport()
+	_ = syswin.CopyTextToClipboard(rep)
+	issueURL := "https://github.com/AliHaider704/wgplus/issues/new?template=bug_report.yml&environment=" +
+		url.QueryEscape(fmt.Sprintf("Windows (%s/%s) - WireGuard Plus v%s", goruntime.GOOS, goruntime.GOARCH, AppVersion))
+	if a.ctx != nil {
+		runtime.BrowserOpenURL(a.ctx, issueURL)
+	}
+	return nil
 }

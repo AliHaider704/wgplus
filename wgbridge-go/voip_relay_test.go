@@ -3,6 +3,7 @@ package wgbridge
 import (
 	"context"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -17,13 +18,30 @@ func TestVoipEndpointRelayUdpTcpDedupAndStop(t *testing.T) {
 	StopAllVoipRelays()
 	defer StopAllVoipRelays()
 
-	// Spin up local UDP echo server on 127.0.0.1 (acts as remote Telegram TurnPort/Reflector).
-	udpSrv, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
-	if err != nil {
-		t.Fatalf("ListenUDP: %v", err)
+	// Spin up paired local UDP+TCP echo servers on 127.0.0.1 (binding TCP first avoids WinNAT excluded ranges).
+	var udpSrv *net.UDPConn
+	var tcpSrv net.Listener
+	var targetPort int
+	for attempt := 0; attempt < 8; attempt++ {
+		ln, tcpErr := net.Listen("tcp4", "127.0.0.1:0")
+		if tcpErr != nil {
+			continue
+		}
+		p := ln.Addr().(*net.TCPAddr).Port
+		pc, udpErr := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: p})
+		if udpErr == nil {
+			tcpSrv = ln
+			udpSrv = pc
+			targetPort = p
+			break
+		}
+		_ = ln.Close()
+	}
+	if udpSrv == nil || tcpSrv == nil {
+		t.Fatalf("failed binding paired UDP/TCP echo ports")
 	}
 	defer udpSrv.Close()
-	targetPort := udpSrv.LocalAddr().(*net.UDPAddr).Port
+	defer tcpSrv.Close()
 
 	go func() {
 		buf := make([]byte, 2048)
@@ -35,14 +53,6 @@ func TestVoipEndpointRelayUdpTcpDedupAndStop(t *testing.T) {
 			_, _ = udpSrv.WriteToUDP(append([]byte("udp-pong:"), buf[:n]...), addr)
 		}
 	}()
-
-	// Also spin up TCP echo server on the same IPv4 loopback port if available;
-	// if OS prevents same-port TCP bind, use separate port for TCP test.
-	tcpSrv, tcpErr := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(targetPort)))
-	if tcpErr != nil {
-		t.Fatalf("Listen tcp4 on %d: %v", targetPort, tcpErr)
-	}
-	defer tcpSrv.Close()
 
 	go func() {
 		for {
@@ -405,6 +415,178 @@ func TestWgp1ControlRpcVoipRelayAndStatus(t *testing.T) {
 	methodReply := make([]byte, 2)
 	if _, mErr := io.ReadFull(socksConn, methodReply); mErr != nil || methodReply[0] != 0x05 || methodReply[1] != 0x02 {
 		t.Fatalf("SOCKS5 method reply mismatch: err=%v reply=%v", mErr, methodReply)
+	}
+}
+
+func TestVoipRelayPreservePortPrefersCanonicalLoopbackThenSpills(t *testing.T) {
+	StopAllVoipRelays()
+	defer StopAllVoipRelays()
+
+	// Find a free high port across both TCP4 and UDP4 on 127.0.0.1.
+	var targetPort int
+	for attempt := 0; attempt < 8; attempt++ {
+		ln, err := net.Listen("tcp4", "127.0.0.1:0")
+		if err != nil {
+			continue
+		}
+		p := ln.Addr().(*net.TCPAddr).Port
+		_ = ln.Close()
+		if p >= 1024 && (p < 48729 || p > 48735) {
+			targetPort = p
+			break
+		}
+	}
+	if targetPort <= 0 {
+		t.Fatalf("failed to probe a free high port")
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	addr1 := startVoipEndpointRelayAddrWithDialer(ctx, localNetDialer{}, "198.51.100.10", targetPort)
+	want1 := net.JoinHostPort("127.0.0.1", strconv.Itoa(targetPort))
+	if addr1 != want1 {
+		t.Fatalf("expected primary preserve-port relay on %q, got %q", want1, addr1)
+	}
+
+	addr2 := startVoipEndpointRelayAddrWithDialer(ctx, localNetDialer{}, "198.51.100.11", targetPort)
+	h2, p2Str, err := net.SplitHostPort(addr2)
+	if err != nil {
+		t.Fatalf("invalid spilled relay addr %q: %v", addr2, err)
+	}
+	if !strings.HasPrefix(h2, "127.0.0.") || h2 == "127.0.0.1" {
+		t.Fatalf("expected second relay on same port to spill to 127.0.0.x (!=127.0.0.1), got %q", addr2)
+	}
+	if p2, _ := strconv.Atoi(p2Str); p2 != targetPort {
+		t.Fatalf("expected spilled relay to preserve port %d, got %q", targetPort, addr2)
+	}
+}
+
+func TestVoipRelayStunTurnTcpToUdpBridge(t *testing.T) {
+	StopKillSwitchGuard()
+	StopTunnel()
+	defer StopTunnel()
+
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	srv := startLocalWgServer(t, "10.97.0.1", 1280, clientPub, "", "")
+	defer srv.closeAll()
+
+	// Start a UDP-only mock TURN server on 10.97.0.1:1400 (NO TCP listener on server!).
+	udpTurn, err := srv.tnet.ListenUDP(&net.UDPAddr{IP: net.IPv4(10, 97, 0, 1), Port: 1400})
+	if err != nil {
+		t.Fatalf("ListenUDP 10.97.0.1:1400 failed: %v", err)
+	}
+	defer udpTurn.Close()
+
+	stunReqChan := make(chan []byte, 4)
+	chanReqChan := make(chan []byte, 4)
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			n, addr, rErr := udpTurn.ReadFrom(buf)
+			if rErr != nil {
+				return
+			}
+			pkt := append([]byte(nil), buf[:n]...)
+			if n >= 8 && (pkt[0]&0xC0) == 0x00 && binary.BigEndian.Uint32(pkt[4:8]) == 0x2112A442 {
+				stunReqChan <- pkt
+				// Reply with a 20-byte STUN Binding Success Response keeping exact txid.
+				resp := make([]byte, 20)
+				binary.BigEndian.PutUint16(resp[0:2], 0x0101)
+				binary.BigEndian.PutUint16(resp[2:4], 0)
+				binary.BigEndian.PutUint32(resp[4:8], 0x2112A442)
+				copy(resp[8:20], pkt[8:20])
+				_, _ = udpTurn.WriteTo(resp, addr)
+			} else if n >= 4 && (pkt[0]&0xC0) == 0x40 {
+				chanReqChan <- pkt
+				// Reply with an unpadded 9-byte TURN ChannelData ("world", len=5).
+				resp := []byte{0x40, 0x01, 0x00, 0x05, 'w', 'o', 'r', 'l', 'd'}
+				_, _ = udpTurn.WriteTo(resp, addr)
+			}
+		}
+	}()
+
+	_, err = StartTunnelAdvanced(
+		clientPriv,
+		"",
+		"10.97.0.2/32",
+		"1.1.1.1",
+		srv.pubHex,
+		fmt.Sprintf("127.0.0.1:%d", srv.udpPort),
+		20,
+		1280,
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced failed: %v", err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && !IsHandshakeHealthy() {
+		time.Sleep(25 * time.Millisecond)
+	}
+
+	relayAddr := StartVoipEndpointRelayAddr("10.97.0.1", 1400)
+	if relayAddr == "" {
+		t.Fatalf("expected non-empty relayAddr for 10.97.0.1:1400")
+	}
+
+	tcpCli, err := net.DialTimeout("tcp4", relayAddr, 3*time.Second)
+	if err != nil {
+		t.Fatalf("DialTimeout tcp4 %q failed: %v", relayAddr, err)
+	}
+	defer tcpCli.Close()
+	_ = tcpCli.SetDeadline(time.Now().Add(4 * time.Second))
+
+	// 1) Send a 24-byte STUN Binding Request with 4-byte attr over TCP -> expect exact 24B over UDP and 20B STUN reply back.
+	stunReq := make([]byte, 24)
+	binary.BigEndian.PutUint16(stunReq[0:2], 0x0001)
+	binary.BigEndian.PutUint16(stunReq[2:4], 4)
+	binary.BigEndian.PutUint32(stunReq[4:8], 0x2112A442)
+	copy(stunReq[8:20], []byte("123456789012"))
+	copy(stunReq[20:24], []byte{0xde, 0xad, 0xbe, 0xef})
+	if err := writeAllVoipConn(tcpCli, stunReq); err != nil {
+		t.Fatalf("write STUN req over TCP failed: %v", err)
+	}
+
+	select {
+	case gotUdp := <-stunReqChan:
+		if len(gotUdp) != 24 || string(gotUdp) != string(stunReq) {
+			t.Fatalf("UDP TURN server got unexpected STUN req len=%d", len(gotUdp))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for bridged STUN UDP packet")
+	}
+
+	stunResp := make([]byte, 20)
+	if _, err := io.ReadFull(tcpCli, stunResp); err != nil {
+		t.Fatalf("ReadFull STUN resp over TCP failed: %v", err)
+	}
+	if binary.BigEndian.Uint16(stunResp[0:2]) != 0x0101 || string(stunResp[8:20]) != "123456789012" {
+		t.Fatalf("unexpected STUN resp over TCP: %x", stunResp)
+	}
+
+	// 2) Send 4-byte aligned TURN ChannelData over TCP (cLen=5 + 3 zero pad = 12B) -> expect unpadded 9B UDP ("hello") and padded 12B TCP reply ("world\0\0\0").
+	chanTcpReq := []byte{0x40, 0x01, 0x00, 0x05, 'h', 'e', 'l', 'l', 'o', 0, 0, 0}
+	if err := writeAllVoipConn(tcpCli, chanTcpReq); err != nil {
+		t.Fatalf("write ChannelData over TCP failed: %v", err)
+	}
+
+	select {
+	case gotUdp := <-chanReqChan:
+		if len(gotUdp) != 9 || string(gotUdp[4:]) != "hello" {
+			t.Fatalf("expected unpadded 9B ChannelData over UDP, got len=%d %q", len(gotUdp), string(gotUdp))
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatalf("timed out waiting for bridged ChannelData UDP packet")
+	}
+
+	chanTcpResp := make([]byte, 12)
+	if _, err := io.ReadFull(tcpCli, chanTcpResp); err != nil {
+		t.Fatalf("ReadFull ChannelData resp over TCP failed: %v", err)
+	}
+	if string(chanTcpResp) != string([]byte{0x40, 0x01, 0x00, 0x05, 'w', 'o', 'r', 'l', 'd', 0, 0, 0}) {
+		t.Fatalf("expected 4-byte padded 12B ChannelData over TCP, got %x", chanTcpResp)
 	}
 }
 

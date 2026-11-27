@@ -1,6 +1,6 @@
 #!/system/bin/sh
 # WireGuard Plus - call/network self-check for Android (no root needed).
-# Run it from Termux, or from a PC:  adb push call-check.sh /data/local/tmp/ && adb shell sh /data/local/tmp/call-check.sh
+# Run it from Termux, or from a PC:  adb push scripts/android-call-check.sh /data/local/tmp/ && adb shell sh /data/local/tmp/android-call-check.sh
 # It prints a short report with no keys, passwords or server addresses. Paste the whole output back to the developer.
 
 say() { printf '%s\n' "$*"; }
@@ -45,14 +45,17 @@ say
 
 say "## UDP loopback echo test (127.0.0.234:49311)"
 if have nc; then
-  ( nc -u -l -p 49311 -s 127.0.0.234 >/data/local/tmp/wgp_nc.out 2>/dev/null || nc -u -l 127.0.0.234 49311 >/data/local/tmp/wgp_nc.out 2>/dev/null ) &
+  TMP_BASE="${TMPDIR:-/data/local/tmp}"
+  [ -w "$TMP_BASE" ] || TMP_BASE="."
+  OUT_FILE="$TMP_BASE/wgp_nc.$$"
+  ( nc -u -l -p 49311 -s 127.0.0.234 >"$OUT_FILE" 2>/dev/null || nc -u -l 127.0.0.234 49311 >"$OUT_FILE" 2>/dev/null ) &
   LP=$!
   sleep 1
   printf 'wgp-probe' | nc -u -w1 127.0.0.234 49311 >/dev/null 2>&1
   sleep 1
   kill "$LP" 2>/dev/null
-  if [ -s /data/local/tmp/wgp_nc.out ]; then say "loopback UDP to 127.0.0.234: OK"; else say "loopback UDP to 127.0.0.234: NO DATA (blocked or nc flags unsupported)"; fi
-  rm -f /data/local/tmp/wgp_nc.out 2>/dev/null
+  if [ -s "$OUT_FILE" ]; then say "loopback UDP to 127.0.0.234: OK"; else say "loopback UDP to 127.0.0.234: NO DATA (blocked or nc flags unsupported)"; fi
+  rm -f "$OUT_FILE" 2>/dev/null
 else
   say "nc not available (skipped)"
 fi

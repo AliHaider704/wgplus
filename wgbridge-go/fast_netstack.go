@@ -2,9 +2,9 @@ package wgbridge
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/netip"
 	"os"
@@ -97,16 +97,21 @@ type fastNetTun struct {
 	ep             *channel.Endpoint
 	stack          *stack.Stack
 	events         chan tun.Event
+	eventsMu       sync.Mutex
 	notifyHandle   *channel.NotificationHandle
 	incomingPacket chan *buffer.View
 	closeCh        chan struct{}
+	closed         atomic.Bool
 	closeOnce      sync.Once
-	mtu            int
+	mtu            atomic.Int32
 	batchSize      int
 	blockIPv6      atomic.Bool
+	localV4        netip.Addr
 	dnsServers     []netip.Addr
 	dnsMu          sync.Mutex
 	dnsCache       map[string]tunnelDnsEntry
+	mtuProbeMu     sync.Mutex
+	mtuProbeCb     func(seq uint16, totalLen int)
 	hasV4, hasV6   bool
 }
 
@@ -151,9 +156,9 @@ func createFastNetTUNWithProfile(localAddresses, dnsServers []netip.Addr, mtu in
 		closeCh:        make(chan struct{}),
 		dnsServers:     dnsServers,
 		dnsCache:       make(map[string]tunnelDnsEntry),
-		mtu:            mtu,
 		batchSize:      prof.batchSize,
 	}
+	dev.mtu.Store(int32(mtu))
 	dev.blockIPv6.Store(prof.blockIPv6)
 
 	// 1. Enable TCP SACK
@@ -208,6 +213,9 @@ func createFastNetTUNWithProfile(localAddresses, dnsServers []netip.Addr, mtu in
 		}
 		if ip.Is4() {
 			dev.hasV4 = true
+			if !dev.localV4.IsValid() {
+				dev.localV4 = ip
+			}
 		} else if ip.Is6() {
 			dev.hasV6 = true
 		}
@@ -283,6 +291,19 @@ func (tun *fastNetTun) Write(buf [][]byte, offset int) (int, error) {
 		if len(packet) == 0 {
 			continue
 		}
+		if (packet[0]>>4) == 4 && len(packet) >= 28 && packet[9] == 1 {
+			ihl := int(packet[0]&0x0f) * 4
+			if ihl >= 20 && len(packet) >= ihl+8 && packet[ihl] == 0 && binary.BigEndian.Uint16(packet[ihl+4:ihl+6]) == 0x5747 {
+				seq := binary.BigEndian.Uint16(packet[ihl+6 : ihl+8])
+				tun.mtuProbeMu.Lock()
+				cb := tun.mtuProbeCb
+				tun.mtuProbeMu.Unlock()
+				if cb != nil {
+					cb(seq, len(packet))
+					continue
+				}
+			}
+		}
 		pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(packet)})
 		switch packet[0] >> 4 {
 		case 4:
@@ -317,21 +338,110 @@ func (tun *fastNetTun) WriteNotify() {
 
 func (tun *fastNetTun) Close() error {
 	tun.closeOnce.Do(func() {
+		tun.closed.Store(true)
 		close(tun.closeCh)
 		tun.stack.RemoveNIC(1)
 		tun.stack.Close()
 		tun.ep.RemoveNotify(tun.notifyHandle)
 		tun.ep.Close()
 
+		tun.eventsMu.Lock()
 		if tun.events != nil {
 			close(tun.events)
+			tun.events = nil
 		}
+		tun.eventsMu.Unlock()
 	})
 	return nil
 }
 
 func (tun *fastNetTun) MTU() (int, error) {
-	return tun.mtu, nil
+	return int(tun.mtu.Load()), nil
+}
+
+// SetDynamicMTU updates the live gVisor NIC and wireguard-go device MTU in-place without closing the tunnel.
+func (ft *fastNetTun) SetDynamicMTU(newMtu int) bool {
+	if ft == nil || ft.closed.Load() {
+		return false
+	}
+	floorMtu := minMTU
+	if hostOuterVpn.Load() || (hostLinkMTU.Load() > 0 && hostLinkMTU.Load() <= 1360) || (newMtu >= nestedMinMTU && newMtu < minMTU) {
+		floorMtu = nestedMinMTU
+	}
+	if newMtu < floorMtu {
+		newMtu = floorMtu
+	} else if newMtu > maxMTU {
+		newMtu = maxMTU
+	}
+	prev := int(ft.mtu.Swap(int32(newMtu)))
+	if prev == newMtu {
+		return false
+	}
+	ft.ep.SetMTU(uint32(newMtu))
+	ft.eventsMu.Lock()
+	if !ft.closed.Load() && ft.events != nil {
+		select {
+		case ft.events <- tun.EventMTUUpdate:
+		default:
+		}
+	}
+	ft.eventsMu.Unlock()
+	return true
+}
+
+func rfc1071Checksum(data []byte) uint16 {
+	var sum uint32
+	for i := 0; i+1 < len(data); i += 2 {
+		sum += uint32(binary.BigEndian.Uint16(data[i : i+2]))
+	}
+	if len(data)%2 == 1 {
+		sum += uint32(data[len(data)-1]) << 8
+	}
+	for sum>>16 != 0 {
+		sum = (sum & 0xffff) + (sum >> 16)
+	}
+	return ^uint16(sum)
+}
+
+func (tun *fastNetTun) sendIcmpMtuProbe(dstV4 [4]byte, seq uint16, totalLen int) bool {
+	if tun == nil || tun.closed.Load() || !tun.localV4.IsValid() || !tun.localV4.Is4() || totalLen < 28 || totalLen > 1500 {
+		return false
+	}
+	pkt := make([]byte, totalLen)
+	pkt[0] = 0x45
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(totalLen))
+	binary.BigEndian.PutUint16(pkt[4:6], seq)
+	binary.BigEndian.PutUint16(pkt[6:8], 0x4000) // DF=1
+	pkt[8] = 64
+	pkt[9] = 1
+	src4 := tun.localV4.As4()
+	copy(pkt[12:16], src4[:])
+	copy(pkt[16:20], dstV4[:])
+	binary.BigEndian.PutUint16(pkt[10:12], rfc1071Checksum(pkt[:20]))
+
+	pkt[20] = 8
+	pkt[21] = 0
+	binary.BigEndian.PutUint16(pkt[24:26], 0x5747)
+	binary.BigEndian.PutUint16(pkt[26:28], seq)
+	for i := 28; i < totalLen; i++ {
+		pkt[i] = byte('A' + ((i - 28) % 26))
+	}
+	binary.BigEndian.PutUint16(pkt[22:24], rfc1071Checksum(pkt[20:]))
+
+	pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(pkt)})
+	view := pkb.ToView()
+	pkb.DecRef()
+
+	select {
+	case tun.incomingPacket <- view:
+		return true
+	case <-tun.closeCh:
+		view.Release()
+		return false
+	default:
+		view.Release()
+		return false
+	}
 }
 
 func (tun *fastNetTun) BatchSize() int {
@@ -455,6 +565,10 @@ func (fnet *fastNet) SupportsIPv6() bool {
 	return fnet != nil && fnet.hasV6 && !fnet.blockIPv6.Load()
 }
 
+func (fnet *fastNet) OpenFullConePacketConn(isV6 bool) (net.PacketConn, error) {
+	return fnet.DialUDPUnconnected(isV6)
+}
+
 func (fnet *fastNet) DialUDPUnconnected(isV6 bool) (net.PacketConn, error) {
 	if isV6 {
 		if !fnet.SupportsIPv6() {
@@ -516,7 +630,7 @@ func (fnet *fastNet) queryTunnelDnsSingle(ctx context.Context, srv netip.Addr, d
 		_ = uConn.SetDeadline(time.Now().Add(2500 * time.Millisecond))
 	}
 
-	txID := uint16(rand.Intn(65534) + 1)
+	txID := cryptoRandDnsTxID()
 	msg := dnsmessage.Message{
 		Header: dnsmessage.Header{
 			ID:               txID,

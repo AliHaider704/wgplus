@@ -335,3 +335,114 @@ func TestSimulationSamsungNineHourOfflineZombieTcpReset(t *testing.T) {
 		t.Fatalf("expected recoveryEpoch to increment on idle ResetActiveProxyConnections (%d -> %d)", epochBeforeIdle, GetRecoveryEpoch())
 	}
 }
+
+func TestExpiredHandshakeAndUnreachablePeerPacesSocks5AndReconnectResetsStreams(t *testing.T) {
+	StopKillSwitchGuard()
+	StopTunnel()
+	SetPreferredMuxPort(0)
+	SetSocksAuth("", "")
+	defer func() {
+		StopKillSwitchGuard()
+		StopTunnel()
+		SetPreferredMuxPort(0)
+		SetSocksAuth("", "")
+	}()
+
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	_, deadPeerPub := generateTestKeypairHex(t)
+
+	// 1. Pacing test: blackhole peer with no handshake must pace SOCKS5 rejections instead of spinning <1ms.
+	deadPort, err := StartTunnelAdvanced(
+		clientPriv,
+		"",
+		"10.94.0.2/32",
+		"1.1.1.1",
+		deadPeerPub,
+		"127.0.0.1:9",
+		20,
+		1280,
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced blackhole failed: %v", err)
+	}
+
+	paceStart := time.Now()
+	for i := 0; i < 2; i++ {
+		if _, dErr := dialSocks5TcpIPv4(deadPort, [4]byte{1, 1, 1, 1}, 443); dErr == nil {
+			t.Fatalf("expected unreachable SOCKS5 error on dead peer attempt #%d", i+1)
+		}
+	}
+	if elapsed := time.Since(paceStart); elapsed < 2*time.Second {
+		t.Fatalf("expected paced >=2s total across 2 dead-peer SOCKS5 rejections (anti-spin), got %v", elapsed)
+	}
+
+	// 2. Restart stream reset test: active stream on live tunnel must close automatically on StartTunnelAdvanced restart.
+	srv := startLocalWgServer(t, "10.94.0.1", 1280, clientPub, "", "")
+	defer srv.closeAll()
+	silentLn, err := srv.tnet.ListenTCP(&net.TCPAddr{IP: net.IPv4(10, 94, 0, 1), Port: 443})
+	if err != nil {
+		t.Fatalf("ListenTCP failed: %v", err)
+	}
+	defer silentLn.Close()
+	go func() {
+		for {
+			c, aErr := silentLn.Accept()
+			if aErr != nil {
+				return
+			}
+			_ = c
+		}
+	}()
+
+	livePort, err := StartTunnelAdvanced(
+		clientPriv,
+		"",
+		"10.94.0.2/32",
+		"1.1.1.1",
+		srv.pubHex,
+		fmt.Sprintf("127.0.0.1:%d", srv.udpPort),
+		25,
+		1280,
+		"",
+		false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced live 1 failed: %v", err)
+	}
+
+	zombieConn, err := dialSocks5TcpIPv4(livePort, [4]byte{10, 94, 0, 1}, 443)
+	if err != nil {
+		t.Fatalf("zombie dial failed: %v", err)
+	}
+	defer zombieConn.Close()
+	unblocked := make(chan struct{}, 1)
+	go func() {
+		_ = zombieConn.SetReadDeadline(time.Now().Add(4 * time.Second))
+		buf := make([]byte, 8)
+		_, _ = zombieConn.Read(buf)
+		unblocked <- struct{}{}
+	}()
+
+	if _, err := StartTunnelAdvanced(
+		clientPriv,
+		"",
+		"10.94.0.2/32",
+		"1.1.1.1",
+		srv.pubHex,
+		fmt.Sprintf("127.0.0.1:%d", srv.udpPort),
+		25,
+		1280,
+		"",
+		false,
+	); err != nil {
+		t.Fatalf("StartTunnelAdvanced live 2 failed: %v", err)
+	}
+
+	select {
+	case <-unblocked:
+	case <-time.After(900 * time.Millisecond):
+		t.Fatal("expected StartTunnelAdvanced restart to close zombie TCP stream automatically")
+	}
+}

@@ -46,15 +46,18 @@ public final class WgDiagnosticsLog {
     private static final AtomicBoolean CRASH_HANDLER_INSTALLED = new AtomicBoolean(false);
 
     private static final Pattern KV_SECRET_RE = Pattern.compile(
-            "(?i)\\b((?:socks_?|proxy_?|shared_?)?(?:private_?key|preshared_?key|pass(?:word|phrase)?|secret|auth|token))\\s*[:=]\\s*([^\\s,;]+)"
+            "(?i)(\"?(?:socks_?|proxy_?|shared_?)?(?:private_?key|preshared_?key|pass(?:word|phrase)?|secret|auth|token)\"?\\s*[:=]\\s*\"?)([^\\s,;\"}\\]]+)"
     );
     private static final Pattern B64_KEY_RE = Pattern.compile("(?<![A-Za-z0-9+/=])[A-Za-z0-9+/]{42,44}=(?![A-Za-z0-9+/=])");
     private static final Pattern HEX_KEY_RE = Pattern.compile("\\b[0-9a-fA-F]{64}\\b");
     private static final Pattern ENDPOINT_RE = Pattern.compile(
-            "(?i)(endpoint\\s*[:=]\\s*)([^\\s,;]+)"
+            "(?i)(\"?endpoint\"?\\s*[:=]\\s*\"?)([^\\s,;\"}\\]]+)"
     );
     private static final Pattern IP_PORT_RE = Pattern.compile(
             "\\b(?!127\\.)(?:\\d{1,3}\\.){3}\\d{1,3}:\\d{1,5}\\b"
+    );
+    private static final Pattern IPV6_PORT_RE = Pattern.compile(
+            "\\[(?!::1\\])[0-9a-fA-F:]+\\]:\\d{1,5}"
     );
 
     private WgDiagnosticsLog() {
@@ -82,6 +85,7 @@ public final class WgDiagnosticsLog {
         s = KV_SECRET_RE.matcher(s).replaceAll("$1=[REDACTED]");
         s = ENDPOINT_RE.matcher(s).replaceAll("$1[ENDPOINT_REDACTED]");
         s = IP_PORT_RE.matcher(s).replaceAll("[IP_PORT_REDACTED]");
+        s = IPV6_PORT_RE.matcher(s).replaceAll("[IP_PORT_REDACTED]");
         s = B64_KEY_RE.matcher(s).replaceAll("[KEY_REDACTED]");
         s = HEX_KEY_RE.matcher(s).replaceAll("[HEX_KEY_REDACTED]");
         return s;
@@ -181,6 +185,22 @@ public final class WgDiagnosticsLog {
             EXCEPTIONS.add("[" + formatUtcNow() + "] [" + cat + "/" + cd + "] " + formatted);
         }
         record(cat, cd, t.getClass().getSimpleName() + ": " + sanitize(t.getMessage()));
+    }
+
+    public static void handleCriticalCatch(String category, String code, Throwable t) {
+        if (t instanceof OutOfMemoryError) {
+            throw (OutOfMemoryError) t;
+        }
+        if (t instanceof StackOverflowError) {
+            throw (StackOverflowError) t;
+        }
+        if (t instanceof ThreadDeath) {
+            throw (ThreadDeath) t;
+        }
+        if (t instanceof InterruptedException) {
+            Thread.currentThread().interrupt();
+        }
+        recordException(category, code, t);
     }
 
     private static String formatThrowableSummary(Throwable t) {

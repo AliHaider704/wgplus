@@ -37,6 +37,7 @@ import java.util.regex.Pattern;
  */
 final class UpdateGate {
     private static final String API = "https://api.github.com/repos/AliHaider704/wgplus/releases/latest";
+    private static final String ALLOWED_RELEASE_PREFIX = "https://github.com/AliHaider704/wgplus/releases/";
     private static final String PREFS = "wgplus_update";
     private static final String KEY_SEEN = "last_seen_version";
     private static final String MODULE_PKG = "org.telegram.wgplus.module";
@@ -60,7 +61,7 @@ final class UpdateGate {
             }
         } catch (Throwable ignored) {
         }
-        return "2.0.0";
+        return "2.0.3";
     }
 
     private static Activity unwrapActivity(Context ctx) {
@@ -169,6 +170,25 @@ final class UpdateGate {
         }, "wg-module-update-check").start();
     }
 
+    static boolean isTrustedReleaseUrl(String rawUrl) {
+        if (rawUrl == null) {
+            return false;
+        }
+        String trimmed = rawUrl.trim();
+        if (!trimmed.startsWith(ALLOWED_RELEASE_PREFIX)) {
+            return false;
+        }
+        if (trimmed.contains("..") || trimmed.contains("\\") || trimmed.contains("@")) {
+            return false;
+        }
+        for (int i = 0; i < trimmed.length(); i++) {
+            if (Character.isWhitespace(trimmed.charAt(i))) {
+                return false;
+            }
+        }
+        return trimmed.length() > ALLOWED_RELEASE_PREFIX.length();
+    }
+
     private static Release fetch() throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(API).openConnection();
         c.setConnectTimeout(8000);
@@ -184,7 +204,8 @@ final class UpdateGate {
         }
         JSONObject j = new JSONObject(sb.toString());
         Release r = new Release();
-        r.pageUrl = j.optString("html_url");
+        String rawPageUrl = j.optString("html_url", "").trim();
+        r.pageUrl = isTrustedReleaseUrl(rawPageUrl) ? rawPageUrl : ALLOWED_RELEASE_PREFIX + "latest";
         r.apkUrl = r.pageUrl;
         String tagVer = j.optString("tag_name", "").trim();
         if (tagVer.startsWith("v") || tagVer.startsWith("V")) {
@@ -198,7 +219,10 @@ final class UpdateGate {
         for (int i = 0; assets != null && i < assets.length(); i++) {
             JSONObject a = assets.getJSONObject(i);
             String assetName = a.optString("name");
-            String url = a.optString("browser_download_url", "");
+            String url = a.optString("browser_download_url", "").trim();
+            if (!isTrustedReleaseUrl(url)) {
+                url = "";
+            }
             Matcher m = APK.matcher(assetName);
             if (m.matches()) {
                 r.version = m.group(1);
@@ -215,7 +239,7 @@ final class UpdateGate {
         } else if (universalApkUrl != null) {
             r.apkUrl = universalApkUrl;
         }
-        if (r.version == null) return null;
+        if (r.version == null || !isTrustedReleaseUrl(r.apkUrl)) return null;
         boolean inAr = false;
         for (String line : j.optString("body").split("\n")) {
             String s = line.trim();
@@ -229,7 +253,7 @@ final class UpdateGate {
         return r;
     }
 
-    private static boolean newer(String a, String b) {
+    static boolean newer(String a, String b) {
         String[] pa = a.split("\\."), pb = b.split("\\.");
         for (int i = 0; i < 3; i++) {
             int x = i < pa.length ? parse(pa[i]) : 0;
@@ -240,7 +264,10 @@ final class UpdateGate {
     }
 
     private static int parse(String s) {
-        try { return Integer.parseInt(s.replaceAll("\\D", "")); } catch (Exception e) { return 0; }
+        if (s == null) return 0;
+        String digits = s.trim().replaceFirst("\\D.*$", "");
+        if (digits.isEmpty()) return 0;
+        try { return Integer.parseInt(digits); } catch (Exception e) { return 0; }
     }
 
     private static void showDialog(final Activity act, final Release r, final boolean force, final Runnable onDone) {
@@ -300,7 +327,9 @@ final class UpdateGate {
         primary.setBackground(WgTheme.cardBackground(act, th.accentPrimary, th.accentPrimary, 10));
         primary.setOnClickListener(v -> {
             if (force) {
-                act.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(r.apkUrl)));
+                if (isTrustedReleaseUrl(r.apkUrl)) {
+                    act.startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(r.apkUrl)));
+                }
             } else {
                 if (onDone != null) onDone.run();
                 d.dismiss();

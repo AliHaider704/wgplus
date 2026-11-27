@@ -173,10 +173,43 @@ try {
 }
 
 Write-Host ""
+$sumsPath = Join-Path $DistDir "SHA256SUMS-windows.txt"
+$sumsSigPath = Join-Path $DistDir "SHA256SUMS-windows.txt.sig"
+$sumsLines = @($verifyExe, $distZip) | ForEach-Object {
+    $it = Get-Item $_
+    $hash = (Get-FileHash -Path $it.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+    "{0}  {1}" -f $hash, $it.Name
+}
+[System.IO.File]::WriteAllText($sumsPath, (($sumsLines -join "`n") + "`n"), [System.Text.UTF8Encoding]::new($false))
+
+$offlineKey = Join-Path $RepoRoot ".offline_keys\updater_ed25519_primary.key"
+$offlinePub = Join-Path $RepoRoot ".offline_keys\updater_ed25519_primary.pub"
+$backupPub = Join-Path $RepoRoot ".offline_keys\updater_ed25519_backup.pub"
+$signTool = Join-Path $RepoRoot "scripts\sign-windows-sums.go"
+if ((Test-Path $signTool) -and ((Test-Path $offlineKey) -or (-not [string]::IsNullOrWhiteSpace($env:WGPLUS_UPDATER_ED25519_PRIV_HEX)))) {
+    if (Test-Path $offlineKey) {
+        & go run $signTool -sign -key $offlineKey -in $sumsPath -out $sumsSigPath
+    } else {
+        & go run $signTool -sign -in $sumsPath -out $sumsSigPath
+    }
+    if ($LASTEXITCODE -ne 0) { throw "Ed25519 signing failed" }
+    $pubs = @()
+    if (Test-Path $offlinePub) { $pubs += (Get-Content -Raw $offlinePub).Trim() }
+    if (Test-Path $backupPub) { $pubs += (Get-Content -Raw $backupPub).Trim() }
+    if ($pubs.Count -gt 0) {
+        & go run $signTool -verify -pub ($pubs -join ",") -in $sumsPath -sig $sumsSigPath
+        if ($LASTEXITCODE -ne 0) { throw "Ed25519 signature verification failed" }
+    }
+}
+
 Write-Host "Build artifacts ready:"
-Get-Item $verifyExe, $distZip | ForEach-Object {
+Get-Item $verifyExe, $distZip, $sumsPath | ForEach-Object {
     $hash = (Get-FileHash -Path $_.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
     Write-Host ("  {0} ({1} bytes) SHA-256: {2}" -f $_.Name, $_.Length, $hash)
+}
+if (Test-Path $sumsSigPath) {
+    $sigItem = Get-Item $sumsSigPath
+    Write-Host ("  {0} ({1} bytes)" -f $sigItem.Name, $sigItem.Length)
 }
 if ($wasDistRunning) {
     Start-Process -FilePath $distExe -ArgumentList "--minimized"

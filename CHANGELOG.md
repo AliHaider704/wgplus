@@ -2,7 +2,24 @@
 
 All notable changes to **WireGuard Plus** (`Windows Desktop` & `Android org.telegram.wgplus.module`) are documented in this file following the [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) format.
 
-## [2.0.0] - Unreleased
+## [2.0.3] - 2026-11-27
+
+### Added
+- **Sovereign 24/7 Sensor Engine & `0ms` Instant Wake (`wgbridge-go`, `WgHealthAndContinuity.java`, `desktop-win/internal/syswin/`)**: Added proactive 115s background rekeys, `IsTunnelHotVerified` 0ms foreground resume, `ACTION_SCREEN_ON` / `GUID_CONSOLE_DISPLAY_STATE` pre-warming, Windows 11 EcoQoS throttling opt-out (`DisableProcessPowerThrottling`), offline `~0% CPU` quiescence (`hasActiveOsNetwork` / `HasOutboundIPv4`), and atomic `SocksCredsSnapshot` / `SharedHubSnapshot` reads.
+- **Nested-VPN Auto-MTU & Cloudflare WARP Port Fallback (`wgbridge-go/bridge.go`)**: Automatically clamps inner MTU to `1200` when an outer VPN (`tun0` / Wintun) is active (`SetHostLinkMTU`), calibrates live path MTU (`1280..1420`) without dropping active sockets, and rotates unhandshaked WARP peers across `2408 -> 4500 -> 500 -> 1701`.
+- **Expanded Verification Coverage**: Split `WgTunnelProber.java` out of `WgHealthAndContinuity.java`, added `WgSecurityAndProviderTest.java`, `WgConfigAndRedactionEdgeTest.java`, `wgbridge-go/security_review_test.go`, `wgbridge-go/triage_fixes_test.go`, and expanded Go (`51` tests), Android (`32` tests), and Windows (`10` packages) regression suites.
+
+### Fixed
+- **6h+ Deep-Sleep Zombie Sockets & Multi-Client Collisions**: Fixed TAI64N post-sleep peer rebind timing (`hopActivePeerInternal` + `ResetActiveProxyConnections`), canonical `48729` convergence (`CONVERGE_SHARED`), shared-hub multi-password acceptance (`SetSocksExtraPasswords`), HyperOS 2.0 VoIP loopback routing (`org.webrtc.NetworkMonitor`), and `WgConfigCodec.cleanSingleLine` UAPI newline truncation.
+- **Clean Error Propagation & Log Redaction (`WgDiagnosticsLog.java`)**: Stopped swallowing `VirtualMachineError` / `InterruptedException` via `handleCriticalCatch` and added IPv6/JSON token redaction in diagnostic logs.
+
+### Security
+- **Explicit Client Certificate Approval (`KeepaliveStatusProvider.java`, `ModuleLauncherActivity.java`)**: Removed silent TOFU and `lastUpdateTime` auto-repin; fixed API 28+ `getApkContentsSigners()` ordering; shipped `12` verified official client certificates (`KNOWN_OFFICIAL_CERTS`) plus an explicit Approve/Reject UI card for custom-signed LSPatch packages.
+- **Zero-Argv Daemon Token & Safe Shell Quoting (`DaemonProcessHelper.java`, `UpdateGate.java`)**: Moved minted daemon tokens strictly into the `KeepaliveStatusProvider` Binder `Bundle` reply, added `shellQuoteSingle` / `isSafeToken` / `isSafeComponent` guards, and restricted updater download URLs via `isTrustedReleaseUrl`.
+- **Offline Dual-Key Ed25519 Windows Updater (`desktop-win/updater.go`, `scripts/sign-windows-sums.go`)**: Added embedded primary/backup Ed25519 signature verification on `SHA256SUMS-windows.txt.sig`, strict `github.com` / `*.githubusercontent.com` redirect checks, and semver anti-downgrade enforcement.
+- **Process Guard Precision & Fail-Closed Go Network (`process_guard_windows.go`, `socks5.go`, `doh.go`)**: Fixed `"ime"` substring matching with `hasWordBoundedToken`, anchored Store `WindowsApps` prefixes, added SHA-256 + `30s` TTL Authenticode caching, made `openFullConePacketConn` fail closed without clearnet fallback, and switched DNS `txID` generation to `crypto/rand`.
+
+## [2.0.0] - 2026-11-25
 
 ### Added
 - Multiple Telegram instances on Android and Windows (per-client labels).

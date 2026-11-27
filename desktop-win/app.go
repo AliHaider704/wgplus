@@ -2,16 +2,11 @@ package main
 
 import (
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net"
-	"net/url"
 	"os"
 	"path/filepath"
-	goruntime "runtime"
-	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,11 +18,9 @@ import (
 	"wgplus-win/internal/clients"
 	"wgplus-win/internal/config"
 	"wgplus-win/internal/guard"
-	"wgplus-win/internal/qr"
 	"wgplus-win/internal/syswin"
 	"wgplus-win/internal/vault"
 	"wgplus-win/internal/voiptun"
-	"wgplus-win/internal/warp"
 	"wgplus-win/internal/watchdog"
 )
 
@@ -62,6 +55,7 @@ type BridgeStats struct {
 	HandshakeHealthy     bool                `json:"handshakeHealthy"`
 	SocksAuthRejectCount int64               `json:"socksAuthRejectCount"`
 	ResolvedEndpoint     string              `json:"resolvedEndpoint"`
+	ActiveMtu            int                 `json:"activeMtu"`
 	Clients              []ClientTrafficStat `json:"clients"`
 }
 
@@ -120,13 +114,14 @@ type App struct {
 	rxHistory  []uint64
 	txHistory  []uint64
 
-	windowVisible atomic.Bool
-	quitting      atomic.Bool
-	startHidden   bool
-	pendingConf   string
-	manualStop    atomic.Bool
-	recoveryGen   atomic.Uint64
-	telemetry     telemetryManager
+	windowVisible  atomic.Bool
+	quitting       atomic.Bool
+	startHidden    bool
+	pendingConf    string
+	manualStop     atomic.Bool
+	networkOffline atomic.Bool
+	recoveryGen    atomic.Uint64
+	telemetry      telemetryManager
 }
 
 // NewApp initializes the DPAPI vault and Windows Process Guard prior to Wails startup.
@@ -153,6 +148,7 @@ func NewApp(startHidden bool) (*App, error) {
 	a.clients = clients.DiscoverClients(st.CustomClients)
 	pg.UpdateAllowedClients(a.clients)
 	pg.SetMode(st.Settings.ProcessGuardMode)
+	a.repairCorruptedProfiles()
 	return a, nil
 }
 
@@ -216,6 +212,7 @@ func (a *App) startup(ctx context.Context) {
 	a.ctx = ctx
 	a.bgCtx, a.bgCancel = context.WithCancel(context.Background())
 
+	syswin.DisableProcessPowerThrottling()
 	wgbridge.SetDesktopMode(true)
 	a.runVersionHygiene()
 	a.applyCoreSettings()
@@ -243,6 +240,7 @@ func (a *App) startup(ctx context.Context) {
 		IsRunning: func() bool {
 			return wgbridge.IsRunning()
 		},
+		HasNetwork: syswin.HasOutboundIPv4,
 		TunnelUptime: func() time.Duration {
 			a.mu.Lock()
 			st := a.startedAt
@@ -684,23 +682,67 @@ func (a *App) handleWakeRecovery() {
 	busy := a.connecting
 	a.mu.Unlock()
 	if !isUp {
+		if on && !busy && !a.manualStop.Load() && syswin.HasOutboundIPv4() {
+			go a.autoConnectOnLaunch()
+		}
+		return
+	}
+	if !syswin.HasOutboundIPv4() {
+		a.networkOffline.Store(true)
+		return
+	}
+	linkMtu, outerVpn := syswin.DetectOutboundLinkMTU()
+	wgbridge.SetHostLinkMTU(linkMtu, outerVpn)
+	wasOffline := a.networkOffline.Swap(false)
+	if wgbridge.IsTunnelHotVerified() && !wasOffline {
+		wgbridge.RecordDiag("RECOVERY", "OK", "wake tunnel hot 0ms")
+		a.refreshTray()
+		a.emitStateChanged()
+		return
+	}
+	if wasOffline {
+		wgbridge.ResetActiveProxyConnections("win_wake")
+	}
+	if wgbridge.EnsureTunnelAlive(1500) {
+		wgbridge.CalibrateActiveTunnelMTUAsync()
+		wgbridge.RecordDiag("RECOVERY", "OK", "wake tunnel alive")
+		a.refreshTray()
+		a.emitStateChanged()
+		return
+	}
+	wgbridge.ResetActiveProxyConnections("win_wake_rebound")
+	a.runSteppedRecovery("wake", true)
+}
+
+func (a *App) handleNetworkSwitch() {
+	if !syswin.HasOutboundIPv4() {
+		a.networkOffline.Store(true)
+		return
+	}
+	wasOffline := a.networkOffline.Swap(false)
+	linkMtu, outerVpn := syswin.DetectOutboundLinkMTU()
+	wgbridge.SetHostLinkMTU(linkMtu, outerVpn)
+
+	a.mu.Lock()
+	isUp := a.connected
+	on := a.state.Settings.AutoConnectOnLaunch
+	busy := a.connecting
+	a.mu.Unlock()
+	if !isUp {
 		if on && !busy && !a.manualStop.Load() {
 			go a.autoConnectOnLaunch()
 		}
 		return
 	}
-	a.runSteppedRecovery("wake", true)
-}
-
-func (a *App) handleNetworkSwitch() {
-	a.mu.Lock()
-	isUp := a.connected
-	a.mu.Unlock()
-	if !isUp {
-		return
+	wgbridge.ClearDnsCache()
+	if wasOffline {
+		wgbridge.ResetActiveProxyConnections("win_net_restored")
 	}
-	if wgbridge.EnsureTunnelAlive(1200) {
+	if wgbridge.EnsureTunnelAlive(1500) {
+		wgbridge.CalibrateActiveTunnelMTUAsync()
 		wgbridge.RecordDiag("RECOVERY", "SKIP", "net_switch tunnel healthy")
+		a.refreshTray()
+		a.emitStateChanged()
 		return
 	}
 	a.runSteppedRecovery("net_switch", true)
@@ -982,17 +1024,9 @@ func (a *App) Connect(profileID string) error {
 		wgbridge.SetTunnelStartupPending(true)
 	}
 
-	effectiveMTU := prof.MTU
-	lowEp := strings.ToLower(strings.TrimSpace(prof.Endpoint))
-	isWarpOrAwg := prof.IsWarp ||
-		strings.TrimSpace(prof.AwgParams) != "" ||
-		strings.Contains(lowEp, "cloudflareclient") ||
-		strings.HasPrefix(lowEp, "162.159.")
-	if isWarpOrAwg && (effectiveMTU <= 0 || effectiveMTU > 1280) {
-		effectiveMTU = 1280
-	}
-
 	wgbridge.ResetSocksAuthRejectCount()
+	linkMtu, outerVpn := syswin.DetectOutboundLinkMTU()
+	wgbridge.SetHostLinkMTU(linkMtu, outerVpn)
 	a.applyCoreSettings()
 	port, err := wgbridge.StartTunnelAdvanced(
 		prof.PrivateKey,
@@ -1002,7 +1036,7 @@ func (a *App) Connect(profileID string) error {
 		prof.PeerPublicKey,
 		prof.Endpoint,
 		prof.KeepAlive,
-		effectiveMTU,
+		prof.MTU,
 		prof.AwgParams,
 		useDoH,
 	)
@@ -1017,7 +1051,9 @@ func (a *App) Connect(profileID string) error {
 		if ks && !a.connected {
 			_, _ = wgbridge.StartKillSwitchGuard()
 		}
-		a.reportAnomalyAsync("TUNNEL_START_FAILED", err.Error())
+		if syswin.HasOutboundIPv4() {
+			a.reportAnomalyAsync("TUNNEL_START_FAILED", err.Error())
+		}
 		a.refreshTray()
 		a.emitStateChanged()
 		return err
@@ -1043,7 +1079,52 @@ func (a *App) Connect(profileID string) error {
 	a.refreshTray()
 	a.emitStateChanged()
 	a.flushPendingTelemetryAsync()
+	go a.refreshActiveProfileLiveTelemetry(prof.ID)
 	return nil
+}
+
+func (a *App) refreshActiveProfileLiveTelemetry(profileID string) {
+	timer := time.NewTimer(900 * time.Millisecond)
+	if a.bgCtx != nil {
+		select {
+		case <-a.bgCtx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	} else {
+		<-timer.C
+	}
+
+	a.mu.Lock()
+	stillSame := a.connected && a.activeID == profileID
+	a.mu.Unlock()
+	if !stillSame {
+		return
+	}
+
+	rttMs, _ := wgbridge.ProbeActiveTunnelRttMs(2500)
+	a.mu.Lock()
+	stillSame = a.connected && a.activeID == profileID
+	updated := false
+	if stillSame && rttMs > 0 {
+		for i := range a.state.Profiles {
+			if a.state.Profiles[i].ID == profileID {
+				a.state.Profiles[i].LastPingMs = rttMs
+				updated = true
+				break
+			}
+		}
+		if updated && a.store != nil {
+			_ = a.store.Save(a.state)
+		}
+	}
+	a.mu.Unlock()
+
+	if stillSame {
+		a.refreshTray()
+		a.emitStateChanged()
+	}
 }
 
 func (a *App) Disconnect() error {
@@ -1160,51 +1241,11 @@ func (a *App) OpenOfficialChannel() (bool, error) {
 // AcknowledgeOfficialChannel records that the user opened or confirmed the mandatory channel modal.
 func (a *App) AcknowledgeOfficialChannel() error {
 	a.mu.Lock()
-	a.state.Settings.ChannelInvitedV2 = true
-	a.state.Settings.ChannelInvitedV3 = true
 	a.state.Settings.ChannelInvitedV4 = true
 	err := a.store.Save(a.state)
 	a.mu.Unlock()
 	a.emitStateChanged()
 	return err
-}
-
-// maybeInviteOfficialChannelOnce dispatches @wgplus_official directly to an active running Telegram
-// client once per install while the tunnel is connected (never when disconnected or no client is running).
-func (a *App) maybeInviteOfficialChannelOnce() {
-	a.mu.Lock()
-	already := a.state.Settings.ChannelInvitedV3
-	a.mu.Unlock()
-	if already {
-		return
-	}
-	time.Sleep(2200 * time.Millisecond)
-	a.mu.Lock()
-	isUp := a.connected && wgbridge.IsRunning()
-	a.mu.Unlock()
-	if !isUp {
-		return
-	}
-	detected := a.ScanTelegramClients()
-	anyRunning := false
-	for _, c := range detected {
-		if c.Running {
-			anyRunning = true
-			break
-		}
-	}
-	if !anyRunning {
-		return
-	}
-	opened, _ := a.OpenOfficialChannel()
-	if !opened {
-		return
-	}
-	a.mu.Lock()
-	a.state.Settings.ChannelInvitedV3 = true
-	a.state.Settings.ChannelInvitedV2 = true
-	_ = a.store.Save(a.state)
-	a.mu.Unlock()
 }
 
 // EnableAwg15AndReconnect applies the strong AmneziaWG 1.5 DPI bypass preset to the active server
@@ -1239,552 +1280,6 @@ func (a *App) EnableAwg15AndReconnect() error {
 		return err
 	}
 	return a.Connect(targetID)
-}
-
-func (a *App) SaveProfile(p config.ServerProfile) (config.ServerProfile, error) {
-	if strings.TrimSpace(p.PrivateKey) == "" || strings.TrimSpace(p.PeerPublicKey) == "" || strings.TrimSpace(p.Endpoint) == "" {
-		return p, errors.New("PrivateKey, PeerPublicKey, and Endpoint are required")
-	}
-	if strings.TrimSpace(p.ClientIP) == "" {
-		p.ClientIP = "10.0.0.2/32"
-	}
-	if strings.TrimSpace(p.DNS) == "" {
-		p.DNS = "1.1.1.1"
-	}
-	if p.MTU <= 0 {
-		p.MTU = 1280
-	}
-	if p.KeepAlive < 0 {
-		p.KeepAlive = 25
-	}
-	if strings.TrimSpace(p.Name) == "" {
-		p.Name = "WireGuard Server"
-	}
-	if strings.TrimSpace(p.ID) == "" {
-		p.ID = config.NewRandomID()
-	}
-
-	a.mu.Lock()
-	replaced := false
-	for i := range a.state.Profiles {
-		if a.state.Profiles[i].ID == p.ID {
-			a.state.Profiles[i] = p
-			replaced = true
-			break
-		}
-	}
-	if !replaced {
-		a.state.Profiles = append(a.state.Profiles, p)
-	}
-	if a.state.Settings.ActiveProfileID == "" {
-		a.state.Settings.ActiveProfileID = p.ID
-	}
-	err := a.store.Save(a.state)
-	isActive := a.connected && a.activeID == p.ID
-	a.mu.Unlock()
-
-	if err != nil {
-		return p, err
-	}
-	a.refreshTray()
-	a.emitStateChanged()
-	if isActive {
-		_ = a.Connect(p.ID)
-	}
-	return p, nil
-}
-
-func (a *App) DeleteProfile(id string) error {
-	a.mu.Lock()
-	var filtered []config.ServerProfile
-	for _, p := range a.state.Profiles {
-		if p.ID != id {
-			filtered = append(filtered, p)
-		}
-	}
-	a.state.Profiles = filtered
-	wasActive := a.activeID == id && a.connected
-	if a.state.Settings.ActiveProfileID == id {
-		if len(filtered) > 0 {
-			a.state.Settings.ActiveProfileID = filtered[0].ID
-		} else {
-			a.state.Settings.ActiveProfileID = ""
-		}
-	}
-	if a.activeID == id {
-		a.activeID = a.state.Settings.ActiveProfileID
-	}
-	err := a.store.Save(a.state)
-	a.mu.Unlock()
-
-	if wasActive {
-		_ = a.Disconnect()
-	} else {
-		a.refreshTray()
-		a.emitStateChanged()
-	}
-	return err
-}
-
-func (a *App) ImportConfText(raw string, customName string) (config.ServerProfile, error) {
-	prof, err := config.ParseWgConf(raw, customName)
-	if err != nil {
-		return prof, err
-	}
-	return a.SaveProfile(prof)
-}
-
-func (a *App) ImportConfFileDialog() (*config.ServerProfile, error) {
-	if a.ctx == nil {
-		return nil, errors.New("window context unavailable")
-	}
-	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
-		Title: "Import WireGuard / AmneziaWG Configuration",
-		Filters: []runtime.FileFilter{
-			{DisplayName: "WireGuard Config (*.conf)", Pattern: "*.conf"},
-			{DisplayName: "All Files (*.*)", Pattern: "*.*"},
-		},
-	})
-	if err != nil || strings.TrimSpace(path) == "" {
-		return nil, err
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	baseName := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	prof, err := a.ImportConfText(string(raw), baseName)
-	if err != nil {
-		return nil, err
-	}
-	return &prof, nil
-}
-
-func (a *App) ExportConfFileDialog(id string) (bool, error) {
-	a.mu.Lock()
-	var target *config.ServerProfile
-	for i := range a.state.Profiles {
-		if a.state.Profiles[i].ID == id {
-			cp := a.state.Profiles[i]
-			target = &cp
-			break
-		}
-	}
-	a.mu.Unlock()
-	if target == nil {
-		return false, errors.New("profile not found")
-	}
-	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
-		Title:           "Export WireGuard Configuration",
-		DefaultFilename: sanitizeFileName(target.Name) + ".conf",
-		Filters: []runtime.FileFilter{
-			{DisplayName: "WireGuard Config (*.conf)", Pattern: "*.conf"},
-		},
-	})
-	if err != nil || strings.TrimSpace(path) == "" {
-		return false, err
-	}
-	return true, os.WriteFile(path, []byte(config.ExportWgConf(*target)), 0600)
-}
-
-func sanitizeFileName(s string) string {
-	clean := strings.Map(func(r rune) rune {
-		if strings.ContainsRune(`<>:"/\|?*`, r) {
-			return '-'
-		}
-		return r
-	}, strings.TrimSpace(s))
-	if clean == "" {
-		return "wgplus-server"
-	}
-	return clean
-}
-
-func (a *App) ImportQRFileDialog() (*config.ServerProfile, error) {
-	if a.ctx == nil {
-		return nil, errors.New("window context unavailable")
-	}
-	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
-		Title: "Import WireGuard QR Image",
-		Filters: []runtime.FileFilter{
-			{DisplayName: "Images (*.png;*.jpg;*.jpeg;*.bmp)", Pattern: "*.png;*.jpg;*.jpeg;*.bmp"},
-		},
-	})
-	if err != nil || strings.TrimSpace(path) == "" {
-		return nil, err
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	text, err := qr.DecodeQRFromBytes(raw)
-	if err != nil {
-		return nil, err
-	}
-	baseName := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
-	prof, err := a.ImportConfText(text, baseName)
-	if err != nil {
-		return nil, err
-	}
-	return &prof, nil
-}
-
-func (a *App) ImportQRBytesBase64(b64Data string, defaultName string) (config.ServerProfile, error) {
-	clean := strings.TrimSpace(b64Data)
-	if comma := strings.IndexByte(clean, ','); comma >= 0 && strings.HasPrefix(clean[:comma], "data:") {
-		clean = clean[comma+1:]
-	}
-	imgBytes, err := base64.StdEncoding.DecodeString(clean)
-	if err != nil {
-		return config.ServerProfile{}, err
-	}
-	text, err := qr.DecodeQRFromBytes(imgBytes)
-	if err != nil {
-		return config.ServerProfile{}, err
-	}
-	return a.ImportConfText(text, defaultName)
-}
-
-func (a *App) ImportQRFromClipboard() (*config.ServerProfile, error) {
-	text, err := qr.DecodeQRFromClipboardWindows()
-	if err != nil {
-		return nil, err
-	}
-	prof, err := a.ImportConfText(text, "Clipboard QR")
-	if err != nil {
-		return nil, err
-	}
-	return &prof, nil
-}
-
-func (a *App) ExportProfileQR(id string) (string, error) {
-	a.mu.Lock()
-	var target *config.ServerProfile
-	for i := range a.state.Profiles {
-		if a.state.Profiles[i].ID == id {
-			cp := a.state.Profiles[i]
-			target = &cp
-			break
-		}
-	}
-	a.mu.Unlock()
-	if target == nil {
-		return "", errors.New("profile not found")
-	}
-	return qr.EncodeConfToPNGDataURL(config.ExportWgConf(*target))
-}
-
-func (a *App) GetAwgPreset(name string) string {
-	return wgbridge.GetAwgPreset(name)
-}
-
-// QuickConnectWarpResult summarizes the outcome of 1-click Free WARP (AWG 1.5) provisioning and binding.
-type QuickConnectWarpResult struct {
-	Profile         config.ServerProfile `json:"profile"`
-	CreatedNew      bool                 `json:"createdNew"`
-	AppliedClients  []string             `json:"appliedClients"`
-	ClipboardCopied bool                 `json:"clipboardCopied"`
-	ProxyURI        string               `json:"proxyUri"`
-}
-
-func findReusableWarpProfile(profiles []config.ServerProfile) (config.ServerProfile, bool) {
-	for _, p := range profiles {
-		if p.IsWarp &&
-			strings.TrimSpace(p.PrivateKey) != "" &&
-			strings.TrimSpace(p.PeerPublicKey) != "" &&
-			strings.TrimSpace(p.Endpoint) != "" {
-			return p, true
-		}
-	}
-	return config.ServerProfile{}, false
-}
-
-func selectQuickWarpTargetClients(list []config.TelegramClientEntry) []config.TelegramClientEntry {
-	var running []config.TelegramClientEntry
-	var firstEnabled *config.TelegramClientEntry
-	for i := range list {
-		c := list[i]
-		if !c.Enabled {
-			continue
-		}
-		if c.Running {
-			running = append(running, c)
-		}
-		if firstEnabled == nil {
-			cp := c
-			firstEnabled = &cp
-		}
-	}
-	if len(running) > 0 {
-		return running
-	}
-	if firstEnabled != nil {
-		return []config.TelegramClientEntry{*firstEnabled}
-	}
-	return nil
-}
-
-func (a *App) GenerateWarpProfile() (config.ServerProfile, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
-
-	prof, err := warp.GenerateProfile(ctx)
-	if err != nil {
-		return prof, err
-	}
-	return a.SaveProfile(prof)
-}
-
-// QuickConnectWarp provisions (or reuses) a Cloudflare WARP + AWG 1.5 profile, connects the tunnel,
-// and dispatches the local SOCKS5 proxy to active Telegram desktop clients in one click.
-func (a *App) QuickConnectWarp(forceNew bool) (QuickConnectWarpResult, error) {
-	var prof config.ServerProfile
-	createdNew := false
-
-	if !forceNew {
-		a.mu.Lock()
-		if existing, ok := findReusableWarpProfile(a.state.Profiles); ok {
-			prof = existing
-		}
-		a.mu.Unlock()
-	}
-
-	if prof.ID == "" {
-		var err error
-		prof, err = a.GenerateWarpProfile()
-		if err != nil {
-			return QuickConnectWarpResult{}, err
-		}
-		createdNew = true
-	}
-
-	if err := a.Connect(prof.ID); err != nil {
-		return QuickConnectWarpResult{}, err
-	}
-
-	proxyURI := a.GetProxyLink()
-	clientsList := a.ScanTelegramClients()
-	targets := selectQuickWarpTargetClients(clientsList)
-
-	applied := make([]string, 0, len(targets))
-	clipboardCopied := false
-	for _, c := range targets {
-		res, applyErr := a.ApplyProxyToClient(c.ID)
-		if applyErr == nil && res.Dispatched {
-			applied = append(applied, c.DisplayName)
-			if res.ClipboardCopied {
-				clipboardCopied = true
-			}
-		}
-	}
-
-	if len(applied) == 0 && strings.TrimSpace(proxyURI) != "" {
-		if err := syswin.CopyTextToClipboard(proxyURI); err == nil {
-			clipboardCopied = true
-		}
-	}
-
-	a.mu.Lock()
-	for _, p := range a.state.Profiles {
-		if p.ID == prof.ID {
-			prof = p
-			break
-		}
-	}
-	a.mu.Unlock()
-
-	return QuickConnectWarpResult{
-		Profile:         prof,
-		CreatedNew:      createdNew,
-		AppliedClients:  applied,
-		ClipboardCopied: clipboardCopied,
-		ProxyURI:        proxyURI,
-	}, nil
-}
-
-func (a *App) PingProfile(id string) (int, error) {
-	a.mu.Lock()
-	var target *config.ServerProfile
-	for i := range a.state.Profiles {
-		if a.state.Profiles[i].ID == id {
-			cp := a.state.Profiles[i]
-			target = &cp
-			break
-		}
-	}
-	useDoHGlobal := a.state.Settings.UseDoH
-	a.mu.Unlock()
-	if target == nil {
-		return -1, errors.New("profile not found")
-	}
-
-	ms, err := wgbridge.ProbeEndpointHandshakeMs(
-		target.PrivateKey,
-		target.PresharedKey,
-		target.PeerPublicKey,
-		target.Endpoint,
-		target.AwgParams,
-		useDoHGlobal && target.UseDoH,
-		3500,
-	)
-	pingVal := ms
-	if err != nil {
-		pingVal = -1
-	}
-
-	a.mu.Lock()
-	for i := range a.state.Profiles {
-		if a.state.Profiles[i].ID == id {
-			a.state.Profiles[i].LastPingMs = pingVal
-			break
-		}
-	}
-	_ = a.store.Save(a.state)
-	a.mu.Unlock()
-	a.refreshTray()
-	a.emitStateChanged()
-	return pingVal, err
-}
-
-func (a *App) PingAllProfiles() ([]config.ServerProfile, error) {
-	a.mu.Lock()
-	profiles := make([]config.ServerProfile, len(a.state.Profiles))
-	copy(profiles, a.state.Profiles)
-	useDoHGlobal := a.state.Settings.UseDoH
-	a.mu.Unlock()
-
-	var wg sync.WaitGroup
-	results := make([]int, len(profiles))
-	for i, p := range profiles {
-		wg.Add(1)
-		go func(idx int, prof config.ServerProfile) {
-			defer wg.Done()
-			ms, err := wgbridge.ProbeEndpointHandshakeMs(
-				prof.PrivateKey, prof.PresharedKey, prof.PeerPublicKey, prof.Endpoint, prof.AwgParams, useDoHGlobal && prof.UseDoH, 3200,
-			)
-			if err != nil {
-				results[idx] = -1
-			} else {
-				results[idx] = ms
-			}
-		}(i, p)
-	}
-	wg.Wait()
-
-	a.mu.Lock()
-	for i, p := range profiles {
-		for j := range a.state.Profiles {
-			if a.state.Profiles[j].ID == p.ID {
-				a.state.Profiles[j].LastPingMs = results[i]
-			}
-		}
-	}
-	_ = a.store.Save(a.state)
-	out := make([]config.ServerProfile, len(a.state.Profiles))
-	copy(out, a.state.Profiles)
-	a.mu.Unlock()
-
-	a.refreshTray()
-	a.emitStateChanged()
-	return out, nil
-}
-
-func (a *App) DiscoverOptimalMTUForProfile(prof config.ServerProfile) (int, error) {
-	if strings.TrimSpace(prof.PrivateKey) == "" || strings.TrimSpace(prof.PeerPublicKey) == "" || strings.TrimSpace(prof.Endpoint) == "" {
-		return 0, errors.New("PrivateKey, PeerPublicKey, and Endpoint are required")
-	}
-	if strings.TrimSpace(prof.ClientIP) == "" {
-		prof.ClientIP = "10.0.0.2/32"
-	}
-	if strings.TrimSpace(prof.DNS) == "" {
-		prof.DNS = "1.1.1.1"
-	}
-	a.mu.Lock()
-	useDoHGlobal := a.state.Settings.UseDoH
-	a.mu.Unlock()
-
-	mtu, err := wgbridge.DiscoverOptimalMTU(
-		prof.PrivateKey,
-		prof.PresharedKey,
-		prof.ClientIP,
-		prof.DNS,
-		prof.PeerPublicKey,
-		prof.Endpoint,
-		prof.AwgParams,
-		useDoHGlobal && prof.UseDoH,
-		"",
-		2600,
-	)
-	if err != nil {
-		return 0, err
-	}
-	if strings.TrimSpace(prof.ID) != "" {
-		a.mu.Lock()
-		for i := range a.state.Profiles {
-			if a.state.Profiles[i].ID == prof.ID {
-				a.state.Profiles[i].MTU = mtu
-				break
-			}
-		}
-		_ = a.store.Save(a.state)
-		isActive := a.connected && a.activeID == prof.ID
-		a.mu.Unlock()
-		a.emitStateChanged()
-		if isActive {
-			_ = a.Connect(prof.ID)
-		}
-	}
-	return mtu, nil
-}
-
-func (a *App) DiscoverOptimalMTU(id string) (int, error) {
-	a.mu.Lock()
-	var target *config.ServerProfile
-	for i := range a.state.Profiles {
-		if a.state.Profiles[i].ID == id {
-			cp := a.state.Profiles[i]
-			target = &cp
-			break
-		}
-	}
-	useDoHGlobal := a.state.Settings.UseDoH
-	a.mu.Unlock()
-	if target == nil {
-		return 0, errors.New("profile not found")
-	}
-
-	mtu, err := wgbridge.DiscoverOptimalMTU(
-		target.PrivateKey,
-		target.PresharedKey,
-		target.ClientIP,
-		target.DNS,
-		target.PeerPublicKey,
-		target.Endpoint,
-		target.AwgParams,
-		useDoHGlobal && target.UseDoH,
-		"",
-		2600,
-	)
-	if err != nil {
-		return 0, err
-	}
-
-	a.mu.Lock()
-	for i := range a.state.Profiles {
-		if a.state.Profiles[i].ID == id {
-			a.state.Profiles[i].MTU = mtu
-			break
-		}
-	}
-	_ = a.store.Save(a.state)
-	isActive := a.connected && a.activeID == id
-	a.mu.Unlock()
-
-	a.emitStateChanged()
-	if isActive {
-		_ = a.Connect(id)
-	}
-	return mtu, nil
 }
 
 func (a *App) VerifyRouteAndCalls() (string, error) {
@@ -1981,8 +1476,6 @@ func (a *App) UpdateSettings(s config.AppSettings) (config.AppSettings, error) {
 	if s.ActiveProfileID == "" {
 		s.ActiveProfileID = prev.ActiveProfileID
 	}
-	s.ChannelInvitedV2 = prev.ChannelInvitedV2
-	s.ChannelInvitedV3 = prev.ChannelInvitedV3
 	s.ChannelInvitedV4 = prev.ChannelInvitedV4
 
 	if s.StartWithWindows != prev.StartWithWindows || s.AlwaysRunAsAdmin != prev.AlwaysRunAsAdmin {
@@ -2053,69 +1546,6 @@ func (a *App) GetGuardEvents() []guard.GuardEvent {
 	return a.procGuard.Events()
 }
 
-func (a *App) ExportEncryptedBackupDialog(passphrase string) (bool, error) {
-	if a.ctx == nil {
-		return false, errors.New("window context unavailable")
-	}
-	a.mu.Lock()
-	st := a.state
-	a.mu.Unlock()
-
-	blob, err := vault.ExportEncryptedBackup(st, passphrase)
-	if err != nil {
-		return false, err
-	}
-	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
-		Title:           "Export Encrypted Portable Backup",
-		DefaultFilename: "wireguard-plus-backup.wgplus",
-		Filters: []runtime.FileFilter{
-			{DisplayName: "WireGuard Plus Backup (*.wgplus)", Pattern: "*.wgplus"},
-		},
-	})
-	if err != nil || strings.TrimSpace(path) == "" {
-		return false, err
-	}
-	return true, os.WriteFile(path, blob, 0600)
-}
-
-func (a *App) ImportEncryptedBackupDialog(passphrase string) (BootstrapState, error) {
-	if a.ctx == nil {
-		return BootstrapState{}, errors.New("window context unavailable")
-	}
-	path, err := runtime.OpenFileDialog(a.ctx, runtime.OpenDialogOptions{
-		Title: "Import Encrypted Portable Backup",
-		Filters: []runtime.FileFilter{
-			{DisplayName: "WireGuard Plus Backup (*.wgplus)", Pattern: "*.wgplus"},
-		},
-	})
-	if err != nil || strings.TrimSpace(path) == "" {
-		return a.GetBootstrapState(), err
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		return BootstrapState{}, err
-	}
-	imported, err := vault.ImportEncryptedBackup(raw, passphrase)
-	if err != nil {
-		return BootstrapState{}, err
-	}
-
-	a.mu.Lock()
-	a.state.Profiles = imported.Profiles
-	a.state.CustomClients = imported.CustomClients
-	if imported.Settings.ActiveProfileID != "" {
-		a.state.Settings.ActiveProfileID = imported.Settings.ActiveProfileID
-	}
-	err = a.store.Save(a.state)
-	a.mu.Unlock()
-	if err != nil {
-		return BootstrapState{}, err
-	}
-	a.ScanTelegramClients()
-	a.emitStateChanged()
-	return a.GetBootstrapState(), nil
-}
-
 // ApproveBlockedClientPath registers a custom unsigned portable client path blocked by Process Guard.
 func (a *App) ApproveBlockedClientPath(exePath string) error {
 	clean := filepath.Clean(strings.TrimSpace(exePath))
@@ -2155,256 +1585,5 @@ func (a *App) ApproveBlockedClientPath(exePath string) error {
 	a.procGuard.AllowExecutablePath(clean)
 	a.ScanTelegramClients()
 	a.emitStateChanged()
-	return nil
-}
-
-func describeWindowsEndpointShape(rawEp string) string {
-	ep := strings.TrimSpace(rawEp)
-	if ep == "" {
-		return "unset"
-	}
-	host, port, err := net.SplitHostPort(ep)
-	if err != nil {
-		return "custom"
-	}
-	if ip := net.ParseIP(host); ip != nil {
-		if ip.To4() != nil {
-			return "ipv4:" + port
-		}
-		return "ipv6:" + port
-	}
-	return "domain:" + port
-}
-
-func appendWindowsNetInterfacesMarkdown(b *strings.Builder) {
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return
-	}
-	var active []string
-	for _, ifc := range ifaces {
-		if ifc.Flags&net.FlagUp == 0 || ifc.Flags&net.FlagLoopback != 0 {
-			continue
-		}
-		addrs, aErr := ifc.Addrs()
-		if aErr != nil || len(addrs) == 0 {
-			continue
-		}
-		v4Count, v6Global := 0, 0
-		for _, a := range addrs {
-			if ipn, ok := a.(*net.IPNet); ok && ipn.IP != nil {
-				if ipn.IP.To4() != nil {
-					v4Count++
-				} else if !ipn.IP.IsLinkLocalUnicast() {
-					v6Global++
-				}
-			}
-		}
-		if v4Count == 0 && v6Global == 0 {
-			continue
-		}
-		active = append(active, fmt.Sprintf("%s(mtu=%d,v4=%d,v6=%d)", sanitizeWindowsDiagText(ifc.Name), ifc.MTU, v4Count, v6Global))
-	}
-	sort.Strings(active)
-	if len(active) == 0 {
-		b.WriteString("- **OS Network**: `OFFLINE (no active non-loopback interfaces)`\n")
-		return
-	}
-	fmt.Fprintf(b, "- **OS Network**: `%s`\n", strings.Join(active, ", "))
-}
-
-// GetDiagnosticReport builds a sanitized Markdown report safe to share with the developer or attach to GitHub Issues.
-// Never includes private keys, preshared keys, server endpoints, SOCKS credentials, or PC usernames.
-func (a *App) GetDiagnosticReport() string {
-	a.mu.Lock()
-	s := a.state.Settings
-	isConn := a.connected
-	isBusy := a.connecting
-	lastErr := a.lastError
-	activeID := a.activeID
-	startedAt := a.startedAt
-	profCount := len(a.state.Profiles)
-	var profSummary string
-	for _, p := range a.state.Profiles {
-		if p.ID == activeID {
-			hasAwg := strings.TrimSpace(p.AwgParams) != ""
-			profSummary = fmt.Sprintf("mtu=%d, keepAlive=%d, useDoH=%v, awg=%v, warp=%v, pingMs=%d, ep=%s",
-				p.MTU, p.KeepAlive, p.UseDoH, hasAwg, p.IsWarp, p.LastPingMs, describeWindowsEndpointShape(p.Endpoint))
-			break
-		}
-	}
-	clis := append([]config.TelegramClientEntry(nil), a.clients...)
-	a.mu.Unlock()
-
-	st := a.readBridgeStats()
-	mergedClis := a.mergeClientTraffic(clis, st)
-	pidsMap := clients.SnapshotRunningPIDs()
-	osRel, buildNum, devModel := queryWindowsOSInfo()
-	uptimeSec := int64(0)
-	if isConn && !startedAt.IsZero() {
-		uptimeSec = int64(time.Since(startedAt).Seconds())
-	}
-
-	var b strings.Builder
-	b.WriteString("### WireGuard Plus Diagnostics (Windows)\n")
-	fmt.Fprintf(&b, "- **App Version**: `v%s`\n", AppVersion)
-	fmt.Fprintf(&b, "- **Device / OS**: `%s` — %s (arch=%s, build=%d, portable=%v, admin=%v)\n",
-		devModel, osRel, goruntime.GOARCH, buildNum, a.store.IsPortable(), isProcessElevated())
-	fmt.Fprintf(&b, "- **Tunnel State**: connected=`%v`, connecting=`%v`, running=`%v`, voipTunActive=`%v`, hsHealthy=`%v`, uptimeSec=`%d`\n",
-		isConn, isBusy, st.Running, st.VoipTunActive, st.HandshakeHealthy, uptimeSec)
-	fmt.Fprintf(&b, "- **Security Policy**: killSwitch=`%v`, guardMode=`%s`, socksAuth=`%v`, blockIPv6=`%v`, doH=`%v`, autoFailover=`%v`, telemetryOptIn=`%v`, profiles=`%d`\n",
-		s.KillSwitch, s.ProcessGuardMode, s.SocksAuthEnabled, s.BlockIPv6, s.UseDoH, s.AutoFailover, s.TelemetryOptIn, profCount)
-	fmt.Fprintf(&b, "- **Ports & Stats**: socksPort=`%d`, httpPort=`%d`, rxBytes=`%d`, txBytes=`%d`, hsAgeSec=`%d`, activeTcp=`%d`, activeUdp=`%d`, socksReject=`%d`, guardBlocked=`%d`\n",
-		st.SocksPort, st.HttpPort, st.RxBytes, st.TxBytes, st.HandshakeAgeSec, st.ActiveTcpConns, st.ActiveUdpAssocs, st.SocksAuthRejectCount, st.BlockedLocalAttempts)
-	if profSummary != "" {
-		fmt.Fprintf(&b, "- **Profile Policy**: `%s`\n", profSummary)
-	}
-	appendWindowsNetInterfacesMarkdown(&b)
-	if strings.TrimSpace(lastErr) != "" {
-		fmt.Fprintf(&b, "- **Last Error**: `%s`\n", lastErr)
-	}
-
-	b.WriteString("\n#### Per-Instance Telegram Desktop Matrix\n")
-	if len(mergedClis) == 0 {
-		b.WriteString("- (none detected)\n")
-	} else {
-		matchedLabels := make(map[string]bool, len(mergedClis))
-		for _, c := range mergedClis {
-			exeBase := strings.ToLower(filepath.Base(c.ExePath))
-			if (exeBase == "." || exeBase == "") && c.Kind == "unigram" {
-				exeBase = "unigram.exe"
-			}
-			instLabel := guard.ClientLabelForExe(c.ExePath, exeBase)
-			matchedLabels[strings.ToLower(instLabel)] = true
-			if strings.TrimSpace(c.ExePath) == "" {
-				matchedLabels[exeBase] = true
-			}
-			var pids []uint32
-			if c.ExePath != "" {
-				pids = pidsMap[strings.ToLower(filepath.Clean(c.ExePath))]
-			}
-			if len(pids) == 0 && exeBase != "" {
-				pids = pidsMap["name:"+exeBase]
-			}
-			dirTag := sanitizeWindowsDiagText(c.InstallDir)
-			if dirTag == "" && c.IsMsix {
-				dirTag = "MSIX"
-			}
-			fmt.Fprintf(&b, "- `%s` (kind=%s, label=`%s`, running=%v, pids=%v, enabled=%v, portable=%v, msix=%v, conns=%d, rx=%d, tx=%d, dir=`%s`)\n",
-				c.DisplayName, c.Kind, instLabel, c.Running, pids, c.Enabled, c.IsPortable, c.IsMsix, c.ActiveConns, c.RxBytes, c.TxBytes, dirTag)
-		}
-		for _, cs := range st.Clients {
-			if !matchedLabels[strings.ToLower(cs.Label)] {
-				fmt.Fprintf(&b, "- (unmapped client) label=`%s`, conns=%d, rx=%d, tx=%d\n",
-					cs.Label, cs.ActiveConns, cs.RxBytes, cs.TxBytes)
-			}
-		}
-	}
-
-	bundleRaw := wgbridge.BuildEngineDiagnosticsBundleJSON()
-	var parsedBundle struct {
-		UdpTelemetry json.RawMessage `json:"udpTelemetry"`
-		VoipRelays   []struct {
-			LocalAddr   string `json:"localAddr"`
-			TargetPort  int    `json:"targetPort"`
-			UdpSessions int    `json:"udpSessions"`
-			UdpTxPkts   int64  `json:"udpTxPkts"`
-			UdpRxPkts   int64  `json:"udpRxPkts"`
-			UdpErrs     int64  `json:"udpErrs"`
-			TcpConns    int64  `json:"tcpConns"`
-			AgeSec      int64  `json:"ageSec"`
-		} `json:"voipRelays"`
-		RingBuffer []struct {
-			Ts   string `json:"ts"`
-			Cat  string `json:"cat"`
-			Code string `json:"code"`
-			Msg  string `json:"msg"`
-		} `json:"ringBuffer"`
-	}
-	if err := json.Unmarshal([]byte(bundleRaw), &parsedBundle); err == nil && len(parsedBundle.UdpTelemetry) > 0 {
-		fmt.Fprintf(&b, "\n#### UDP & Watchdog Telemetry\n```json\n%s\n```\n", string(parsedBundle.UdpTelemetry))
-		if len(parsedBundle.VoipRelays) > 0 {
-			b.WriteString("\n#### Active VoIP Relays\n```text\n")
-			for _, r := range parsedBundle.VoipRelays {
-				fmt.Fprintf(&b, "%s -> :%d sess=%d txPkts=%d rxPkts=%d errs=%d tcp=%d age=%ds\n",
-					r.LocalAddr, r.TargetPort, r.UdpSessions, r.UdpTxPkts, r.UdpRxPkts, r.UdpErrs, r.TcpConns, r.AgeSec)
-			}
-			b.WriteString("```\n")
-		}
-		b.WriteString("\n#### Go Engine Ring Buffer\n```text\n")
-		if len(parsedBundle.RingBuffer) == 0 {
-			b.WriteString("(none)\n")
-		} else {
-			for _, o := range parsedBundle.RingBuffer {
-				fmt.Fprintf(&b, "[%s] [%s/%s] %s\n", o.Ts, o.Cat, o.Code, o.Msg)
-			}
-		}
-		b.WriteString("```\n")
-	} else {
-		fmt.Fprintf(&b, "\n#### UDP & Watchdog Telemetry\n```json\n%s\n```\n", wgbridge.GetUdpTelemetryJSON())
-		fmt.Fprintf(&b, "\n#### Go Engine Ring Buffer\n```json\n%s\n```\n", wgbridge.GetDiagnosticsJSON())
-	}
-
-	anomalies := a.snapshotAppAnomalies()
-	if len(anomalies) > 0 {
-		b.WriteString("\n#### Windows App Anomaly Log\n```text\n")
-		for _, line := range anomalies {
-			b.WriteString(line)
-			b.WriteByte('\n')
-		}
-		b.WriteString("```\n")
-	}
-
-	guardEvents := a.procGuard.Events()
-	b.WriteString("\n#### Recent Process Guard Events\n```text\n")
-	if len(guardEvents) == 0 {
-		b.WriteString("(none)\n")
-	} else {
-		start := 0
-		if len(guardEvents) > 25 {
-			start = len(guardEvents) - 25
-		}
-		for _, ev := range guardEvents[start:] {
-			fmt.Fprintf(&b, "[%d] %s %s %s (pid=%d, :%d) path=%s\n",
-				ev.TimestampUnix, strings.ToUpper(ev.Action), ev.Protocol, ev.ClientLabel, ev.PID, ev.PeerPort, ev.ExePath)
-		}
-	}
-	b.WriteString("```\n")
-	return capUTF8HeadTail(sanitizeWindowsDiagText(b.String()), maxTelemetryReportUTF8Bytes)
-}
-
-func (a *App) ClearDiagnostics() {
-	wgbridge.ClearDiagnostics()
-}
-
-func (a *App) SaveDiagnosticReport() (string, error) {
-	if a.ctx == nil {
-		return "", errors.New("window context unavailable")
-	}
-	rep := a.GetDiagnosticReport()
-	path, err := runtime.SaveFileDialog(a.ctx, runtime.SaveDialogOptions{
-		Title:           "Save Diagnostic Report",
-		DefaultFilename: "wireguard-plus-diagnostics.md",
-		Filters: []runtime.FileFilter{
-			{DisplayName: "Markdown Report (*.md)", Pattern: "*.md"},
-		},
-	})
-	if err != nil || strings.TrimSpace(path) == "" {
-		return "", err
-	}
-	if err := os.WriteFile(path, []byte(rep), 0600); err != nil {
-		return "", err
-	}
-	return path, nil
-}
-
-func (a *App) OpenGitHubBugReport() error {
-	rep := a.GetDiagnosticReport()
-	_ = syswin.CopyTextToClipboard(rep)
-	issueURL := "https://github.com/AliHaider704/wgplus/issues/new?template=bug_report.yml&environment=" +
-		url.QueryEscape(fmt.Sprintf("Windows (%s/%s) - WireGuard Plus v%s", goruntime.GOOS, goruntime.GOARCH, AppVersion))
-	if a.ctx != nil {
-		runtime.BrowserOpenURL(a.ctx, issueURL)
-	}
 	return nil
 }

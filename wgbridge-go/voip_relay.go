@@ -1,11 +1,15 @@
 package wgbridge
 
 import (
+	"bufio"
 	"context"
+	"encoding/binary"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"net"
 	"net/netip"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -26,11 +30,15 @@ type voipRelayUdpSession struct {
 	pConn      net.PacketConn
 	dialer     udpDialer
 	lastActive atomic.Int64
+	counted    atomic.Bool
 	closeOnce  sync.Once
 }
 
 func (s *voipRelayUdpSession) close() {
 	s.closeOnce.Do(func() {
+		if s.counted.CompareAndSwap(true, false) {
+			activeUdpAssocs.Add(-1)
+		}
 		if s.pConn != nil {
 			_ = s.pConn.Close()
 		}
@@ -72,8 +80,37 @@ var (
 	voipRelays   = make(map[string]*voipRelay)
 
 	// voipLowTrafficCloses counts relays that closed after >=30s with <100 packets (failed call signature).
-	voipLowTrafficCloses atomic.Uint64
+	voipLowTrafficCloses         atomic.Uint64
+	lastVoipWarmUnix             atomic.Int64
+	lastVoipMediaRelayActiveUnix atomic.Int64
 )
+
+func warmTunnelForVoipCall() {
+	mu.Lock()
+	isUp := running
+	dev := activeDev
+	pubHex := activePeerPubHex
+	mu.Unlock()
+	if !isUp || dev == nil || pubHex == "" {
+		return
+	}
+	_, _, hsSec := readDeviceCounters(dev)
+	nowSec := time.Now().Unix()
+	if hsSec > 0 && (nowSec-hsSec) <= 45 {
+		return
+	}
+	prevWarm := lastVoipWarmUnix.Load()
+	if nowSec-prevWarm < 3 || !lastVoipWarmUnix.CompareAndSwap(prevWarm, nowSec) {
+		return
+	}
+	go func() {
+		if hsSec <= 0 || (nowSec-hsSec) >= 120 {
+			_ = EnsureTunnelAlive(1800)
+			return
+		}
+		triggerPeerHandshakeDirect(dev, pubHex, true)
+	}()
+}
 
 // GetVoipLowTrafficCloseCount reports how many VoIP relays closed looking like a failed call.
 func GetVoipLowTrafficCloseCount() int64 {
@@ -84,6 +121,7 @@ func GetVoipLowTrafficCloseCount() int64 {
 // socket that forwards packets for targetHost:targetPort directly through the active
 // WireGuard tunnel netstack. Returns the bound local loopback port, or 0 on failure.
 func StartVoipEndpointRelay(targetHost string, targetPort int) int {
+	warmTunnelForVoipCall()
 	ctx, dialer, ok := getActiveVoipDialer()
 	if !ok {
 		return 0
@@ -92,9 +130,11 @@ func StartVoipEndpointRelay(targetHost string, targetPort int) int {
 }
 
 // StartVoipEndpointRelayAddr binds or reuses a local loopback UDP/TCP relay socket for
-// targetHost:targetPort, preserving targetPort on a dedicated 127.0.0.x address when
-// targetPort >= 1024 (falling back to ephemeral 127.0.0.1:0 when needed). Returns "ip:port" or "".
+// targetHost:targetPort, preserving targetPort on 127.0.0.1 first (or 127.0.0.x on conflict) when
+// targetPort >= 1024 (or any port when running as uid=0), falling back to ephemeral 127.0.0.1:0 when needed.
+// Returns "ip:port" or "".
 func StartVoipEndpointRelayAddr(targetHost string, targetPort int) string {
+	warmTunnelForVoipCall()
 	ctx, dialer, ok := getActiveVoipDialer()
 	if !ok {
 		return ""
@@ -298,7 +338,17 @@ func startVoipEndpointRelayInternal(
 }
 
 func bindVoipRelayLoopbackPreservePort(targetKey string, targetPort int) (*net.UDPConn, net.Listener, string, int, error) {
-	if targetPort >= 1024 && (targetPort < 48729 || targetPort > 48735) {
+	canPreserve := (targetPort >= 1024 || (targetPort >= 1 && os.Geteuid() == 0)) && (targetPort < 48729 || targetPort > 48735)
+	if canPreserve {
+		// Try canonical 127.0.0.1:<targetPort> first so OEMs that isolate 127.0.0.2+ work on primary endpoint.
+		ip1 := net.IPv4(127, 0, 0, 1)
+		if udpLn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: ip1, Port: targetPort}); err == nil {
+			if tcpLn, tcpErr := net.Listen("tcp4", net.JoinHostPort("127.0.0.1", strconv.Itoa(targetPort))); tcpErr == nil {
+				return udpLn, tcpLn, "127.0.0.1", targetPort, nil
+			}
+			_ = udpLn.Close()
+		}
+
 		h := fnv.New32a()
 		_, _ = h.Write([]byte(targetKey))
 		startOctet := 2 + int(h.Sum32()%248) // 2..249
@@ -367,7 +417,9 @@ func (r *voipRelay) removeFromRegistry() {
 func (r *voipRelay) close() {
 	r.closeOnce.Do(func() {
 		r.closed.Store(true)
-		r.cancel()
+		if r.cancel != nil {
+			r.cancel()
+		}
 		if r.udpLn != nil {
 			_ = r.udpLn.Close()
 		}
@@ -386,14 +438,33 @@ func (r *voipRelay) close() {
 			ageSec = 0
 		}
 		tx, rx, errs := r.udpPktsTx.Load(), r.udpPktsRx.Load(), r.udpErrs.Load()
+		totPkts := tx + rx
+		if totPkts >= 100 {
+			lastVoipMediaRelayActiveUnix.Store(time.Now().Unix())
+		}
 		RecordDiag("VOIP_RELAY", "CLOSE", fmt.Sprintf("target=%s:%d localAddr=%s ageSec=%d udpTx=%d udpRx=%d errs=%d tcpConns=%d",
 			r.targetHost, r.targetPort, r.localAddrString(), ageSec, tx, rx, errs, r.tcpConns.Load()))
-		// A call relay that lived >= 30s but carried almost no media is the signature of a failed call.
-		if ageSec >= 30 && tx+rx < 100 {
+		// A call relay that lived >= 30s with <100 packets is only a failed call when no sibling relay
+		// in the same call session carried real media.
+		if ageSec >= 30 && totPkts < 100 && !r.hasSiblingMediaEvidence() {
 			voipLowTrafficCloses.Add(1)
 			RecordDiag("VOIP_RELAY", "LOW_TRAFFIC", fmt.Sprintf("target=%s:%d ageSec=%d udpTx=%d udpRx=%d errs=%d", r.targetHost, r.targetPort, ageSec, tx, rx, errs))
 		}
 	})
+}
+
+func (r *voipRelay) hasSiblingMediaEvidence() bool {
+	if time.Now().Unix()-lastVoipMediaRelayActiveUnix.Load() <= 20 {
+		return true
+	}
+	voipRelaysMu.Lock()
+	defer voipRelaysMu.Unlock()
+	for _, other := range voipRelays {
+		if other != nil && other != r && (other.udpPktsTx.Load()+other.udpPktsRx.Load()) >= 100 {
+			return true
+		}
+	}
+	return false
 }
 
 func (r *voipRelay) start() {
@@ -479,7 +550,9 @@ func (r *voipRelay) startReturnPump(s *voipRelayUdpSession) {
 				nowNano := time.Now().UnixNano()
 				s.lastActive.Store(nowNano)
 				r.lastActive.Store(nowNano)
-				r.udpPktsRx.Add(1)
+				if r.udpPktsRx.Add(1)+r.udpPktsTx.Load() == 100 {
+					lastVoipMediaRelayActiveUnix.Store(time.Now().Unix())
+				}
 				udpPacketsRx.Add(1)
 				recordClientRx(r.statEnt, rn)
 			} else {
@@ -649,6 +722,8 @@ func (r *voipRelay) getOrCreateUdpSession(
 		return cur, nil
 	}
 	r.sessions[clientKey] = newSess
+	newSess.counted.Store(true)
+	activeUdpAssocs.Add(1)
 	r.sessMu.Unlock()
 
 	udpSocketsOpened.Add(1)
@@ -730,19 +805,37 @@ func getVoipRelaysDiagSnapshot() []voipRelayDiagStat {
 	return out
 }
 
-func (r *voipRelay) handleTcpClient(client net.Conn) {
-	defer client.Close()
-	r.lastActive.Store(time.Now().UnixNano())
+type bufferedVoipConn struct {
+	net.Conn
+	r *bufio.Reader
+}
 
-	liveCtx, liveDialer, _ := r.getLiveDialer()
-	if !awaitHandshakeReadyOrFail(liveCtx, liveDialer, 2500*time.Millisecond) {
-		return
-	}
+func (b *bufferedVoipConn) Read(p []byte) (int, error) {
+	return b.r.Read(p)
+}
 
-	targetIP, resErr := resolveUdpTargetIP(liveCtx, liveDialer, r.targetHost, r.dnsCache, &r.dnsMu)
-	if resErr != nil {
-		return
+func (b *bufferedVoipConn) CloseWrite() error {
+	if wc, ok := b.Conn.(writeCloserConn); ok {
+		return wc.CloseWrite()
 	}
+	return b.Conn.Close()
+}
+
+func writeAllVoipConn(w io.Writer, data []byte) error {
+	for len(data) > 0 {
+		n, err := w.Write(data)
+		if err != nil {
+			return err
+		}
+		if n <= 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
+}
+
+func (r *voipRelay) relayTcpOverTunnel(client net.Conn, br *bufio.Reader, liveCtx context.Context, liveDialer udpDialer, targetIP netip.Addr) {
 	network := "tcp4"
 	if targetIP.Is6() {
 		network = "tcp6"
@@ -760,5 +853,153 @@ func (r *voipRelay) handleTcpClient(client net.Conn) {
 	activeTcpConns.Add(1)
 	defer activeTcpConns.Add(-1)
 
-	relayTcpBidirectional(r.ctx, client, remote, r.statEnt)
+	localConn := client
+	if br != nil && br.Buffered() > 0 {
+		localConn = &bufferedVoipConn{Conn: client, r: br}
+	}
+	relayTcpBidirectional(r.ctx, localConn, remote, r.statEnt)
+}
+
+func (r *voipRelay) bridgeStunTurnTcpToUdp(client net.Conn, br *bufio.Reader, liveCtx context.Context, liveDialer udpDialer, targetIP netip.Addr) {
+	pConn, err := openFullConePacketConn(liveDialer, targetIP.Is6())
+	if err != nil {
+		r.relayTcpOverTunnel(client, br, liveCtx, liveDialer, targetIP)
+		return
+	}
+
+	udpSocketsOpened.Add(1)
+	activeUdpAssocs.Add(1)
+	defer activeUdpAssocs.Add(-1)
+	defer pConn.Close()
+
+	stopBridge := make(chan struct{})
+	defer close(stopBridge)
+	go func() {
+		select {
+		case <-r.ctx.Done():
+			_ = client.Close()
+			_ = pConn.Close()
+		case <-stopBridge:
+		}
+	}()
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		rBufPtr := udpFrameBufPool.Get().(*[]byte)
+		defer udpFrameBufPool.Put(rBufPtr)
+		respBuf := *rBufPtr
+
+		for {
+			rn, _, rErr := pConn.ReadFrom(respBuf)
+			if rErr != nil {
+				_ = client.Close()
+				return
+			}
+			if rn <= 0 {
+				continue
+			}
+			r.lastActive.Store(time.Now().UnixNano())
+			r.udpPktsRx.Add(1)
+			udpPacketsRx.Add(1)
+			recordClientRx(r.statEnt, rn)
+
+			// AsyncStunTCPSocket expects 4-byte padded ChannelData frames over TCP (RFC 5766 §11.4).
+			var outFrame []byte
+			if rn >= 4 && (respBuf[0]&0xC0) == 0x40 {
+				cLen := int(binary.BigEndian.Uint16(respBuf[2:4]))
+				if 4+cLen <= rn {
+					pad := (4 - (cLen % 4)) % 4
+					if 4+cLen+pad <= len(respBuf) {
+						for p := 0; p < pad; p++ {
+							respBuf[4+cLen+p] = 0
+						}
+						outFrame = respBuf[:4+cLen+pad]
+					}
+				}
+			}
+			if outFrame == nil {
+				outFrame = respBuf[:rn]
+			}
+			_ = client.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if wErr := writeAllVoipConn(client, outFrame); wErr != nil {
+				_ = pConn.Close()
+				return
+			}
+		}
+	}()
+
+	dstAddr := &net.UDPAddr{
+		IP:   net.IP(targetIP.AsSlice()),
+		Port: r.targetPort,
+	}
+	frameBuf := make([]byte, 16384+32)
+	hdr := frameBuf[:4]
+	for {
+		_ = client.SetReadDeadline(time.Now().Add(voipRelayIdleTTL))
+		if _, rErr := io.ReadFull(br, hdr); rErr != nil {
+			break
+		}
+		msgLen := int(binary.BigEndian.Uint16(hdr[2:4]))
+		if msgLen > 16384 {
+			break
+		}
+		tcpRem, udpLen := -1, 0
+		switch hdr[0] & 0xC0 {
+		case 0x00:
+			if msgLen%4 == 0 {
+				tcpRem = 16 + msgLen
+				udpLen = 20 + msgLen
+			}
+		case 0x40:
+			tcpRem = (msgLen + 3) &^ 3
+			udpLen = 4 + msgLen
+		}
+		if tcpRem < 0 || 4+tcpRem > len(frameBuf) {
+			break
+		}
+		_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
+		if _, rErr := io.ReadFull(br, frameBuf[4:4+tcpRem]); rErr != nil {
+			break
+		}
+		r.lastActive.Store(time.Now().UnixNano())
+		nw, wErr := pConn.WriteTo(frameBuf[:udpLen], dstAddr)
+		if wErr != nil {
+			r.udpErrs.Add(1)
+			udpSendErrors.Add(1)
+			continue
+		}
+		r.udpPktsTx.Add(1)
+		udpPacketsTx.Add(1)
+		recordClientTx(r.statEnt, nw)
+	}
+	_ = client.Close()
+	_ = pConn.Close()
+	<-done
+}
+
+func (r *voipRelay) handleTcpClient(client net.Conn) {
+	defer client.Close()
+	r.lastActive.Store(time.Now().UnixNano())
+
+	br := bufio.NewReaderSize(client, 8192)
+	_ = client.SetReadDeadline(time.Now().Add(750 * time.Millisecond))
+	peek, _ := br.Peek(8)
+	_ = client.SetReadDeadline(time.Time{})
+
+	liveCtx, liveDialer, _ := r.getLiveDialer()
+	if !awaitHandshakeReadyOrFail(liveCtx, liveDialer, 2500*time.Millisecond) {
+		return
+	}
+
+	targetIP, resErr := resolveUdpTargetIP(liveCtx, liveDialer, r.targetHost, r.dnsCache, &r.dnsMu)
+	if resErr != nil {
+		return
+	}
+
+	if len(peek) >= 8 && (peek[0]&0xC0) == 0x00 && binary.BigEndian.Uint32(peek[4:8]) == 0x2112A442 {
+		r.bridgeStunTurnTcpToUdp(client, br, liveCtx, liveDialer, targetIP)
+		return
+	}
+	r.relayTcpOverTunnel(client, br, liveCtx, liveDialer, targetIP)
 }

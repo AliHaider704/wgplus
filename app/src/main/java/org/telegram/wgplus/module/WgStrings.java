@@ -12,7 +12,7 @@ public final class WgStrings {
 
     public static final String LANG_AR = "ar";
     public static final String LANG_EN = "en";
-    public static final String VERSION_LABEL = "2.0.0";
+    public static final String VERSION_LABEL = "2.0.3";
 
     private static final Map<String, String> AR_COUNTRIES = new HashMap<>();
 
@@ -1542,5 +1542,69 @@ public final class WgStrings {
         return ar
                 ? "تم إرسال تقرير قبل لحظات. انتظر بضع ثوانٍ ثم حاول مجدد\u064B\u0627."
                 : "A report was just sent. Wait a few seconds before sending again.";
+    }
+
+    public static String standaloneBindTelegramBtn(boolean ar) {
+        return ar
+                ? "ربط تيليجرام تلقائي\u064B\u0627 بالبروكسي (بدون روت)"
+                : "Bind Telegram to Proxy (1-Tap, No Root)";
+    }
+
+    public static String standaloneBindTelegramToast(boolean ar) {
+        return ar
+                ? "تم فتح ربط البروكسي داخل تيليجرام؛ اضغط تفعيل البروكسي."
+                : "Opened proxy link in Telegram; tap Enable Proxy.";
+    }
+
+    public static String allowUnrestrictedBatteryBtn(boolean ar) {
+        return ar
+                ? "إلغاء تقييد البطارية للعمل 24/7"
+                : "Allow Unrestricted 24/7 Battery";
+    }
+
+    public static String pendingClientApprovalTitle(boolean ar, boolean certChanged) {
+        if (certChanged) {
+            return ar
+                    ? "تغيّرت شهادة توقيع تطبيق تيليجرام"
+                    : "Telegram Client Signing Certificate Changed";
+        }
+        return ar
+                ? "طلب ربط تطبيق تيليجرام بشهادة غير معروفة"
+                : "Telegram Client Requests Trust Approval";
+    }
+
+    public static String pendingClientApprovalDesc(boolean ar, String pkg, String certPrefix, boolean certChanged) {
+        if (ar) {
+            String warn = certChanged
+                    ? "تنبيه: بصمة الشهادة الجديدة مختلفة عن البصمة المعتمدة سابق\u064B\u0627 لهذا التطبيق. "
+                    : "";
+            return warn + "الحزمة " + ltr(pkg) + " تطلب الوصول إلى نفق وايرجارد المحلي ببصمة توقيع "
+                    + ltr(certPrefix + "...") + ". إذا لم تقم بتعديلها أو تثبيتها بنفسك فاختر رفض.";
+        }
+        String warn = certChanged
+                ? "Warning: this signing fingerprint differs from the previously approved certificate. "
+                : "";
+        return warn + "Package " + pkg + " (cert " + certPrefix
+                + "...) requested local tunnel access. Reject if you did not install or patch this build.";
+    }
+
+    public static String approveClientBtn(boolean ar) {
+        return ar ? "اعتماد التطبيق" : "Approve client";
+    }
+
+    public static String rejectClientBtn(boolean ar) {
+        return ar ? "رفض" : "Reject";
+    }
+
+    public static String clientApprovedToast(boolean ar, String pkg) {
+        return ar
+                ? "تم اعتماد شهادة " + ltr(pkg) + "."
+                : "Approved signing certificate for " + pkg + ".";
+    }
+
+    public static String clientRejectedToast(boolean ar, String pkg) {
+        return ar
+                ? "تم رفض وحظر الشهادة غير المعتمدة للحزمة " + ltr(pkg) + "."
+                : "Rejected untrusted signing certificate for " + pkg + ".";
     }
 }

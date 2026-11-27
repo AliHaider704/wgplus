@@ -157,3 +157,26 @@ func TestMonitorStallRecoveryResetsCounterWhenForceRebindSucceeds(t *testing.T) 
 		t.Fatalf("expected ForceRebind recovery to prevent unnecessary backup switchover")
 	}
 }
+
+func TestMonitorQuiescentWhileHostOffline(t *testing.T) {
+	var rebindCalls atomic.Int32
+	var probeCalls atomic.Int32
+	m := NewMonitor(Dependencies{
+		IsRunning:       func() bool { return true },
+		HasNetwork:      func() bool { return false },
+		TunnelUptime:    func() time.Duration { return 30 * time.Second },
+		SnapshotStats:   func() (int64, uint64) { return 300, 4096 },
+		ForceRebind:     func() bool { rebindCalls.Add(1); return true },
+		IsAutoFailover:  func() bool { return true },
+		ListProfiles:    func() (string, []config.ServerProfile) { return "a", []config.ServerProfile{{ID: "a"}, {ID: "b"}} },
+		ProbeProfile:    func(_ context.Context, _ config.ServerProfile) (int, error) { probeCalls.Add(1); return 10, nil },
+		SwitchToProfile: func(_ string) error { return nil },
+	}, time.Second)
+
+	m.Step(context.Background())
+	m.Step(context.Background())
+	m.Step(context.Background())
+	if rebindCalls.Load() != 0 || probeCalls.Load() != 0 {
+		t.Fatalf("expected 0 rebinds/probes while offline, got rebind=%d probe=%d", rebindCalls.Load(), probeCalls.Load())
+	}
+}

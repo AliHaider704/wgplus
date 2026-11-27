@@ -21,10 +21,12 @@ import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.security.MessageDigest;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -44,6 +46,7 @@ public class KeepaliveStatusProvider extends ContentProvider {
 
     // Privileged headless automation APIs (shell/root callers only)
     public static final String METHOD_AUTOMATION_STATUS = "automation_status";
+    public static final String METHOD_AUTOMATION_VERIFY = "automation_verify";
     public static final String METHOD_AUTOMATION_QUICK_WARP = "automation_quick_warp";
     public static final String METHOD_AUTOMATION_IMPORT_CONF = "automation_import_conf";
     public static final String METHOD_AUTOMATION_CLEAN_CACHE = "automation_clean_cache";
@@ -272,9 +275,12 @@ public class KeepaliveStatusProvider extends ContentProvider {
                 int uid = extras.getInt("uid", -1);
                 int tx = extras.getInt("tx", -1);
                 String token = extras.getString("token", "");
-                PrivilegeBridge.registerDaemonEndpoint(ctx, port, pid, uid, tx, token);
+                String resolvedToken = PrivilegeBridge.mintOrUpdateDaemonEndpoint(ctx, port, pid, uid, tx, token);
                 Bundle out = new Bundle();
-                out.putBoolean("registered", port > 0 && !token.isEmpty());
+                out.putBoolean("registered", port > 0 && !resolvedToken.isEmpty());
+                if (!resolvedToken.isEmpty()) {
+                    out.putString("token", resolvedToken);
+                }
                 return out;
             }
             return null;
@@ -437,6 +443,12 @@ public class KeepaliveStatusProvider extends ContentProvider {
             }
             return handleAutomationStatus(ctx);
         }
+        if (METHOD_AUTOMATION_VERIFY.equals(method)) {
+            if (!isPrivilegedCaller()) {
+                return null;
+            }
+            return handleAutomationVerify(ctx);
+        }
         if (METHOD_AUTOMATION_QUICK_WARP.equals(method)) {
             if (!isPrivilegedCaller()) {
                 return null;
@@ -535,6 +547,58 @@ public class KeepaliveStatusProvider extends ContentProvider {
         return out;
     }
 
+    private static Bundle handleAutomationVerify(Context ctx) {
+        Bundle out = new Bundle();
+        try {
+            String apkPath = ctx != null && ctx.getApplicationInfo() != null ? ctx.getApplicationInfo().sourceDir : null;
+            try {
+                NativeBridgeLoader.ensureLoaded(ctx, apkPath);
+            } catch (Throwable ignored) {
+            }
+            int port = WireGuardManager.getActivePort(ctx, apkPath);
+            android.content.SharedPreferences sp = ctx != null
+                    ? ctx.getSharedPreferences("wgplus_shared_tunnel", Context.MODE_PRIVATE)
+                    : null;
+            if (port <= 0 && sp != null) {
+                port = sp.getInt("port", 0);
+            }
+            String spPass = sp != null ? sp.getString("socksPass", "") : "";
+            String probePass = !spPass.isEmpty() ? spPass : WireGuardManager.getActiveSocksPass(ctx);
+            String probeUser = WireGuardManager.getActiveSocksUser(ctx);
+
+            JSONObject obj = new JSONObject();
+            obj.put("version", WgStrings.VERSION_LABEL);
+            obj.put("port", port);
+            if (port > 0) {
+                String verifyRaw = "";
+                try {
+                    verifyRaw = wgbridge.Wgbridge.verifyRouteAndCallsJSON(port, probeUser, probePass);
+                } catch (Throwable t) {
+                    obj.put("verifyError", String.valueOf(t.getMessage()));
+                }
+                if (verifyRaw != null && !verifyRaw.trim().isEmpty()) {
+                    try {
+                        obj.put("verify", new JSONObject(verifyRaw));
+                    } catch (Throwable ignored) {
+                        obj.put("verifyRaw", verifyRaw);
+                    }
+                }
+                String diagRaw = WgSharedHubAndVoip.fetchRemoteEngineDiagnosticsBundle(ctx, apkPath, port);
+                if (diagRaw != null && !diagRaw.trim().isEmpty()) {
+                    try {
+                        obj.put("remoteDiag", new JSONObject(diagRaw));
+                    } catch (Throwable ignored) {
+                        obj.put("remoteDiagRaw", diagRaw);
+                    }
+                }
+            }
+            out.putString(RESULT_JSON, obj.toString());
+        } catch (Throwable t) {
+            out.putString(RESULT_JSON, "{\"error\":\"" + String.valueOf(t.getMessage()).replace("\"", "'") + "\"}");
+        }
+        return out;
+    }
+
     private static Bundle handleAutomationQuickWarp(Context ctx, Bundle extras) {
         Bundle out = new Bundle();
         try {
@@ -597,13 +661,51 @@ public class KeepaliveStatusProvider extends ContentProvider {
     }
 
     private static final String CERT_PINS_PREFS = "wg_plus_trusted_caller_certs";
-    // Known official SHA-256 signing certificate digests (lowercase hex, no colons).
+    private static final String KEY_APPROVED_PREFIX = "approved_cert_";
+    private static final String KEY_PENDING_PREFIX = "pending_cert_";
+    private static final String KEY_PENDING_TS_PREFIX = "pending_ts_";
+    private static final String KEY_REJECTED_PREFIX = "rejected_cert_";
+    // Cryptographically verified via apksigner --print-certs on device/GitHub APKs or APKMirror records (sha256, lowercase hex).
     private static final Set<String> KNOWN_OFFICIAL_CERTS = new HashSet<>(Arrays.asList(
-            // Official Telegram (Play / Direct)
+            // Official Telegram Google Play (org.telegram.messenger)
             "496b68c0f0e38839e141ef48b636260b8215c255a0e7aa80147f9bb2e149c173",
-            // Telegram X (Challegram)
-            "b577c8d6f67d2eb1e837e89695993055fd9b9f5fc47f2a0fa5d9de2fb489a385"
+            // Official Telegram Direct / Web / Beta (org.telegram.messenger.web, .beta; CN=Nikolay Kudashov, O=VK; apksigner + APKMirror)
+            "49c1522548ebacd46ce322b6fd47f6092bb745d0f88082145caf35e14dcc38e1",
+            // Plus Messenger (org.telegram.plus; CN=rafalense; apksigner on device + APKMirror)
+            "6ebb622268aad319dbe8a1f414837d2843a9b35856aefb7dee2971a3d493f276",
+            // Telegram X (org.thunderdog.challegram; APKMirror)
+            "b577c8d6f67d2eb1e837e89695993055fd9b9f5fc47f2a0fa5d9de2fb489a385",
+            // Nicegram (app.nicegram; Play App Signing; APKMirror)
+            "bce0abdcc35da8b05c8824dc602811717cf9e8facf470ad6b2e4c049a7f3a0ca",
+            // Graph Messenger / Telegraph (ir.ilmili.telegraph; CN=Masoud BH, O=ilmili; APKMirror)
+            "e7d5ad736aeecd2fe237679e4deaf2a40bb32fc07837fe48778a5b41c0418862",
+            // Nekogram v13.2.2 (Nekogram-13.2.2-7303-armeabi-v7a.apk; apksigner)
+            "5ce932b970199fbda2aae7bf21e1ad9e70b0809a7b1ac94c0699f5d5ada83313",
+            // Nagram v13.1.1.1258 (Nagram-v13.1.1.1258-armeabi-v7a.apk; apksigner)
+            "88a8afe3ccbee080c13b73832aab8c98a9f19d1c65f3bcfd50b8d01c0bc80e9e",
+            // exteraGram v13.2.2 (exteraGram-lite-universal-20261124.apk; apksigner)
+            "f1a56d605801a6a73d7270f7ce5a9b126e6669955d2536011dfb20f5f15bf754",
+            // Cherrygram 11.6.0 (Cherrygram-11.6.0-TG-13.2.2-armeabi-v7a.apk; apksigner)
+            "a9d5ba4a1aa06b969bfec97b557183160c856f1e1401d756a043af110dddc71f",
+            // OctoGram v3.5.1_3801 (OctoGram_arm32.apk; apksigner)
+            "9bd25f08e031a7c878f468336795191adb23ad8044c1ace4c7cf0f34cdf8d4cd",
+            // Forkgram 13.2.3.0 (ForkClient.13.2.3.0.apk; apksigner)
+            "0880f186d777f3cb6d82a66d02bd58850e3a270a26b678175459a95511235ae5"
     ));
+
+    public static final class PendingClientApproval {
+        public final String pkg;
+        public final String certSha256;
+        public final boolean certChanged;
+        public final long requestedAtMs;
+
+        PendingClientApproval(String pkg, String certSha256, boolean certChanged, long requestedAtMs) {
+            this.pkg = pkg;
+            this.certSha256 = certSha256;
+            this.certChanged = certChanged;
+            this.requestedAtMs = requestedAtMs;
+        }
+    }
 
     private static boolean isPrivilegedCaller() {
         int caller = Binder.getCallingUid();
@@ -634,67 +736,180 @@ public class KeepaliveStatusProvider extends ContentProvider {
                     return p;
                 }
             }
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            WgDiagnosticsLog.handleCriticalCatch("SEC", "PROVIDER_VERIFY_ERR", t);
         }
         return null;
     }
 
-    private static boolean isSupportedTelegramPackage(String pkg) {
-        if (pkg == null || pkg.isEmpty()) {
-            return false;
+    static boolean isSupportedTelegramPackage(String pkg) {
+        return pkg != null && ContinuityBridgeManager.DEFAULT_TARGET_PACKAGES.contains(pkg);
+    }
+
+    /**
+     * Explicit trust evaluator (no silent TOFU and no auto-repin on package updates).
+     * Returns 0 = deny (requires explicit user approval in module UI), 1 = allow.
+     */
+    static int evaluateCallerTrustDecision(
+            String pkg,
+            String certHash,
+            String ownCertHash,
+            String userApprovedCert
+    ) {
+        if (!isSupportedTelegramPackage(pkg) || certHash == null || certHash.isEmpty()) {
+            return 0;
         }
-        for (String target : ContinuityBridgeManager.DEFAULT_TARGET_PACKAGES) {
-            if (target.equals(pkg)) {
-                return true;
-            }
+        if (KNOWN_OFFICIAL_CERTS.contains(certHash)) {
+            return 1;
         }
-        String low = pkg.toLowerCase(Locale.US);
-        return low.startsWith("org.telegram.")
-                || low.startsWith("com.radolyn.")
-                || low.startsWith("xyz.nextalone.")
-                || low.contains("gram")
-                || low.contains("telegraph");
+        if (ownCertHash != null && !ownCertHash.isEmpty() && ownCertHash.equals(certHash)) {
+            return 1;
+        }
+        if (userApprovedCert != null && !userApprovedCert.isEmpty() && userApprovedCert.equals(certHash)) {
+            return 1;
+        }
+        return 0;
     }
 
     static boolean verifyPackageSigningTrust(Context ctx, PackageManager pm, String pkg) {
-        if (ctx == null || pm == null || pkg == null || pkg.isEmpty()) {
+        if (ctx == null || pm == null || !isSupportedTelegramPackage(pkg)) {
             return false;
         }
         String certHash = computePrimarySigningCertSha256(pm, pkg);
-        if (certHash.isEmpty()) {
-            // Under Android 11+ <queries> visibility filtering, unlisted fork packages may not expose certs
-            // to PackageManager even though Binder.getCallingUid() already verified UID ownership of pkg.
-            return isSupportedTelegramPackage(pkg) && Binder.getCallingUid() >= Process.FIRST_APPLICATION_UID;
-        }
-        if (KNOWN_OFFICIAL_CERTS.contains(certHash)) {
-            return true;
-        }
-        // Own module signature (self-signed or matched build)
         String ownCert = computePrimarySigningCertSha256(pm, ctx.getPackageName());
-        if (!ownCert.isEmpty() && ownCert.equals(certHash)) {
+        boolean hasLauncher = hasLauncherEntryActivity(pm, pkg);
+
+        SharedPreferences pins = ctx.getSharedPreferences(CERT_PINS_PREFS, Context.MODE_PRIVATE);
+        String approved = pins.getString(KEY_APPROVED_PREFIX + pkg, "");
+        String rejected = pins.getString(KEY_REJECTED_PREFIX + pkg, "");
+
+        int decision = evaluateCallerTrustDecision(pkg, certHash, ownCert, approved);
+        if (decision > 0) {
+            if (pins.contains(KEY_PENDING_PREFIX + pkg)) {
+                pins.edit()
+                        .remove(KEY_PENDING_PREFIX + pkg)
+                        .remove(KEY_PENDING_TS_PREFIX + pkg)
+                        .apply();
+            }
             return true;
         }
-        // Allow genuine Telegram/LSPatch clients declaring a real launcher entry or matching UID ownership,
-        // refreshing the TOFU record seamlessly when LSPatch APKs are reinstalled or re-signed.
-        if (!hasLauncherEntryActivity(pm, pkg)) {
+
+        if (!certHash.isEmpty() && hasLauncher && !certHash.equals(rejected)) {
+            String prevPending = pins.getString(KEY_PENDING_PREFIX + pkg, "");
+            if (!certHash.equals(prevPending)) {
+                pins.edit()
+                        .putString(KEY_PENDING_PREFIX + pkg, certHash)
+                        .putLong(KEY_PENDING_TS_PREFIX + pkg, System.currentTimeMillis())
+                        .apply();
+                String code = (!approved.isEmpty() && !approved.equals(certHash))
+                        ? "CERT_PIN_MISMATCH"
+                        : "CERT_APPROVAL_REQUIRED";
+                WgDiagnosticsLog.record("SEC", code,
+                        "pkg=" + pkg + " cert12=" + certHash.substring(0, Math.min(12, certHash.length())));
+            }
+        }
+        return false;
+    }
+
+    public static List<PendingClientApproval> getPendingClientApprovals(Context ctx) {
+        ArrayList<PendingClientApproval> list = new ArrayList<>();
+        if (ctx == null) {
+            return list;
+        }
+        try {
+            PackageManager pm = ctx.getPackageManager();
+            SharedPreferences pins = ctx.getSharedPreferences(CERT_PINS_PREFS, Context.MODE_PRIVATE);
+            Map<String, ?> all = pins.getAll();
+            if (all == null || all.isEmpty()) {
+                return list;
+            }
+            for (Map.Entry<String, ?> e : all.entrySet()) {
+                String k = e.getKey();
+                if (k == null || !k.startsWith(KEY_PENDING_PREFIX) || !(e.getValue() instanceof String)) {
+                    continue;
+                }
+                String pkg = k.substring(KEY_PENDING_PREFIX.length());
+                String pendingCert = ((String) e.getValue()).trim().toLowerCase(Locale.US);
+                if (!isSupportedTelegramPackage(pkg) || pendingCert.length() != 64) {
+                    pins.edit().remove(k).remove(KEY_PENDING_TS_PREFIX + pkg).apply();
+                    continue;
+                }
+                if (pm != null && !isPackageInstalled(pm, pkg)) {
+                    pins.edit().remove(k).remove(KEY_PENDING_TS_PREFIX + pkg).apply();
+                    continue;
+                }
+                String approved = pins.getString(KEY_APPROVED_PREFIX + pkg, "");
+                if (approved.equals(pendingCert) || KNOWN_OFFICIAL_CERTS.contains(pendingCert)) {
+                    pins.edit().remove(k).remove(KEY_PENDING_TS_PREFIX + pkg).apply();
+                    continue;
+                }
+                long ts = pins.getLong(KEY_PENDING_TS_PREFIX + pkg, 0L);
+                boolean certChanged = !approved.isEmpty() && !approved.equals(pendingCert);
+                list.add(new PendingClientApproval(pkg, pendingCert, certChanged, ts));
+            }
+        } catch (Throwable t) {
+            WgDiagnosticsLog.handleCriticalCatch("SEC", "LIST_PENDING_CERTS_ERR", t);
+        }
+        return list;
+    }
+
+    public static void approveClientCertificate(Context ctx, String pkg, String certSha256) {
+        if (ctx == null || !isSupportedTelegramPackage(pkg) || !isValidSha256Hex(certSha256)) {
+            return;
+        }
+        String norm = certSha256.trim().toLowerCase(Locale.US);
+        SharedPreferences pins = ctx.getSharedPreferences(CERT_PINS_PREFS, Context.MODE_PRIVATE);
+        pins.edit()
+                .putString(KEY_APPROVED_PREFIX + pkg, norm)
+                .remove(KEY_PENDING_PREFIX + pkg)
+                .remove(KEY_PENDING_TS_PREFIX + pkg)
+                .remove(KEY_REJECTED_PREFIX + pkg)
+                .apply();
+        WgDiagnosticsLog.record("SEC", "CERT_USER_APPROVED",
+                "pkg=" + pkg + " cert12=" + norm.substring(0, 12));
+    }
+
+    public static void rejectClientCertificate(Context ctx, String pkg, String certSha256) {
+        if (ctx == null || !isSupportedTelegramPackage(pkg) || !isValidSha256Hex(certSha256)) {
+            return;
+        }
+        String norm = certSha256.trim().toLowerCase(Locale.US);
+        SharedPreferences pins = ctx.getSharedPreferences(CERT_PINS_PREFS, Context.MODE_PRIVATE);
+        pins.edit()
+                .putString(KEY_REJECTED_PREFIX + pkg, norm)
+                .remove(KEY_PENDING_PREFIX + pkg)
+                .remove(KEY_PENDING_TS_PREFIX + pkg)
+                .apply();
+        WgDiagnosticsLog.record("SEC", "CERT_USER_REJECTED",
+                "pkg=" + pkg + " cert12=" + norm.substring(0, 12));
+    }
+
+    private static boolean isValidSha256Hex(String s) {
+        if (s == null) {
             return false;
         }
-        long pkgUpdateTime = 0L;
-        try {
-            PackageInfo pi = pm.getPackageInfo(pkg, 0);
-            if (pi != null) {
-                pkgUpdateTime = pi.lastUpdateTime;
-            }
-        } catch (Throwable ignored) {
+        String trimmed = s.trim();
+        if (trimmed.length() != 64) {
+            return false;
         }
-        SharedPreferences pins = ctx.getSharedPreferences(CERT_PINS_PREFS, Context.MODE_PRIVATE);
-        String key = "cert_" + pkg;
-        String updKey = "upd_" + pkg;
-        String pinned = pins.getString(key, "");
-        if (pinned == null || !pinned.equals(certHash)) {
-            pins.edit().putString(key, certHash).putLong(updKey, pkgUpdateTime).apply();
+        for (int i = 0; i < trimmed.length(); i++) {
+            char c = trimmed.charAt(i);
+            boolean hex = (c >= '0' && c <= '9')
+                    || (c >= 'a' && c <= 'f')
+                    || (c >= 'A' && c <= 'F');
+            if (!hex) {
+                return false;
+            }
         }
         return true;
+    }
+
+    private static boolean isPackageInstalled(PackageManager pm, String pkg) {
+        try {
+            return pm.getPackageInfo(pkg, 0) != null;
+        } catch (Throwable ignored) {
+            return false;
+        }
     }
 
     private static boolean hasLauncherEntryActivity(PackageManager pm, String pkg) {
@@ -712,38 +927,41 @@ public class KeepaliveStatusProvider extends ContentProvider {
     @SuppressWarnings("deprecation")
     private static String computePrimarySigningCertSha256(PackageManager pm, String pkg) {
         try {
-            Signature[] sigs = null;
+            Signature activeSig = null;
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                 PackageInfo pi = pm.getPackageInfo(pkg, PackageManager.GET_SIGNING_CERTIFICATES);
                 if (pi != null && pi.signingInfo != null) {
                     SigningInfo si = pi.signingInfo;
-                    sigs = si.hasMultipleSigners()
-                            ? si.getApkContentsSigners()
-                            : si.getSigningCertificateHistory();
+                    Signature[] signers = si.getApkContentsSigners();
+                    if (signers != null && signers.length > 0 && signers[0] != null) {
+                        activeSig = signers[0];
+                    } else {
+                        Signature[] history = si.getSigningCertificateHistory();
+                        if (history != null && history.length > 0) {
+                            activeSig = history[history.length - 1];
+                        }
+                    }
                 }
             } else {
                 PackageInfo pi = pm.getPackageInfo(pkg, PackageManager.GET_SIGNATURES);
-                if (pi != null) {
-                    sigs = pi.signatures;
+                if (pi != null && pi.signatures != null && pi.signatures.length > 0) {
+                    activeSig = pi.signatures[0];
                 }
             }
-            if (sigs == null || sigs.length == 0 || sigs[0] == null) {
+            if (activeSig == null) {
                 return "";
             }
             MessageDigest md = MessageDigest.getInstance("SHA-256");
-            byte[] digest = md.digest(sigs[0].toByteArray());
+            byte[] digest = md.digest(activeSig.toByteArray());
             StringBuilder hex = new StringBuilder(digest.length * 2);
             for (byte b : digest) {
                 hex.append(String.format(Locale.US, "%02x", b & 0xff));
             }
             return hex.toString();
-        } catch (Throwable ignored) {
+        } catch (Throwable t) {
+            WgDiagnosticsLog.handleCriticalCatch("SEC", "CERT_HASH_ERR", t);
             return "";
         }
-    }
-
-    private static boolean isTrustedSyncCaller(Context ctx) {
-        return resolveVerifiedCallerPackage(ctx, "") != null;
     }
 
     private static Bundle toBundle(Context ctx, ContinuityBridgeManager.StealthSnapshot snap) {
@@ -762,7 +980,7 @@ public class KeepaliveStatusProvider extends ContentProvider {
         return b;
     }
 
-    private static String sanitizePackageName(String pkg) {
+    static String sanitizePackageName(String pkg) {
         if (pkg == null) {
             return "";
         }

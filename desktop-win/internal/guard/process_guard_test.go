@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestResolveTcpPeerPidAndStrictAllowlist(t *testing.T) {
@@ -168,9 +169,84 @@ func TestDefaultAllowedTelegramForksRecognized(t *testing.T) {
 			t.Fatalf("expected %q to be in default allowlisted fork names", exe)
 		}
 	}
-	for _, pub := range []string{"exteraGram", "Cherrygram", "materialgram", "Nicegram"} {
+	for _, pub := range []string{"exteraGram", "Cherrygram", "materialgram", "Nicegram", "iMe Messenger"} {
 		if !isTrustedTelegramPublisher(pub, `C:\Apps\client.exe`) {
 			t.Fatalf("expected publisher %q to be trusted", pub)
 		}
 	}
+	for _, spoofPub := range []string{"Sublime HQ Pty Ltd", "Prime Video", "Mimecast Services", "Time Inc", "Microsoft Corporation"} {
+		if isTrustedTelegramPublisher(spoofPub, `C:\Users\Victim\AppData\Local\Temp\windowsapps\Telegram.exe`) {
+			t.Fatalf("expected publisher %q in spoofed path to be REJECTED", spoofPub)
+		}
+	}
+	if !isTrustedTelegramPublisher("Microsoft Corporation", `C:\Program Files\WindowsApps\TelegramMessengerLLP.TelegramDesktop_5.0_x64__t4vj0pshhgkwm\Telegram.exe`) {
+		t.Fatal("expected legitimate WindowsApps Telegram Store binary to be trusted")
+	}
+
+	const curlSrc = `C:\Windows\System32\curl.exe`
+	if data, err := os.ReadFile(curlSrc); err == nil {
+		fakeStoreDir := filepath.Join(t.TempDir(), "windowsapps")
+		if err := os.MkdirAll(fakeStoreDir, 0o755); err == nil {
+			fakeStoreExe := filepath.Join(fakeStoreDir, "Telegram.exe")
+			if wErr := os.WriteFile(fakeStoreExe, data, 0o755); wErr == nil {
+				if pg.isAllowedProcess(99999, fakeStoreExe, "Telegram.exe") {
+					t.Fatalf("expected spoofed Temp\\windowsapps\\Telegram.exe signed by Microsoft to be BLOCKED")
+				}
+			}
+		}
+	}
 }
+
+func TestAuthenticodeCacheInvalidatesOnFileChangeAndNeverPinsPath(t *testing.T) {
+	pg := NewProcessGuard()
+	fPath := filepath.Join(t.TempDir(), "Telegram.exe")
+	if err := os.WriteFile(fPath, []byte("unsigned-v1"), 0o755); err != nil {
+		t.Fatalf("WriteFile v1: %v", err)
+	}
+	norm := strings.ToLower(filepath.Clean(fPath))
+
+	if pg.verifyAuthenticodeCached(fPath, norm) {
+		t.Fatal("expected unsigned v1 to fail Authenticode verification")
+	}
+	if pg.allowedPaths[norm] {
+		t.Fatal("verifyAuthenticodeCached must not mutate allowedPaths")
+	}
+	firstEnt, ok := pg.verifiedSigCache[norm]
+	if !ok || firstEnt.valid || firstEnt.sha256Hex == "" {
+		t.Fatalf("expected cached invalid entry with sha256 for v1, got ok=%v ent=%+v", ok, firstEnt)
+	}
+
+	// Simulate same-size replacement while preserving exact mtime via Chtimes (stomp bypass test).
+	st1, err := os.Stat(fPath)
+	if err != nil {
+		t.Fatalf("Stat v1: %v", err)
+	}
+	if err := os.WriteFile(fPath, []byte("unsigned-vX"), 0o755); err != nil {
+		t.Fatalf("WriteFile vX: %v", err)
+	}
+	_ = os.Chtimes(fPath, st1.ModTime(), st1.ModTime())
+
+	if pg.verifyAuthenticodeCached(fPath, norm) {
+		t.Fatal("expected same-size Chtimes-stomped file to fail")
+	}
+	stompedEnt := pg.verifiedSigCache[norm]
+	if stompedEnt.sha256Hex == firstEnt.sha256Hex {
+		t.Fatalf("expected sha256 cache entry to refresh even when size and mtime matched")
+	}
+
+	// Simulate file replacement on disk (different size and mtime)
+	if err := os.WriteFile(fPath, []byte("unsigned-v2-different-size"), 0o755); err != nil {
+		t.Fatalf("WriteFile v2: %v", err)
+	}
+	future := time.Now().Add(2 * time.Second)
+	_ = os.Chtimes(fPath, future, future)
+
+	if pg.verifyAuthenticodeCached(fPath, norm) {
+		t.Fatal("expected modified unsigned v2 to re-evaluate and fail")
+	}
+	secondEnt := pg.verifiedSigCache[norm]
+	if secondEnt.size == stompedEnt.size && secondEnt.modUnixNano == stompedEnt.modUnixNano {
+		t.Fatalf("expected cache entry to refresh after file change: prev=%+v second=%+v", stompedEnt, secondEnt)
+	}
+}
+

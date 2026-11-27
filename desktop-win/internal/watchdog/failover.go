@@ -12,6 +12,7 @@ import (
 // Dependencies abstracts tunnel health checks, rebinding, probing, and switching for testability.
 type Dependencies struct {
 	IsRunning            func() bool
+	HasNetwork           func() bool
 	TunnelUptime         func() time.Duration
 	SnapshotStats        func() (handshakeAgeSec int64, txBytes uint64)
 	SnapshotTrafficStats func() (handshakeAgeSec int64, rxBytes uint64, txBytes uint64)
@@ -71,6 +72,12 @@ func (m *Monitor) Step(ctx context.Context) {
 		m.consecutiveStall = 0
 		m.lastRxBytes = 0
 		m.lastTxBytes = 0
+		m.mu.Unlock()
+		return
+	}
+	if m.deps.HasNetwork != nil && !m.deps.HasNetwork() {
+		m.mu.Lock()
+		m.consecutiveStall = 0
 		m.mu.Unlock()
 		return
 	}

@@ -84,6 +84,7 @@ public final class WgKeystoreCrypto {
                                 + b64Encode(cipherBytes);
                     }
                 } catch (Throwable t) {
+                    WgDiagnosticsLog.handleCriticalCatch("CRYPTO", "KEYSTORE_ENCRYPT_RETRY", t);
                     Log.w(TAG, "Keystore encrypt attempt " + (attempt + 1) + " failed: " + t.getMessage());
                     if (attempt == 0) {
                         deleteBrokenKeystoreAlias();
@@ -119,6 +120,7 @@ public final class WgKeystoreCrypto {
             try {
                 return decryptWithKey(stored.substring(PREFIX_V1.length()), loadKeystoreKey());
             } catch (Throwable t) {
+                WgDiagnosticsLog.handleCriticalCatch("CRYPTO", "KEYSTORE_V1_DECRYPT_FAIL", t);
                 Log.w(TAG, "Keystore v1 decrypt failed: " + t.getMessage());
                 return "";
             }
@@ -127,6 +129,7 @@ public final class WgKeystoreCrypto {
             try {
                 return decryptWithKey(stored.substring(PREFIX_V2.length()), getOrCreateSoftwareKey());
             } catch (Throwable t) {
+                WgDiagnosticsLog.handleCriticalCatch("CRYPTO", "SW_V2_DECRYPT_FAIL", t);
                 Log.w(TAG, "Software v2 decrypt failed: " + t.getMessage());
                 return "";
             }

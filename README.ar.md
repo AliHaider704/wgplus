@@ -26,19 +26,19 @@
 
 <div dir="rtl">
 
-[![CI](https://github.com/AliHaider704/wgplus/actions/workflows/ci.yml/badge.svg?branch=qa/v2.0.0-cloud-verify)](https://github.com/AliHaider704/wgplus/actions/workflows/ci.yml) [![Test Lab](https://github.com/AliHaider704/wgplus/actions/workflows/firebase-test-lab.yml/badge.svg?branch=qa/v2.0.0-cloud-verify)](docs/QA_PIPELINE.md) [Privacy](docs/PRIVACY.md) | [FAQ](docs/FAQ.md)
+[![CI](https://github.com/AliHaider704/wgplus/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/AliHaider704/wgplus/actions/workflows/ci.yml) [![Test Lab](https://github.com/AliHaider704/wgplus/actions/workflows/firebase-test-lab.yml/badge.svg?branch=main)](docs/QA_PIPELINE.md) [Privacy](docs/PRIVACY.md) | [FAQ](docs/FAQ.md)
 
-## التحميل (`v2.0.0`)
+## التحميل (`v2.0.3`)
 
 | المنصة | رابط التحميل | المتطلبات | الملاحظات |
 |--------|--------------|-----------|-----------|
-| **ويندوز (ملف `.exe` مفرد، `17.83 MB`)** | [`WireGuardPlus-Windows-x64.exe`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64.exe) | ويندوز 10/11 (x64) | تشغيل مباشر، تشفير DPAPI، أيقونة شريط النظام، توجيه معزول للمكالمات |
-| **ويندوز المحمول (`.zip`، `6.87 MB`)** | [`WireGuardPlus-Windows-x64-Portable.zip`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64-Portable.zip) | ويندوز 10/11 (x64)، فلاش/مجلد | يحتوي `portable.flag`، حفظ محلي كامل بدون AppData |
-| **أندرويد ARM64 (`5.25 MB` - موصى به)** | [`WireGuardPlus-2.0.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-arm64-v8a.apk) | أندرويد 5.0+ (arm64-v8a) | بدون روت عبر LSPatch أو بالروت عبر LSPosed / Vector |
-| **أندرويد ARMv7 (`5.23 MB`)** | [`WireGuardPlus-2.0.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-armeabi-v7a.apk) | أندرويد 5.0+ (armeabi-v7a) | للأجهزة ذات معمارية 32 بت |
-| **أندرويد الشاملة (`11.53 MB`)** | [`WireGuardPlus-2.0.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0.apk) | أندرويد 5.0+ (arm64 + armv7a) | نسخة شاملة متوافقة مع التحديثات التلقائية |
+| **ويندوز (ملف `.exe` مفرد، `18.12 MB`)** | [`WireGuardPlus-Windows-x64.exe`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64.exe) | ويندوز 10/11 (x64) | تشغيل مباشر، تشفير DPAPI، أيقونة شريط النظام، توجيه معزول للمكالمات |
+| **ويندوز المحمول (`.zip`، `6.99 MB`)** | [`WireGuardPlus-Windows-x64-Portable.zip`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-Windows-x64-Portable.zip) | ويندوز 10/11 (x64)، فلاش/مجلد | يحتوي `portable.flag`، حفظ محلي كامل بدون AppData |
+| **أندرويد ARM64 (`5.29 MB` - موصى به)** | [`WireGuardPlus-2.0.3-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.3-arm64-v8a.apk) | أندرويد 5.0+ (arm64-v8a) | بدون روت عبر LSPatch أو التطبيق المستقل، أو بالروت عبر LSPosed / Vector |
+| **أندرويد ARMv7 (`5.27 MB`)** | [`WireGuardPlus-2.0.3-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.3-armeabi-v7a.apk) | أندرويد 5.0+ (armeabi-v7a) | للأجهزة ذات معمارية 32 بت |
+| **أندرويد الشاملة (`11.60 MB`)** | [`WireGuardPlus-2.0.3.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.3.apk) | أندرويد 5.0+ (arm64 + armv7a) | نسخة شاملة متوافقة مع التحديثات التلقائية |
 
-تحقق من تطابق الملفات عبر [`SHA256SUMS.txt`](https://github.com/AliHaider704/wgplus/releases/latest/download/SHA256SUMS.txt)، أو شاهد [فيديو الشرح (`MP4`)](https://github.com/AliHaider704/wgplus/releases/download/v1.7.3/WireGuardPlus-Windows-Walkthrough.mp4)، أو انضم إلى [قناة تيليجرام الرسمية](https://t.me/wgplus_official).
+تحقق من تطابق الملفات عبر [`SHA256SUMS-windows.txt`](https://github.com/AliHaider704/wgplus/releases/latest/download/SHA256SUMS-windows.txt) ([توقيع Ed25519 `.sig`](https://github.com/AliHaider704/wgplus/releases/latest/download/SHA256SUMS-windows.txt.sig))، أو شاهد [فيديو الشرح (`MP4`)](https://github.com/AliHaider704/wgplus/releases/download/v1.7.3/WireGuardPlus-Windows-Walkthrough.mp4)، أو انضم إلى [قناة تيليجرام الرسمية](https://t.me/wgplus_official).
 
 ---
 
@@ -129,8 +129,10 @@ flowchart LR
 - **عزل حقيقي داخل تيليجرام (بدون خانة VPN أو تعارض الشبكات):** يشغّل `wireguard-go` و`gVisor` في مساحة المستخدم (`desktopMode` يرفع طوابير النفق إلى `8192` وتجميع `128` حزمة ونوافذ TCP حتى `16 MB` على الكمبيوتر) بحيث لا يمر أي تطبيق آخر عبر النفق.
 - **تمويه AmneziaWG 1.0 / 1.5 (`I1`-`I5`) و Cloudflare WARP:** دعم كامل لقيم `Jc`/`Jmin`/`Jmax` و`S1`-`S4` و`H1`-`H4` وحزم التوقيع `I1`-`I5` (محاكاة QUIC) وبصمة `Reserved` لـ WARP مع زر **+ توليد WARP مجاني (AWG 1.5)** بضغطة واحدة على ويندوز.
 - **حماية مدرعة لمنفذ التوجيه والمفاتيح (`v1.9.0`):** على ويندوز، يجمع بين جدار `iphlpapi` والتحقق من توقيع Authenticode (`WinVerifyTrust`) ومصادقة RFC 1929 ومانع التسريب الصارم. وعلى أندرويد، يفرض مصادقة SOCKS5 محليًا، ويتحقق من شهادة توقيع التطبيقات المستدعية في `KeepaliveStatusProvider`، ويلغي التخزين النصي في `WgKeystoreCrypto` (`AndroidKeyStore` أو `0600` AES-256-GCM)، ويفرض منفذ الإغلاق `9` عند تفعيل مانع التسريب، ويشفّر النسخ الاحتياطي المصدّر بكلمة مرور (`wgplus-backup-v1`).
-- **مكالمات صوتية ومرئية مستقرة (`v1.9.0`):** على أندرويد، ينشئ ممرّات محلية مخصصة على `127.0.0.1` (`UDP`/`TCP` عبر `voip_relay.go`) لكل خادم مكالمة مع تعطيل P2P تلقائيًا. وعلى ويندوز، ينقل محول `WireGuardPlusCalls` (`Wintun v0.14.1`) حزم مكالمات تيليجرام فقط ضمن 9 نطاقات `IPv4` رسمية؛ مع إبقاء خيار **نظير لنظير: لا أحد** مفعلًا داخل تيليجرام لحماية عنوانك.
-- **DNS مشفر (DoH) وتشخيص الأخطاء عبر GitHub:** يدعم `1.1.1.1` و`1.0.0.1` و`8.8.8.8` و`9.9.9.9` أو رابط DoH مخصص مع رفض العناوين المزورة، ويفحص الـ IP الخارجي والدولة وسرعة مراكز بيانات تيليجرام `DC1/DC2/DC4/DC5` وجاهزية UDP، مع نسخ تقرير تشخيصي جاهز للإرسال عبر [نموذج بلاغات GitHub](.github/ISSUE_TEMPLATE/bug_report.yml).
+- **منظومة المستشعرات السيادية 24/7 والفتح الفوري `0ms` (`v2.0.3`):** يجدد مصافحة النفق استباقيًا في الخلفية عند `115` ثانية مع سبات ذكي `0% CPU` عند انقطاع الإنترنت، ويستعد مسبقًا فور إضاءة الشاشة على أندرويد وويندوز (`GUID_CONSOLE_DISPLAY_STATE`)، ويعطل خنق الطاقة `EcoQoS` على ويندوز 11، ويُلغي ومضة «في انتظار الشبكة» عند العودة للنفق الساخن، ويضبط تلقائيًا سقف `MTU 1200` فوق شبكات الـ VPN الخارجية، مع زر ربط `tg://socks` مباشر بضغطة واحدة بدون روت للنسخة المستقلة.
+- **مكالمات صوتية ومرئية مستقرة (`v2.0.3`):** على أندرويد، ينشئ ممرّات محلية مخصصة على `127.0.0.1` (`UDP`/`TCP` عبر `voip_relay.go`) مع جسر STUN/TURN TCP-إلى-UDP ونسخ بديلة متزامنة لكل خادم مكالمة مع تعطيل P2P تلقائيًا. وعلى ويندوز، ينقل محول `WireGuardPlusCalls` (`Wintun v0.14.1`) حزم مكالمات تيليجرام فقط ضمن 9 نطاقات `IPv4` رسمية (مع حظر ضجيج الشبكة المحلية NetBIOS) وإبقاء **نظير لنظير: لا أحد** داخل تيليجرام لحماية عنوانك.
+- **ضبط MTU ديناميكي تلقائي (`v2.0.3`):** يقلع النفق بأمان عند `1280` (أو `1200` داخل VPN خارجي) ثم يعاير حجم الرزمة حيًا أثناء الاتصال (`1280..1420` بمضاعفات 16 بايت مع مراعاة سقف WARP البالغ `1280` وترويسة التمويه `S4`) ويهبط فوريًا عند التبديل بين الواي فاي والبيانات أو السكون أو التعثر بدون قطع الاتصال.
+- **DNS مشفر (DoH) وتشخيص الأخطاء عبر GitHub:** يدعم `1.1.1.1` و`1.0.0.1` و`8.8.8.8` و`9.9.9.9` أو رابط DoH مخصص مع رفض العناوين المزورة، ويفحص الـ IP الخارجي والدولة وسرعة مراكز بيانات تيليجرام `DC1/DC2/DC4/DC5` والـ `MTU` الحي وجاهزية UDP، مع نسخ تقرير تشخيصي جاهز للإرسال عبر [نموذج بلاغات GitHub](.github/ISSUE_TEMPLATE/bug_report.yml).
 - **تشفير DPAPI والوضع المحمول والنسخ الاحتياطي المشفر:** تُشفّر المفاتيح على ويندوز عبر DPAPI (`CryptProtectData`)، ووضع `portable.flag` يحفظ كل البيانات في `./wgplus-data/`، بينما ملفات `.wgplus` (Argon2id + AES-256-GCM) تنقل إعداداتك بأمان بين الأجهزة. على أندرويد تُحفظ المفاتيح في `AndroidKeyStore` وتُزال المفاتيح الخاصة من أي مشاركة مفتوحة.
 - **استمرارية موثوقة وأيقونة One UI وواجهة ثنائية اللغة:** تعافي تلقائي على ويندوز عند السكون وتغيّر الشبكة (`handleNetworkSwitch`) وأيقونة شريط النظام، وحماية صامتة على أندرويد، وأيقونة متجهة تكيفية مع دعم Monochrome لواجهة One UI، وواجهة عربية (RTL) وإنجليزية (LTR) بالوضعين الداكن والفاتح.
 
@@ -152,7 +154,7 @@ flowchart LR
 
 يتطلب **أندرويد 5.0+** (**أندرويد 11+** للتفعيل الصامت عبر التصحيح اللاسلكي).
 
-1. حمّل [`WireGuardPlus-2.0.0-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-arm64-v8a.apk) (`5.25 MB`) أو [`WireGuardPlus-2.0.0-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0-armeabi-v7a.apk) (`5.23 MB`) أو [`WireGuardPlus-2.0.0.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.0.apk) (الشاملة).
+1. حمّل [`WireGuardPlus-2.0.3-arm64-v8a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.3-arm64-v8a.apk) (`5.29 MB`) أو [`WireGuardPlus-2.0.3-armeabi-v7a.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.3-armeabi-v7a.apk) (`5.27 MB`) أو [`WireGuardPlus-2.0.3.apk`](https://github.com/AliHaider704/wgplus/releases/latest/download/WireGuardPlus-2.0.3.apk) (الشاملة).
 2. **بدون روت (LSPatch):** ادمج أي نسخة مدعومة (**Telegram** أو **Telegram Plus** أو **Nagram** أو **AyuGram** أو **Telegraph** أو **Telegram Gold** أو **Telegram X**) عبر [JingMatrix LSPatch](https://github.com/JingMatrix/LSPatch) بوضع **Portable** أو **Local**، ثم ثبّت تيليجرام وافتح تطبيق **نفق وايرجارد بلس** لإكمال ربط التصحيح اللاسلكي ذي الـ 6 أرقام لمرة واحدة.
    - **مع روت (LSPosed / Vector):** فعّل **WireGuard Plus** في **LSPosed / Vector -> Modules** وحدد تطبيقات تيليجرام ثم امنح الروت داخل التطبيق لحماية صامتة.
 3. داخل تيليجرام افتح **الإعدادات -> البيانات والتخزين -> إعدادات البروكسي -> نفق وايرجارد** وأضف ملفك واتصل.

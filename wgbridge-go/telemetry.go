@@ -45,6 +45,7 @@ type detailedTunnelStats struct {
 	HandshakeHealthy     bool                `json:"handshakeHealthy"`
 	SocksAuthRejectCount int64               `json:"socksAuthRejectCount"`
 	ResolvedEndpoint     string              `json:"resolvedEndpoint"`
+	ActiveMtu            int                 `json:"activeMtu"`
 	Clients              []clientTrafficStat `json:"clients"`
 }
 
@@ -176,6 +177,7 @@ func GetDetailedStatsJSON() string {
 	baseRx := baseRxBytes
 	baseTx := baseTxBytes
 	resolvedEp := activeResolvedEp
+	curMtu := activeMtu
 	mu.Unlock()
 
 	var rxBytes, txBytes uint64
@@ -237,6 +239,7 @@ func GetDetailedStatsJSON() string {
 		HandshakeHealthy:     IsHandshakeHealthy(),
 		SocksAuthRejectCount: GetSocksAuthRejectCount(),
 		ResolvedEndpoint:     resolvedEp,
+		ActiveMtu:            curMtu,
 		Clients:              clients,
 	}
 	raw, err := json.Marshal(snap)

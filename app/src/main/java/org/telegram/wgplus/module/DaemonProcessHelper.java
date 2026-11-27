@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
 
 /**
  * Dual-mode platform helper executed via {@code /system/bin/app_process} under {@code uid=2000}
@@ -169,15 +170,16 @@ public final class DaemonProcessHelper {
 
         byte[] rawSecret = new byte[32];
         new SecureRandom().nextBytes(rawSecret);
-        final String secretHex = toHex(rawSecret);
-        final byte[] secretBytes = secretHex.getBytes(StandardCharsets.UTF_8);
+        final AtomicReference<byte[]> secretBytesRef = new AtomicReference<>(
+                toHex(rawSecret).getBytes(StandardCharsets.UTF_8)
+        );
 
         ServerSocket server = null;
         try {
             server = new ServerSocket(0, 8, InetAddress.getByName("127.0.0.1"));
             final int localPort = server.getLocalPort();
 
-            registerWithModuleProvider(localPort, myPid, myUid, finalTxCode, secretHex);
+            registerWithModuleProvider(localPort, myPid, myUid, finalTxCode, secretBytesRef);
 
             Thread exemptionsInit = new Thread(() -> {
                 try {
@@ -190,7 +192,7 @@ public final class DaemonProcessHelper {
 
             final ServerSocket finalServer = server;
             Thread watchdog = new Thread(() -> runWatchdogLoop(
-                    modulePkg, targets, myPid, myUid, localPort, finalTxCode, secretHex
+                    modulePkg, targets, myPid, myUid, localPort, finalTxCode, secretBytesRef
             ), "wgplus-daemon-watchdog");
             watchdog.setDaemon(true);
             watchdog.start();
@@ -198,7 +200,7 @@ public final class DaemonProcessHelper {
             while (sRunning) {
                 try {
                     Socket client = finalServer.accept();
-                    handleClient(client, secretBytes, modulePkg, targets, myPid, myUid, finalTxCode, finalServer);
+                    handleClient(client, secretBytesRef, modulePkg, targets, myPid, myUid, finalTxCode, finalServer);
                 } catch (Throwable t) {
                     if (!sRunning) {
                         break;
@@ -220,7 +222,7 @@ public final class DaemonProcessHelper {
 
     private static void handleClient(
             Socket client,
-            byte[] secretBytes,
+            AtomicReference<byte[]> secretBytesRef,
             String modulePkg,
             List<String> targets,
             int myPid,
@@ -243,7 +245,9 @@ public final class DaemonProcessHelper {
                 return;
             }
             String token = line.substring(0, sp1);
-            if (!MessageDigest.isEqual(token.getBytes(StandardCharsets.UTF_8), secretBytes)) {
+            byte[] currentSecret = secretBytesRef.get();
+            if (currentSecret == null || currentSecret.length == 0
+                    || !MessageDigest.isEqual(token.getBytes(StandardCharsets.UTF_8), currentSecret)) {
                 writer.println("ERR_AUTH");
                 return;
             }
@@ -305,7 +309,7 @@ public final class DaemonProcessHelper {
             int myUid,
             int localPort,
             int txCode,
-            String secretHex
+            AtomicReference<byte[]> secretBytesRef
     ) {
         HashMap<String, Integer> lastPids = new HashMap<>();
         int tick = 0;
@@ -333,7 +337,7 @@ public final class DaemonProcessHelper {
                     }
                 }
                 if (tick % 6 == 0) {
-                    registerWithModuleProvider(localPort, myPid, myUid, txCode, secretHex);
+                    registerWithModuleProvider(localPort, myPid, myUid, txCode, secretBytesRef);
                 }
                 tick++;
                 Thread.sleep(20000L);
@@ -344,7 +348,39 @@ public final class DaemonProcessHelper {
         }
     }
 
-    private static void registerWithModuleProvider(int port, int pid, int uid, int txCode, String secretHex) {
+    static String extractTokenFromContentCallOutput(String stdout) {
+        if (stdout == null || stdout.isEmpty()) {
+            return "";
+        }
+        int idx = stdout.indexOf("token=");
+        if (idx < 0) {
+            return "";
+        }
+        int start = idx + "token=".length();
+        int end = start;
+        while (end < stdout.length()) {
+            char c = stdout.charAt(end);
+            boolean hex = (c >= '0' && c <= '9')
+                    || (c >= 'a' && c <= 'f')
+                    || (c >= 'A' && c <= 'F');
+            if (!hex) {
+                break;
+            }
+            end++;
+        }
+        if (end - start != 64) {
+            return "";
+        }
+        return stdout.substring(start, end).toLowerCase(java.util.Locale.US);
+    }
+
+    private static void registerWithModuleProvider(
+            int port,
+            int pid,
+            int uid,
+            int txCode,
+            AtomicReference<byte[]> secretBytesRef
+    ) {
         for (int attempt = 0; attempt < 3; attempt++) {
             try {
                 ProcessBuilder pb = new ProcessBuilder(
@@ -354,17 +390,35 @@ public final class DaemonProcessHelper {
                         "--extra", "port:i:" + port,
                         "--extra", "pid:i:" + pid,
                         "--extra", "uid:i:" + uid,
-                        "--extra", "tx:i:" + txCode,
-                        "--extra", "token:s:" + secretHex
+                        "--extra", "tx:i:" + txCode
                 );
                 pb.redirectErrorStream(true);
                 java.lang.Process p = pb.start();
+                ByteArrayOutputStream outBuf = new ByteArrayOutputStream();
+                Thread reader = new Thread(() -> {
+                    try (InputStream is = p.getInputStream()) {
+                        byte[] b = new byte[1024];
+                        int n;
+                        while ((n = is.read(b)) > 0 && outBuf.size() < 8192) {
+                            outBuf.write(b, 0, Math.min(n, 8192 - outBuf.size()));
+                        }
+                    } catch (Throwable ignored) {
+                    }
+                }, "wgplus-daemon-reg-io");
+                reader.start();
                 boolean done = p.waitFor(4, TimeUnit.SECONDS);
-                if (done && p.exitValue() == 0) {
-                    return;
-                }
                 if (!done) {
                     p.destroyForcibly();
+                } else {
+                    reader.join(350);
+                    String stdout = new String(outBuf.toByteArray(), StandardCharsets.UTF_8);
+                    String mintedToken = extractTokenFromContentCallOutput(stdout);
+                    if (!mintedToken.isEmpty() && secretBytesRef != null) {
+                        secretBytesRef.set(mintedToken.getBytes(StandardCharsets.UTF_8));
+                    }
+                    if (p.exitValue() == 0 && !mintedToken.isEmpty()) {
+                        return;
+                    }
                 }
             } catch (Throwable ignored) {
             }
@@ -419,6 +473,7 @@ public final class DaemonProcessHelper {
             sb.append("cmd deviceidle whitelist +").append(pkg).append(" 2>/dev/null || true; ");
             sb.append("cmd activity set-standby-bucket ").append(pkg).append(" exempted 2>/dev/null || ")
                     .append("cmd activity set-standby-bucket ").append(pkg).append(" active 2>/dev/null || true; ");
+            sb.append("cmd activity set-inactive ").append(pkg).append(" false 2>/dev/null || true; ");
             for (String op : DEEP_APPOPS) {
                 sb.append("cmd appops set ").append(pkg).append(' ').append(op).append(" allow 2>/dev/null || true; ");
             }
@@ -550,6 +605,14 @@ public final class DaemonProcessHelper {
             return false;
         }
         return isSafeToken(comp.substring(0, slash)) && isSafeToken(comp.substring(slash + 1));
+    }
+
+    static String shellQuoteSingle(String raw) {
+        if (raw == null || raw.isEmpty() || raw.indexOf('\0') >= 0
+                || raw.indexOf('\n') >= 0 || raw.indexOf('\r') >= 0) {
+            return "";
+        }
+        return "'" + raw.replace("'", "'\"'\"'") + "'";
     }
 
     private static String toHex(byte[] bytes) {

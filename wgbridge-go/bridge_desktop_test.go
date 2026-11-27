@@ -812,3 +812,92 @@ func TestUdpPeerGuardDoesNotCacheReject(t *testing.T) {
 	}
 }
 
+func TestHttpProxyRejectsExcessiveHeaders431(t *testing.T) {
+	defer resetGlobalDesktopBridgeState()
+
+	port, err := StartHttpProxy(0)
+	if err != nil {
+		t.Fatalf("StartHttpProxy failed: %v", err)
+	}
+	defer StopHttpProxy()
+
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("127.0.0.1:%d", port), 3*time.Second)
+	if err != nil {
+		t.Fatalf("Dial HTTP proxy failed: %v", err)
+	}
+	defer c.Close()
+	_ = c.SetDeadline(time.Now().Add(3 * time.Second))
+
+	var req strings.Builder
+	req.WriteString("CONNECT 1.1.1.1:443 HTTP/1.1\r\n")
+	for i := 0; i < 65; i++ {
+		fmt.Fprintf(&req, "X-Extra-%d: v\r\n", i)
+	}
+	req.WriteString("\r\n")
+	if _, err := io.WriteString(c, req.String()); err != nil {
+		t.Fatalf("Write CONNECT request failed: %v", err)
+	}
+
+	statusLine, err := bufio.NewReader(c).ReadString('\n')
+	if err != nil {
+		t.Fatalf("Read status failed: %v", err)
+	}
+	if !strings.Contains(statusLine, "431") {
+		t.Fatalf("expected HTTP 431 status, got %q", statusLine)
+	}
+}
+
+func TestProbeExitTraceRttIgnoresDelayedServerClose(t *testing.T) {
+	defer resetGlobalDesktopBridgeState()
+
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	srv := startLocalWgServer(t, "10.88.0.1", 1280, clientPub, "", "")
+	defer srv.closeAll()
+
+	// Mock trace server writes ip= and loc= immediately, then stalls 2500ms before closing FIN.
+	traceLn, err := srv.tnet.ListenTCP(&net.TCPAddr{IP: net.IPv4(10, 88, 0, 1), Port: 8089})
+	if err != nil {
+		t.Fatalf("ListenTCP failed: %v", err)
+	}
+	defer traceLn.Close()
+	go func() {
+		for {
+			c, aErr := traceLn.Accept()
+			if aErr != nil {
+				return
+			}
+			go func(conn net.Conn) {
+				defer conn.Close()
+				buf := make([]byte, 512)
+				_, _ = conn.Read(buf)
+				_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nip=104.28.245.19\nloc=IQ\n")
+				time.Sleep(2500 * time.Millisecond)
+			}(c)
+		}
+	}()
+
+	SetDesktopMode(true)
+	SetSocksAuth("probe2", "pass456")
+	socksPort, err := StartTunnelAdvanced(
+		clientPriv, "", "10.88.0.2/32", "1.1.1.1", srv.pubHex, fmt.Sprintf("127.0.0.1:%d", srv.udpPort), 25, 1280, "", false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced failed: %v", err)
+	}
+	deadline := time.Now().Add(4 * time.Second)
+	for time.Now().Before(deadline) && !IsHandshakeHealthy() {
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	wallStart := time.Now()
+	ip, cc, rtt, errStr := probeExitTrace(socksPort, "probe2", "pass456", "10.88.0.1:8089", "mock.trace", false)
+	wallElapsed := time.Since(wallStart)
+	if errStr != "" || ip != "104.28.245.19" || cc != "IQ" {
+		t.Fatalf("unexpected probeExitTrace result: ip=%q cc=%q rtt=%d err=%q", ip, cc, rtt, errStr)
+	}
+	if wallElapsed >= 600*time.Millisecond || rtt >= 300 {
+		t.Fatalf("probeExitTrace stalled on server close! rtt=%dms wall=%v", rtt, wallElapsed)
+	}
+}
+
+

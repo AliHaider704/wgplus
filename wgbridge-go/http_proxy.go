@@ -107,6 +107,14 @@ func writeHttpErrorAndClose(c net.Conn, statusLine string, extraHeaders string) 
 }
 
 func verifyBasicProxyAuth(authHeader string, expectedUser string, expectedPass string) bool {
+	return verifyBasicProxyAuthInternal(authHeader, expectedUser, expectedPass, false)
+}
+
+func verifyBasicProxyAuthWithExtras(authHeader string, expectedUser string, expectedPass string) bool {
+	return verifyBasicProxyAuthInternal(authHeader, expectedUser, expectedPass, true)
+}
+
+func verifyBasicProxyAuthInternal(authHeader string, expectedUser string, expectedPass string, allowExtras bool) bool {
 	if expectedUser == "" && expectedPass == "" {
 		return true
 	}
@@ -125,9 +133,13 @@ func verifyBasicProxyAuth(authHeader string, expectedUser string, expectedPass s
 	}
 	gotUser := pair[:colonIdx]
 	gotPass := pair[colonIdx+1:]
-	userOk := subtle.ConstantTimeCompare([]byte(gotUser), []byte(expectedUser)) == 1
-	passOk := subtle.ConstantTimeCompare([]byte(gotPass), []byte(expectedPass)) == 1
-	return userOk && passOk
+	if subtle.ConstantTimeCompare([]byte(gotUser), []byte(expectedUser)) != 1 {
+		return false
+	}
+	if allowExtras {
+		return verifySocksPassBytes([]byte(gotPass)) == 1
+	}
+	return subtle.ConstantTimeCompare([]byte(gotPass), []byte(expectedPass)) == 1
 }
 
 func handleHttpConnectClient(client net.Conn) {
@@ -155,6 +167,7 @@ func handleHttpConnectClient(client net.Conn) {
 	method, target := parts[0], parts[1]
 
 	var proxyAuthHeader string
+	sawBlankLine := false
 	for headerLines := 0; headerLines < 64; headerLines++ {
 		line, hErr := br.ReadString('\n')
 		if hErr != nil {
@@ -162,6 +175,7 @@ func handleHttpConnectClient(client net.Conn) {
 		}
 		trimmed := strings.TrimRight(line, "\r\n")
 		if trimmed == "" {
+			sawBlankLine = true
 			break
 		}
 		if colon := strings.IndexByte(trimmed, ':'); colon > 0 {
@@ -170,6 +184,10 @@ func handleHttpConnectClient(client net.Conn) {
 				proxyAuthHeader = strings.TrimSpace(trimmed[colon+1:])
 			}
 		}
+	}
+	if !sawBlankLine {
+		writeHttpErrorAndClose(client, "HTTP/1.1 431 Request Header Fields Too Large", "")
+		return
 	}
 
 	if !strings.EqualFold(method, http.MethodConnect) {
@@ -189,7 +207,7 @@ func handleHttpConnectClient(client net.Conn) {
 	}
 
 	expectedUser, expectedPass := getSocksAuth()
-	if !verifyBasicProxyAuth(proxyAuthHeader, expectedUser, expectedPass) {
+	if !verifyBasicProxyAuthWithExtras(proxyAuthHeader, expectedUser, expectedPass) {
 		writeHttpErrorAndClose(client, "HTTP/1.1 407 Proxy Authentication Required", "Proxy-Authenticate: Basic realm=\"WireGuard Plus\"\r\n")
 		return
 	}

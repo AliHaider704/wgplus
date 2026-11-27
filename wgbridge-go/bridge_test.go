@@ -29,6 +29,13 @@ func (localNetDialer) DialContext(ctx context.Context, network, address string) 
 	return d.DialContext(ctx, network, address)
 }
 
+func (localNetDialer) OpenFullConePacketConn(isV6 bool) (net.PacketConn, error) {
+	if isV6 {
+		return net.ListenPacket("udp6", "[::1]:0")
+	}
+	return net.ListenPacket("udp4", "127.0.0.1:0")
+}
+
 func generateTestKeypairHex(t *testing.T) (privHex string, pubHex string) {
 	t.Helper()
 	var raw [32]byte
@@ -1595,6 +1602,113 @@ func TestSocks5SubLabelPerInstanceAttribution(t *testing.T) {
 	statsJSON := GetDetailedStatsJSON()
 	if !strings.Contains(statsJSON, "org.telegram.plus") || !strings.Contains(statsJSON, "org.telegram.messenger.web") {
 		t.Fatalf("expected separate ClientTrafficStat entries in stats JSON, got: %s", statsJSON)
+	}
+}
+
+func TestLiveInTunnelAutoMtuCalibrationAndActiveProbeSafety(t *testing.T) {
+	StopKillSwitchGuard()
+	StopTunnel()
+	defer StopTunnel()
+
+	clientPriv, clientPub := generateTestKeypairHex(t)
+	srvPriv, srvPub := generateTestKeypairHex(t)
+
+	// Server owns both 10.77.0.1 and 1.0.0.1 so ICMP Echo and TCP probe to 1.0.0.1 traverse WireGuard end-to-end.
+	srvTun, srvNet, err := netstack.CreateNetTUN(
+		[]netip.Addr{netip.MustParseAddr("10.77.0.1"), netip.MustParseAddr("1.0.0.1")},
+		[]netip.Addr{netip.MustParseAddr("1.1.1.1")},
+		1420,
+	)
+	if err != nil {
+		t.Fatalf("CreateNetTUN server failed: %v", err)
+	}
+	srvBind, err := newAwgBind(newPlatformBind(), AwgConfig{}, srvPriv, clientPub)
+	if err != nil {
+		_ = srvTun.Close()
+		t.Fatalf("newAwgBind server failed: %v", err)
+	}
+	srvDev := device.NewDevice(srvTun, srvBind, device.NewLogger(device.LogLevelSilent, ""))
+	var uapi strings.Builder
+	fmt.Fprintf(&uapi, "private_key=%s\nlisten_port=0\npublic_key=%s\nallowed_ip=0.0.0.0/0\nallowed_ip=::/0\n", srvPriv, clientPub)
+	if err := srvDev.IpcSet(uapi.String()); err != nil {
+		srvDev.Close()
+		t.Fatalf("srvDev IpcSet failed: %v", err)
+	}
+	if err := srvDev.Up(); err != nil {
+		srvDev.Close()
+		t.Fatalf("srvDev Up failed: %v", err)
+	}
+	defer srvDev.Close()
+
+	ipcOut, _ := srvDev.IpcGet()
+	srvUdpPort := 0
+	for _, line := range strings.Split(ipcOut, "\n") {
+		if strings.HasPrefix(line, "listen_port=") {
+			_, _ = fmt.Sscanf(strings.TrimPrefix(line, "listen_port="), "%d", &srvUdpPort)
+		}
+	}
+	if srvUdpPort <= 0 {
+		t.Fatalf("invalid server listen_port from IpcGet: %q", ipcOut)
+	}
+
+	probeLn, err := srvNet.ListenTCP(&net.TCPAddr{IP: net.IPv4(1, 0, 0, 1), Port: 443})
+	if err != nil {
+		t.Fatalf("srvNet ListenTCP 1.0.0.1:443 failed: %v", err)
+	}
+	defer probeLn.Close()
+	go func() {
+		for {
+			c, aErr := probeLn.Accept()
+			if aErr != nil {
+				return
+			}
+			_ = c.Close()
+		}
+	}()
+
+	// Cap outer WireGuard UDP payload at 1416 bytes (IP 20 + UDP 8 + 1416 = 1444-byte router MTU ceiling):
+	// - inner 1376 -> 1376 + 32 = 1408 <= 1416 (PASSES)
+	// - inner 1392 -> 1392 + 32 = 1424 > 1416 (DROPPED)
+	cappedLink := startUdpLinkProxy(t, srvUdpPort, 1416, 0, 0, 0)
+	defer cappedLink.closeFn()
+
+	_, err = StartTunnelAdvanced(
+		clientPriv, "", "10.77.0.2/32", "1.1.1.1", srvPub, cappedLink.addr, 25, 1420, "", false,
+	)
+	if err != nil {
+		t.Fatalf("StartTunnelAdvanced failed: %v", err)
+	}
+	if initMtu := GetActiveMTU(); initMtu != 1280 {
+		t.Fatalf("expected safe startup boot MTU=1280, got %d", initMtu)
+	}
+
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if IsHandshakeHealthy() && GetActiveMTU() == 1376 {
+			break
+		}
+		time.Sleep(35 * time.Millisecond)
+	}
+	if got := GetActiveMTU(); got != 1376 {
+		t.Fatalf("expected live Auto-MTU calibration to 1376 under 1444-byte ceiling, got %d (dropped=%d)", got, cappedLink.droppedOversized.Load())
+	}
+	if !strings.Contains(GetDetailedStatsJSON(), `"activeMtu":1376`) {
+		t.Fatalf("expected GetDetailedStatsJSON to report activeMtu=1376: %s", GetDetailedStatsJSON())
+	}
+
+	// Verify active-peer ping and DiscoverOptimalMTU do not tear down or reset active peer session.
+	statsBefore := GetTunnelStats()
+	pingMs, pErr := ProbeEndpointHandshakeMs(clientPriv, "", srvPub, cappedLink.addr, "", false, 2000)
+	if pErr != nil || pingMs <= 0 {
+		t.Fatalf("expected fast active-tunnel ping via ProbeEndpointHandshakeMs, got ms=%d err=%v", pingMs, pErr)
+	}
+	if !IsHandshakeHealthy() {
+		t.Fatalf("active peer probe unexpectedly disrupted handshake (%q -> %q)", statsBefore, GetTunnelStats())
+	}
+
+	// Verify emergency step-down lowers live MTU in-place without dropping tunnel.
+	if stepped := StepDownActiveTunnelMTU(1280, "test_stall"); stepped != 1280 || GetActiveMTU() != 1280 {
+		t.Fatalf("expected StepDownActiveTunnelMTU -> 1280, got stepped=%d active=%d", stepped, GetActiveMTU())
 	}
 }
 

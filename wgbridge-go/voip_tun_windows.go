@@ -55,6 +55,44 @@ var telegramVoipCIDRStrings = []string{
 	"185.76.151.0/24",
 }
 
+var telegramVoipPrefixes = func() []netip.Prefix {
+	out := make([]netip.Prefix, 0, len(telegramVoipCIDRStrings))
+	for _, raw := range telegramVoipCIDRStrings {
+		if p, err := netip.ParsePrefix(raw); err == nil {
+			out = append(out, p)
+		}
+	}
+	return out
+}()
+
+func isWindowsLanNoisePort(port uint16) bool {
+	switch port {
+	case 137, 138, 139, 445, 1900, 3702, 5353, 5355:
+		return true
+	default:
+		return false
+	}
+}
+
+func isAllowedTelegramVoipDst(dstIP [4]byte, srcPort, dstPort uint16) bool {
+	if isWindowsLanNoisePort(srcPort) || isWindowsLanNoisePort(dstPort) {
+		return false
+	}
+	if dstIP[0] == 10 && dstIP[1] == 254 && dstIP[2] == 254 {
+		return false
+	}
+	if dstIP == ([4]byte{0, 0, 0, 0}) || dstIP == ([4]byte{255, 255, 255, 255}) || (dstIP[0]&0xf0) == 0xe0 {
+		return false
+	}
+	addr := netip.AddrFrom4(dstIP)
+	for _, p := range telegramVoipPrefixes {
+		if p.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
 var (
 	modVoipIphlpapi                  = windows.NewLazySystemDLL("iphlpapi.dll")
 	procInitUnicastIpAddrEntry       = modVoipIphlpapi.NewProc("InitializeUnicastIpAddressEntry")
@@ -192,11 +230,15 @@ type voipTunNatEntry struct {
 	pConn      net.PacketConn
 	dialer     udpDialer
 	lastActive atomic.Int64
+	counted    atomic.Bool
 	closeOnce  sync.Once
 }
 
 func (e *voipTunNatEntry) close() {
 	e.closeOnce.Do(func() {
+		if e.counted.CompareAndSwap(true, false) {
+			activeUdpAssocs.Add(-1)
+		}
 		if e.pConn != nil {
 			_ = e.pConn.Close()
 		}
@@ -708,9 +750,15 @@ func (s *winVoipTunSession) runReadLoop() {
 		}
 
 		if pkt[9] == 6 && s.tcpEp != nil {
+			ihl := int(pkt[0]&0x0f) * 4
+			if ihl < 20 || len(pkt) < ihl+4 {
+				continue
+			}
 			var dstIP [4]byte
 			copy(dstIP[:], pkt[16:20])
-			if dstIP == ([4]byte{0, 0, 0, 0}) || dstIP == ([4]byte{255, 255, 255, 255}) || (dstIP[0]&0xf0) == 0xe0 {
+			srcPort := binary.BigEndian.Uint16(pkt[ihl : ihl+2])
+			dstPort := binary.BigEndian.Uint16(pkt[ihl+2 : ihl+4])
+			if !isAllowedTelegramVoipDst(dstIP, srcPort, dstPort) {
 				continue
 			}
 			pkb := stack.NewPacketBuffer(stack.PacketBufferOptions{Payload: buffer.MakeWithData(pkt)})
@@ -723,7 +771,7 @@ func (s *winVoipTunSession) runReadLoop() {
 		if !ok || len(payload) == 0 {
 			continue
 		}
-		if dstIP == ([4]byte{0, 0, 0, 0}) || dstIP == ([4]byte{255, 255, 255, 255}) || (dstIP[0]&0xf0) == 0xe0 {
+		if !isAllowedTelegramVoipDst(dstIP, srcPort, dstPort) {
 			continue
 		}
 
@@ -840,6 +888,8 @@ func (s *winVoipTunSession) getOrCreateNatEntry(
 		return cur, nil
 	}
 	s.nat[key] = newEntry
+	newEntry.counted.Store(true)
+	activeUdpAssocs.Add(1)
 	s.natMu.Unlock()
 
 	udpSocketsOpened.Add(1)

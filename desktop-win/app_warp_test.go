@@ -133,3 +133,78 @@ func TestFetchReleaseAndRedirectFallback(t *testing.T) {
 		t.Fatalf("expected Redirect Download URL to contain WireGuardPlus-Windows-x64.exe, got %q", nRedir.Download)
 	}
 }
+
+func TestSaveProfilePreservesWarpMetadataAndRepairsCorruptedState(t *testing.T) {
+	dir := t.TempDir()
+	store, err := vault.NewStoreAt(dir, false)
+	if err != nil {
+		t.Fatalf("vault.NewStoreAt failed: %v", err)
+	}
+	st := config.PersistedState{
+		Settings: config.DefaultSettings(),
+		Profiles: []config.ServerProfile{
+			{
+				ID:            "warp-1",
+				Name:          "Cloudflare WARP (AWG 1.5)",
+				PrivateKey:    "priv",
+				PeerPublicKey: "pub",
+				Endpoint:      "engage.cloudflareclient.com:2408",
+				MTU:           1320,
+				AwgParams:     "Jc=4;I1=<b 0xc70000000108>;Reserved=12,34,56",
+				IsWarp:        false,
+				LastPingMs:    52,
+			},
+			{
+				ID:            "std-1",
+				Name:          "Standard Server",
+				PrivateKey:    "priv2",
+				PeerPublicKey: "pub2",
+				Endpoint:      "198.51.100.10:51820",
+				MTU:           1420,
+				IsWarp:        false,
+			},
+		},
+	}
+	if err := store.Save(st); err != nil {
+		t.Fatalf("store.Save failed: %v", err)
+	}
+
+	app := &App{store: store, state: st}
+	app.repairCorruptedProfiles()
+	if !app.state.Profiles[0].IsWarp {
+		t.Fatalf("expected stripped WARP profile to be repaired with IsWarp=true")
+	}
+	if app.state.Profiles[1].IsWarp {
+		t.Fatalf("expected non-WARP profile to remain IsWarp=false")
+	}
+	reloaded, err := store.Load()
+	if err != nil || !reloaded.Profiles[0].IsWarp {
+		t.Fatalf("expected repaired WARP flag to be persisted, err=%v prof=%+v", err, reloaded.Profiles)
+	}
+
+	saved, err := app.SaveProfile(config.ServerProfile{
+		ID:            "warp-1",
+		Name:          "Cloudflare WARP (AWG 1.5)",
+		PrivateKey:    "priv",
+		PeerPublicKey: "pub",
+		Endpoint:      "engage.cloudflareclient.com:2408",
+		KeepAlive:     25,
+		MTU:           1280,
+		AwgParams:     "Jc=3",
+		UseDoH:        true,
+		IsWarp:        false,
+		LastPingMs:    0,
+	})
+	if err != nil {
+		t.Fatalf("SaveProfile failed: %v", err)
+	}
+	if !saved.IsWarp {
+		t.Fatalf("expected SaveProfile to preserve IsWarp=true")
+	}
+	if saved.LastPingMs != 52 {
+		t.Fatalf("expected SaveProfile to preserve LastPingMs=52 when endpoint unchanged, got %d", saved.LastPingMs)
+	}
+	if !strings.Contains(saved.AwgParams, "Reserved=12,34,56") {
+		t.Fatalf("expected SaveProfile to preserve WARP Reserved bytes, got %q", saved.AwgParams)
+	}
+}

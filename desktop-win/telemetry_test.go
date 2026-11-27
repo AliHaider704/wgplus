@@ -119,6 +119,9 @@ func TestBuildFirestoreTelemetryPayloadSchema(t *testing.T) {
 	if parsed.Fields["schemaVersion"]["integerValue"] != "1" {
 		t.Fatalf("unexpected schemaVersion: %v", parsed.Fields["schemaVersion"])
 	}
+	if parsed.Fields["moduleVersion"]["stringValue"] != "2.0.0" {
+		t.Fatalf("expected bare moduleVersion 2.0.0, got %v", parsed.Fields["moduleVersion"])
+	}
 	if parsed.Fields["sdkInt"]["integerValue"] != "26100" {
 		t.Fatalf("unexpected sdkInt: %v", parsed.Fields["sdkInt"])
 	}

@@ -48,7 +48,9 @@ public class BootContinuityReceiver extends BroadcastReceiver {
                     try {
                         if (PrivilegeBridge.isStandaloneDaemonAlive(appCtx) || PrivilegeBridge.hasRootAccess()) {
                             for (String pkg : ContinuityBridgeManager.getInstalledTargetPackages(appCtx)) {
-                                PrivilegeBridge.runShellCommand(appCtx, "am force-stop " + pkg, 2500);
+                                if (DaemonProcessHelper.isSafeToken(pkg)) {
+                                    PrivilegeBridge.runShellCommand(appCtx, "am force-stop " + pkg, 2500);
+                                }
                             }
                         }
                     } catch (Throwable ignored) {

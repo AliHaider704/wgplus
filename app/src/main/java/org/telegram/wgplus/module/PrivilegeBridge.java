@@ -24,6 +24,7 @@ import java.lang.reflect.Method;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
+import java.security.SecureRandom;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -293,6 +294,39 @@ public final class PrivilegeBridge {
         }
     }
 
+    public static synchronized String mintOrUpdateDaemonEndpoint(
+            Context context,
+            int port,
+            int pid,
+            int uid,
+            int txCode,
+            String explicitToken
+    ) {
+        if (context == null || port <= 0) {
+            return "";
+        }
+        String resolved = explicitToken != null ? explicitToken.trim() : "";
+        if (resolved.isEmpty()) {
+            SharedPreferences prefs = cachePrefs(context);
+            int prevPort = prefs.getInt(KEY_DAEMON_PORT, -1);
+            int prevPid = prefs.getInt(KEY_DAEMON_PID, -1);
+            String prevToken = prefs.getString(KEY_DAEMON_TOKEN, "");
+            if (prevPort == port && pid > 0 && prevPid == pid && prevToken != null && prevToken.length() == 64) {
+                resolved = prevToken;
+            } else {
+                byte[] raw = new byte[32];
+                new SecureRandom().nextBytes(raw);
+                StringBuilder sb = new StringBuilder(64);
+                for (byte b : raw) {
+                    sb.append(String.format(java.util.Locale.US, "%02x", b & 0xff));
+                }
+                resolved = sb.toString();
+            }
+        }
+        registerDaemonEndpoint(context, port, pid, uid, txCode, resolved);
+        return resolved;
+    }
+
     public static void registerDaemonEndpoint(
             Context context,
             int port,
@@ -430,10 +464,15 @@ public final class PrivilegeBridge {
             }
         }
         String targetArg = csv.length() > 0 ? csv.toString() : "org.telegram.plus,org.telegram.messenger,org.telegram.gold";
-        return "setsid /system/bin/env CLASSPATH=" + apkPath
+        String quotedApk = DaemonProcessHelper.shellQuoteSingle(apkPath);
+        String modulePkg = context.getPackageName();
+        if (quotedApk.isEmpty() || !DaemonProcessHelper.isSafeToken(modulePkg)) {
+            return "";
+        }
+        return "setsid /system/bin/env CLASSPATH=" + quotedApk
                 + " /system/bin/app_process /system/bin --nice-name=wgplus_daemon "
                 + DaemonProcessHelper.class.getName()
-                + " --daemon " + context.getPackageName() + " " + targetArg
+                + " --daemon " + modulePkg + " " + targetArg
                 + " </dev/null >/dev/null 2>&1 &";
     }
 
@@ -759,10 +798,14 @@ public final class PrivilegeBridge {
             if (apkPath == null || apkPath.isEmpty()) {
                 return -1;
             }
+            String quotedApk = DaemonProcessHelper.shellQuoteSingle(apkPath);
+            if (quotedApk.isEmpty()) {
+                return -1;
+            }
             ShellResult res = null;
             if (hasRootAccess()) {
                 res = runRootCommand(
-                        "/system/bin/env CLASSPATH=" + apkPath + " /system/bin/app_process /system/bin " + DaemonProcessHelper.class.getName(),
+                        "/system/bin/env CLASSPATH=" + quotedApk + " /system/bin/app_process /system/bin " + DaemonProcessHelper.class.getName(),
                         4000
                 );
             } else if (BuiltinAdbKeyManager.isPaired(appCtx)) {
@@ -770,7 +813,7 @@ public final class PrivilegeBridge {
                 WgAdbConnectionManager mgr = WgAdbConnectionManager.getInstance(appCtx);
                 if (mgr.isConnected()) {
                     res = mgr.runShellCommand(
-                            "/system/bin/env CLASSPATH=" + apkPath + " /system/bin/app_process /system/bin " + DaemonProcessHelper.class.getName(),
+                            "/system/bin/env CLASSPATH=" + quotedApk + " /system/bin/app_process /system/bin " + DaemonProcessHelper.class.getName(),
                             4000
                     );
                 }

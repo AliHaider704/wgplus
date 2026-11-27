@@ -1,8 +1,6 @@
 package vault
 
 import (
-	"crypto/aes"
-	"crypto/cipher"
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
@@ -14,15 +12,12 @@ import (
 	"sync"
 	"unsafe"
 
-	"golang.org/x/crypto/argon2"
 	"golang.org/x/sys/windows"
+	"wgbridge"
 	"wgplus-win/internal/config"
 )
 
-const (
-	dpapiPrefix    = "dpapi:"
-	backupFormatV1 = "wgplus-backup-v1"
-)
+const dpapiPrefix = "dpapi:"
 
 var dpapiEntropy = []byte("WireGuardPlus-Windows-DPAPI-v1")
 
@@ -300,89 +295,28 @@ func (s *Store) saveLocked(st config.PersistedState) error {
 	return nil
 }
 
-type portableBackupEnvelope struct {
-	Format     string `json:"format"`
-	Salt       string `json:"salt"`
-	Nonce      string `json:"nonce"`
-	Ciphertext string `json:"ciphertext"`
-}
-
 // ExportEncryptedBackup encrypts the entire state (profiles, settings, custom clients)
 // using Argon2id + AES-256-GCM so portable users can transfer configurations across Windows PCs.
 func ExportEncryptedBackup(st config.PersistedState, passphrase string) ([]byte, error) {
-	if len(passphrase) < 4 {
-		return nil, errors.New("passphrase must be at least 4 characters")
-	}
 	plain, err := json.Marshal(st)
 	if err != nil {
 		return nil, err
 	}
-	salt := make([]byte, 16)
-	if _, err := rand.Read(salt); err != nil {
-		return nil, err
-	}
-	key := argon2.IDKey([]byte(passphrase), salt, 2, 64*1024, 4, 32)
-	block, err := aes.NewCipher(key)
+	env, err := wgbridge.EncryptBackupV1(string(plain), passphrase)
 	if err != nil {
 		return nil, err
 	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return nil, err
-	}
-	nonce := make([]byte, gcm.NonceSize())
-	if _, err := rand.Read(nonce); err != nil {
-		return nil, err
-	}
-	sealed := gcm.Seal(nil, nonce, plain, []byte(backupFormatV1))
-	env := portableBackupEnvelope{
-		Format:     backupFormatV1,
-		Salt:       base64.StdEncoding.EncodeToString(salt),
-		Nonce:      base64.StdEncoding.EncodeToString(nonce),
-		Ciphertext: base64.StdEncoding.EncodeToString(sealed),
-	}
-	return json.MarshalIndent(env, "", "  ")
+	return []byte(env), nil
 }
 
 // ImportEncryptedBackup decrypts a portable Argon2id + AES-256-GCM backup bundle.
 func ImportEncryptedBackup(raw []byte, passphrase string) (config.PersistedState, error) {
-	var env portableBackupEnvelope
-	if err := json.Unmarshal(raw, &env); err != nil {
-		return config.PersistedState{}, fmt.Errorf("invalid backup file: %w", err)
-	}
-	if env.Format != backupFormatV1 {
-		return config.PersistedState{}, fmt.Errorf("unsupported backup format %q", env.Format)
-	}
-	salt, err := base64.StdEncoding.DecodeString(env.Salt)
-	if err != nil || len(salt) < 8 {
-		return config.PersistedState{}, errors.New("corrupt backup salt")
-	}
-	nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
-	if err != nil {
-		return config.PersistedState{}, errors.New("corrupt backup nonce")
-	}
-	ct, err := base64.StdEncoding.DecodeString(env.Ciphertext)
-	if err != nil {
-		return config.PersistedState{}, errors.New("corrupt backup ciphertext")
-	}
-	key := argon2.IDKey([]byte(passphrase), salt, 2, 64*1024, 4, 32)
-	block, err := aes.NewCipher(key)
+	plain, err := wgbridge.DecryptBackupV1(string(raw), passphrase)
 	if err != nil {
 		return config.PersistedState{}, err
-	}
-	gcm, err := cipher.NewGCM(block)
-	if err != nil {
-		return config.PersistedState{}, err
-	}
-	if len(nonce) != gcm.NonceSize() {
-		return config.PersistedState{}, errors.New("invalid backup nonce size")
-	}
-	plain, err := gcm.Open(nil, nonce, ct, []byte(backupFormatV1))
-	if err != nil {
-		return config.PersistedState{}, errors.New("wrong passphrase or tampered backup")
 	}
 	var out config.PersistedState
-	if err := json.Unmarshal(plain, &out); err != nil {
+	if err := json.Unmarshal([]byte(plain), &out); err != nil {
 		return config.PersistedState{}, err
 	}
 	return out, nil

@@ -73,6 +73,13 @@ final class WgCallWatchdog {
         if (json == null || !json.trim().startsWith("{")) {
             return null;
         }
+        return evaluateDiagnosticsJson(json);
+    }
+
+    static String evaluateDiagnosticsJson(String json) {
+        if (json == null || !json.trim().startsWith("{")) {
+            return null;
+        }
         try {
             JSONObject root = new JSONObject(json);
             JSONArray relays = root.optJSONArray("voipRelays");
@@ -84,29 +91,37 @@ final class WgCallWatchdog {
             long errs = 0L;
             long tcp = 0L;
             long oldest = 0L;
+            long minIdle = Long.MAX_VALUE;
+            long maxActiveSpan = 0L;
+            int validCount = 0;
             for (int i = 0; i < relays.length(); i++) {
                 JSONObject r = relays.optJSONObject(i);
                 if (r == null) {
                     continue;
                 }
+                validCount++;
                 tx += r.optLong("udpTxPkts");
                 rx += r.optLong("udpRxPkts");
                 errs += r.optLong("udpErrs");
                 tcp += r.optLong("tcpConns");
-                oldest = Math.max(oldest, r.optLong("ageSec"));
+                long ageSec = r.optLong("ageSec");
+                long idleSec = r.optLong("idleSec");
+                oldest = Math.max(oldest, ageSec);
+                minIdle = Math.min(minIdle, idleSec);
+                maxActiveSpan = Math.max(maxActiveSpan, Math.max(0L, ageSec - idleSec));
             }
-            String summary = " relays=" + relays.length() + " udpTx=" + tx + " udpRx=" + rx
-                    + " errs=" + errs + " tcpConns=" + tcp + " oldestAgeSec=" + oldest;
-            if (oldest < 20L) {
+            if (validCount == 0 || oldest < 20L) {
                 return null;
             }
-            if (tx > 0L && rx == 0L) {
+            String summary = " relays=" + validCount + " udpTx=" + tx + " udpRx=" + rx
+                    + " errs=" + errs + " tcpConns=" + tcp + " oldestAgeSec=" + oldest + " minIdleSec=" + minIdle;
+            if (tx > 0L && rx == 0L && (minIdle <= 15L || maxActiveSpan >= 10L)) {
                 return "DEAD(no return traffic)" + summary;
             }
-            if (tx == 0L && tcp == 0L) {
+            if (tx == 0L && tcp == 0L && oldest <= 40L) {
                 return "DEAD(no outbound packets reached relay)" + summary;
             }
-            if (tx + rx < LOW_TRAFFIC_PKTS && oldest >= 50L) {
+            if (tx + rx < LOW_TRAFFIC_PKTS && oldest >= 50L && (minIdle <= 15L || maxActiveSpan >= 20L)) {
                 return "LOW(call never carried media)" + summary;
             }
         } catch (Throwable ignored) {
